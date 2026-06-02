@@ -1,0 +1,84 @@
+# Compiled source #
+###################
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# Packages #
+############
+# it's better to unpack these files and commit the raw source
+# git has its own built in compression methods
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Logs and databases #
+######################
+*.log
+*.sql
+*.sqlite
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# data and model #
+####################
+*.json
+*.jsonl
+*.ipynb_checkpoints*
+
+PVBERTopic/my_bertopic_model_HDBSCAN
+# typical deep learning .gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pt
+*.bin
+*.safetensors
+*.npy
+*.pkl
+*.csv
+*.tsv
+*.txt
+*.arrow
+*.pth
+# SFT & DPO outputs
+runs_pv/
+dpo_pipeline_outputs/
+runs/
+dpo_runs/
+materials/
+# ignore all run outputs
+po_runs/
+po_ablation_runs/
+po_runs_claude/
+comparison*/
+po_variants_runs_april24/
+po_variants_runs_april24_seed_42_123_2024/
+TABPO_3RS_6Models/
+po_variants_runs_april24
+
+# HuggingFace / Trainer checkpoints
+**/checkpoint-*/
+
+# LoRA adapter artifacts
+**/sft_adapter/
+**/lora_adapter/
+
+# README files generated inside checkpoints
+**/checkpoint-*/README.md
