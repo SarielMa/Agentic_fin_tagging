@@ -152,27 +152,31 @@ class ValidatorCorrectorAgent:
 
         if mode in {"offline_build", "online_with_gt"} and gold_tag is not None:
             if selection.selected_tag == gold_tag:
+                risk_note = self._risk_note(rule_flags)
                 return ValidationDecision(
                     action="keep",
                     final_tag=selection.selected_tag,
                     passed=True,
-                    rationale="Gold-supervised validator accepted the selector output.",
+                    rationale="Gold-supervised validator accepted the selector output." + risk_note,
                     flags=rule_flags,
                 )
             if attempt < max_iters:
+                feedback = f"Previous tag {selection.selected_tag} was wrong; prefer {gold_tag}."
+                feedback += self._risk_feedback(rule_flags)
                 return ValidationDecision(
                     action="retry",
                     final_tag=selection.selected_tag,
                     passed=False,
                     rationale="Gold-supervised validator found an incorrect tag and requests retry.",
-                    feedback_to_selector=f"Previous tag {selection.selected_tag} was wrong; prefer {gold_tag}.",
+                    feedback_to_selector=feedback,
                     flags=rule_flags + ["wrong_against_gold"],
                 )
+            risk_note = self._risk_note(rule_flags)
             return ValidationDecision(
                 action="correct",
                 final_tag=gold_tag,
                 passed=True,
-                rationale="Gold-supervised validator corrected the final tag.",
+                rationale="Gold-supervised validator corrected the final tag." + risk_note,
                 flags=rule_flags + ["wrong_against_gold"],
             )
 
@@ -182,7 +186,8 @@ class ValidatorCorrectorAgent:
                 final_tag=selection.selected_tag,
                 passed=False,
                 rationale="Validator found rule-based risk and requests one retry.",
-                feedback_to_selector="The previous selection was low confidence or inconsistent; reconsider candidates.",
+                feedback_to_selector="The previous selection was low confidence or inconsistent; reconsider candidates."
+                + self._risk_feedback(rule_flags),
                 flags=rule_flags,
             )
 
@@ -218,6 +223,18 @@ class ValidatorCorrectorAgent:
             return False
         top_gap = candidates[0]["score"] - candidates[1]["score"]
         return selection.selected_tag == candidates[0]["tag"] and top_gap >= 0.05 and selection.confidence >= 0.95
+
+    @staticmethod
+    def _risk_feedback(flags: list[str]) -> str:
+        if not flags:
+            return ""
+        return " Risk signals: " + ", ".join(flags) + "."
+
+    @staticmethod
+    def _risk_note(flags: list[str]) -> str:
+        if not flags:
+            return ""
+        return " Risk signals were logged: " + ", ".join(flags) + "."
 
     def _attach_memory_writes(
         self,
