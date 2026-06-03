@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selector-model", default="meta-llama/Llama-3.2-3B-Instruct")
     parser.add_argument("--validator-backend", choices=["rule", "llama"], default="rule")
     parser.add_argument("--validator-model", default="meta-llama/Llama-3.2-3B-Instruct")
+    parser.add_argument("--table-evidence-backend", choices=["heuristic", "llama"], default="heuristic")
+    parser.add_argument("--table-evidence-model", default="meta-llama/Llama-3.2-3B-Instruct")
 
     parser.add_argument("--top-k", type=int, default=200)
     parser.add_argument("--rerank-k", type=int, default=20)
@@ -47,6 +49,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         selector_model=args.selector_model,
         validator_backend=args.validator_backend,
         validator_model=args.validator_model,
+        table_evidence_backend=args.table_evidence_backend,
+        table_evidence_model=args.table_evidence_model,
         top_k=args.top_k,
         rerank_k=args.rerank_k,
         memory_k=args.memory_k,

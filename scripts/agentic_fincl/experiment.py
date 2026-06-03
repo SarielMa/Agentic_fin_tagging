@@ -10,9 +10,9 @@ import pandas as pd
 
 from .agents import TagSelectorAgent, ValidatorCorrectorAgent
 from .data import load_taxonomy
+from .evidence import build_evidence_builder
 from .memory_store import LTMStore
 from .retrieval import DynamicLTMRetriever
-from .text_utils import localize_context
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class ExperimentConfig:
     selector_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     validator_backend: str = "rule"
     validator_model: str = "meta-llama/Llama-3.2-3B-Instruct"
+    table_evidence_backend: str = "heuristic"
+    table_evidence_model: str = "meta-llama/Llama-3.2-3B-Instruct"
     top_k: int = 200
     rerank_k: int = 20
     memory_k: int = 8
@@ -46,6 +48,7 @@ class AgenticExperiment:
         self.ltm = LTMStore(config.output_dir / "ltm", write_enabled=True)
         self.taxonomy = load_taxonomy(config.taxonomy_jsonl)
         self.retriever = DynamicLTMRetriever(self.taxonomy, self.ltm)
+        self.evidence_builder = build_evidence_builder(config.table_evidence_backend, config.table_evidence_model)
         self.selector = TagSelectorAgent(config.selector_backend, config.selector_model)
         self.validator = ValidatorCorrectorAgent(config.validator_backend, config.validator_model)
 
@@ -162,7 +165,7 @@ class AgenticExperiment:
         return metrics
 
     def _run_one(self, row_idx: int, row: Any, agent_mode: str, supervise_after_loop: bool) -> dict[str, Any]:
-        evidence = localize_context(row.context, row.category, row.entity)
+        evidence = self.evidence_builder.build(row.context, row.category, row.entity, row.entity_type)
         feedback: list[str] = []
         attempts = []
         final_decision = None
@@ -273,6 +276,10 @@ class AgenticExperiment:
             "selector_model": self.config.selector_model if self.config.selector_backend == "llama" else None,
             "validator_backend": self.config.validator_backend,
             "validator_model": self.config.validator_model if self.config.validator_backend == "llama" else None,
+            "table_evidence_backend": self.config.table_evidence_backend,
+            "table_evidence_model": self.config.table_evidence_model
+            if self.config.table_evidence_backend == "llama"
+            else None,
             "top_k": self.config.top_k,
             "rerank_k": self.config.rerank_k,
             "max_iters": self.config.max_iters,

@@ -85,13 +85,38 @@ outputs/<run>/ltm/
   table_context_patterns.jsonl
 ```
 
+### Evidence Builder
+
+Before retrieval and agent reasoning, the system builds an evidence string from the input fields. This evidence is what the retriever, selector, and validator use.
+
+For text examples, the evidence builder extracts nearby text around the target entity.
+
+For table examples, two backends are available:
+
+| Backend | Behavior |
+|---|---|
+| `heuristic` | Default. Parses table rows and uses rows containing the target entity. Fast and does not require an LLM. |
+| `llama` | Uses an LLM to produce a compact table description before retrieval. This can include table title, unit, column header, section context, matched row, nearby rows, and a retrieval query. |
+
+The LLM table evidence builder sees only:
+
+```text
+context + category + entity + entity_type
+```
+
+It does not see the gold tag and is instructed not to predict the US-GAAP tag. Its job is only to build better table evidence.
+
 ### ReAct-Style Loop
 
 For each sample, the system runs a small selector-validator loop:
 
 ```text
 Initialize STM with:
-  context, category, entity, entity_type, localized evidence
+  context, category, entity, entity_type
+
+Build evidence:
+  text -> nearby text evidence
+  table -> heuristic row evidence or LLM-generated table description
 
 For attempt = 1..max_iters:
   1. Retrieve candidates from taxonomy + current LTM.
@@ -247,6 +272,18 @@ python scripts/run_two_agent_system.py \
 ```
 
 The Llama backend uses Hugging Face `local_files_only=True`, so model weights should already be available in the local cache or at the provided model path.
+
+LLM table evidence builder:
+
+```bash
+python scripts/run_two_agent_system.py \
+  --mode offline \
+  --table-evidence-backend llama \
+  --table-evidence-model meta-llama/Llama-3.2-3B-Instruct \
+  --output-dir outputs/offline_llama_table_evidence
+```
+
+The evidence builder model is configured separately from the selector and validator models, so all three can use different checkpoints if needed.
 
 ## Outputs
 
