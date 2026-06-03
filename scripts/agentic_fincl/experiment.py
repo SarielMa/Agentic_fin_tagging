@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 from .agents import TagSelectorAgent, ValidatorCorrectorAgent
 from .data import load_taxonomy
@@ -148,11 +149,24 @@ class AgenticExperiment:
         predictions_path = phase_dir / "predictions.jsonl"
 
         records: list[dict[str, Any]] = []
+        row_limit = min(len(df), self.config.limit) if self.config.limit else len(df)
+        progress = tqdm(
+            enumerate(df.itertuples(index=False), start=1),
+            total=row_limit,
+            desc=f"{self.config.mode}:{phase}",
+            unit="row",
+            dynamic_ncols=True,
+        )
         with predictions_path.open("w", encoding="utf-8") as f:
-            for row_idx, row in enumerate(df.itertuples(index=False), start=1):
+            for row_idx, row in progress:
                 record = self._run_one(row_idx, row, agent_mode, supervise_after_loop)
                 records.append(record)
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                progress.set_postfix(
+                    correct=record["correct"],
+                    prediction=record["prediction"]["Tag"][:40],
+                    refresh=False,
+                )
                 if self.config.limit and row_idx >= self.config.limit:
                     break
 

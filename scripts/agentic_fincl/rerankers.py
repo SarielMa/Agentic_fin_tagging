@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
-from .hf_generation import model_input_device, move_inputs_to_device
+from .hf_generation import load_local_causal_lm, model_input_device, move_inputs_to_device
 
 
 class Reranker(Protocol):
@@ -21,8 +21,8 @@ class RetrievalTop1Reranker:
 class LlamaReranker:
     """Local Hugging Face Llama reranker.
 
-    This is intended for the GPU session. It uses local_files_only=True so the
-    run is reproducible and does not try to download model weights.
+    This is intended for the GPU session. Set FINAI_LOCAL_FILES_ONLY=1 to force
+    a fully cached/offline run.
     """
 
     def __init__(
@@ -38,21 +38,13 @@ class LlamaReranker:
         self.torch = torch
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        device_map = "auto" if torch.cuda.is_available() and device is None else None
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.tokenizer, self.model, self.device = load_local_causal_lm(
             model_name,
-            local_files_only=True,
-            torch_dtype=dtype,
-            device_map=device_map,
+            torch,
+            AutoModelForCausalLM,
+            AutoTokenizer,
+            device=device,
         )
-        if device_map is None:
-            self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-            self.model.to(self.device)
-        else:
-            self.device = None
-        self.model.eval()
 
     def choose(self, entity: Any, entity_type: str, evidence: str, candidates: list[dict[str, Any]]) -> str:
         if not candidates:

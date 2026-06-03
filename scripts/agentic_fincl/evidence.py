@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Protocol
 
-from .hf_generation import model_input_device, move_inputs_to_device
+from .hf_generation import load_local_causal_lm, model_input_device, move_inputs_to_device
 from .text_utils import localize_context, normalize_space, row_contains_entity, table_rows
 
 
@@ -41,21 +41,12 @@ class LlamaTableEvidenceBuilder:
         self.fallback = fallback or HeuristicEvidenceBuilder()
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        device_map = "auto" if torch.cuda.is_available() else None
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.tokenizer, self.model, self.device = load_local_causal_lm(
             model_name,
-            local_files_only=True,
-            torch_dtype=dtype,
-            device_map=device_map,
+            torch,
+            AutoModelForCausalLM,
+            AutoTokenizer,
         )
-        if device_map is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model.to(self.device)
-        else:
-            self.device = None
-        self.model.eval()
 
     def build(self, context: str, category: str, entity: Any, entity_type: str) -> str:
         if category != "table":
