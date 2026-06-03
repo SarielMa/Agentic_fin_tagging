@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
+from .hf_generation import model_input_device, move_inputs_to_device
+
 
 class Reranker(Protocol):
     def choose(self, entity: Any, entity_type: str, evidence: str, candidates: list[dict[str, Any]]) -> str:
@@ -67,8 +69,7 @@ class LlamaReranker:
             truncation=True,
             max_length=self.max_input_tokens,
         )
-        if self.device is not None:
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        inputs = move_inputs_to_device(inputs, self.device or model_input_device(self.model))
         with self.torch.no_grad():
             output = self.model.generate(
                 **inputs,
