@@ -120,7 +120,7 @@ For attempt = 1..max_iters:
 STM is short-term state for the current sample. It can change within the loop, mainly by adding validator feedback such as:
 
 ```text
-Previous tag X was wrong; prefer Y. Risk signals: low_top2_gap.
+The previous selection was low confidence or inconsistent; reconsider candidates. Risk signals: low_top2_gap.
 ```
 
 LTM is durable memory across samples. It is updated only after a final accepted or corrected decision, not after every retry. Therefore, LTM updates affect later samples, while STM feedback affects the next loop attempt for the same sample.
@@ -133,9 +133,9 @@ Offline mode is the main held-out evaluation setting. It has two phases:
 
 ```text
 Phase 1: memory-build set
-  gold labels are visible to Agent 2
-  Agent 2 can correct Agent 1
-  LTM is updated after final keep/correct decisions
+  gold labels are hidden during the Agent1-Agent2 loop
+  after the loop produces a final tag, gold is used for supervision
+  LTM is updated from the post-loop supervised keep/correction
 
 Phase 2: held-out test set
   gold labels are hidden from both agents
@@ -147,8 +147,9 @@ Pseudo-code:
 
 ```text
 for sample in memory_build:
-    run Agent1-Agent2 loop with gold visible to Agent2
-    update LTM after final keep/correct
+    run Agent1-Agent2 loop without gold
+    compare final_tag with answer after the loop
+    update LTM using post-loop supervision
 
 freeze LTM
 
@@ -169,15 +170,15 @@ python scripts/run_two_agent_system.py \
 
 ### Online With Ground Truth
 
-Online-with-GT mode processes one stream. There is no separate train/test split. For each sample, gold is available after/during validation, so Agent 2 can correct the result and update LTM for future samples.
+Online-with-GT mode processes one stream. There is no separate train/test split. For each sample, gold is not shown inside the Agent1-Agent2 loop. After the loop produces a final tag, gold is used to supervise memory updates for future samples.
 
 Pseudo-code:
 
 ```text
 for sample in stream:
-    run Agent1-Agent2 loop with gold visible to Agent2
-    evaluate final_tag against answer
-    update LTM after final keep/correct
+    run Agent1-Agent2 loop without gold
+    compare final_tag with answer after the loop
+    update LTM using post-loop supervision
 ```
 
 The update is for later samples only. The current sample is not rerun after its LTM write.

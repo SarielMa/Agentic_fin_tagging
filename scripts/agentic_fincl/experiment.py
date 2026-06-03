@@ -67,7 +67,7 @@ class AgenticExperiment:
             csv_path=self.config.memory_build_csv,
             phase="memory_build",
             agent_mode="offline_build",
-            gold_visible=True,
+            supervise_after_loop=True,
             score=True,
         )
         build_snapshot = self.ltm.snapshot()
@@ -77,7 +77,7 @@ class AgenticExperiment:
             csv_path=self.config.test_csv,
             phase="test",
             agent_mode="offline_test",
-            gold_visible=False,
+            supervise_after_loop=False,
             score=True,
         )
 
@@ -99,7 +99,7 @@ class AgenticExperiment:
             csv_path=self.config.stream_csv,
             phase="online_with_gt",
             agent_mode="online_with_gt",
-            gold_visible=True,
+            supervise_after_loop=True,
             score=True,
         )
         summary = {
@@ -119,7 +119,7 @@ class AgenticExperiment:
             csv_path=self.config.stream_csv,
             phase="online_without_gt",
             agent_mode="online_without_gt",
-            gold_visible=False,
+            supervise_after_loop=False,
             score="answer" in pd.read_csv(self.config.stream_csv, nrows=0).columns,
         )
         summary = {
@@ -136,7 +136,7 @@ class AgenticExperiment:
         csv_path: Path,
         phase: str,
         agent_mode: str,
-        gold_visible: bool,
+        supervise_after_loop: bool,
         score: bool,
     ) -> dict[str, Any]:
         df = pd.read_csv(csv_path)
@@ -147,7 +147,7 @@ class AgenticExperiment:
         records: list[dict[str, Any]] = []
         with predictions_path.open("w", encoding="utf-8") as f:
             for row_idx, row in enumerate(df.itertuples(index=False), start=1):
-                record = self._run_one(row_idx, row, agent_mode, gold_visible)
+                record = self._run_one(row_idx, row, agent_mode, supervise_after_loop)
                 records.append(record)
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 if self.config.limit and row_idx >= self.config.limit:
@@ -161,14 +161,13 @@ class AgenticExperiment:
         self._write_breakdown(records, phase_dir, score)
         return metrics
 
-    def _run_one(self, row_idx: int, row: Any, agent_mode: str, gold_visible: bool) -> dict[str, Any]:
+    def _run_one(self, row_idx: int, row: Any, agent_mode: str, supervise_after_loop: bool) -> dict[str, Any]:
         evidence = localize_context(row.context, row.category, row.entity)
         feedback: list[str] = []
         attempts = []
         final_decision = None
         candidates: list[dict[str, Any]] = []
         memory_hits: dict[str, list[dict[str, Any]]] = {}
-        gold_for_agent = row.answer if gold_visible and hasattr(row, "answer") else None
 
         for attempt in range(1, self.config.max_iters + 1):
             candidates, memory_hits = self.retriever.retrieve(
@@ -197,7 +196,7 @@ class AgenticExperiment:
                 selection=selection,
                 candidates=candidates,
                 memory_hits=memory_hits,
-                gold_tag=gold_for_agent,
+                gold_tag=None,
                 attempt=attempt,
                 max_iters=self.config.max_iters,
             )
@@ -225,6 +224,28 @@ class AgenticExperiment:
 
         final_tag = final_decision.final_tag if final_decision is not None else ""
         gold_tag = row.answer if hasattr(row, "answer") else None
+        supervision_record = None
+        if supervise_after_loop and gold_tag is not None:
+            supervision = self.validator.supervise_after_loop(
+                mode=agent_mode,
+                category=row.category,
+                entity=row.entity,
+                entity_type=row.entity_type,
+                evidence=evidence,
+                predicted_tag=final_tag,
+                gold_tag=gold_tag,
+                flags=final_decision.flags if final_decision else [],
+            )
+            if supervision.memory_writes:
+                self.ltm.append_many(supervision.memory_writes)
+            supervision_record = {
+                "action": supervision.action,
+                "final_tag": supervision.final_tag,
+                "passed": supervision.passed,
+                "rationale": supervision.rationale,
+                "flags": supervision.flags,
+                "memory_writes": [write.namespace for write in supervision.memory_writes],
+            }
         return {
             "row_index": row_idx - 1,
             "gold": {"Fact": str(row.entity), "Type": row.entity_type, "Tag": gold_tag},
@@ -240,6 +261,7 @@ class AgenticExperiment:
                 "attempts": attempts,
                 "final_action": final_decision.action if final_decision else "none",
                 "final_flags": final_decision.flags if final_decision else [],
+                "post_loop_supervision": supervision_record,
             },
         }
 

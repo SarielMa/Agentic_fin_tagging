@@ -104,7 +104,7 @@ class ValidatorCorrectorAgent:
                 selection=selection,
                 candidates=candidates,
                 memory_hits=memory_hits,
-                gold_tag=gold_tag if mode in {"offline_build", "online_with_gt"} else None,
+                gold_tag=None,
             )
             return self._attach_memory_writes(
                 llm_decision,
@@ -114,7 +114,7 @@ class ValidatorCorrectorAgent:
                 entity_type,
                 evidence,
                 selection.selected_tag,
-                gold_tag,
+                None,
             )
 
         decision = self._rule_validate(
@@ -122,7 +122,7 @@ class ValidatorCorrectorAgent:
             entity_type,
             selection,
             candidates,
-            gold_tag,
+            None,
             attempt,
             max_iters,
         )
@@ -134,7 +134,50 @@ class ValidatorCorrectorAgent:
             entity_type,
             evidence,
             selection.selected_tag,
-            gold_tag,
+            None,
+        )
+
+    def supervise_after_loop(
+        self,
+        mode: str,
+        category: str,
+        entity: Any,
+        entity_type: str,
+        evidence: str,
+        predicted_tag: str,
+        gold_tag: str,
+        flags: list[str],
+    ) -> ValidationDecision:
+        """Use gold after the loop to write supervised memory.
+
+        This method is intentionally separate from ``validate`` so Agent 2 does
+        not reveal the gold label to Agent 1 during retry loops.
+        """
+        if predicted_tag == gold_tag:
+            decision = ValidationDecision(
+                action="supervise_keep",
+                final_tag=predicted_tag,
+                passed=True,
+                rationale="Post-loop supervision confirmed the final tag.",
+                flags=flags,
+            )
+        else:
+            decision = ValidationDecision(
+                action="supervise_correct",
+                final_tag=gold_tag,
+                passed=True,
+                rationale="Post-loop supervision corrected the final tag for memory update.",
+                flags=flags + ["wrong_against_gold"],
+            )
+        return self._attach_memory_writes(
+            decision=decision,
+            mode=mode,
+            category=category,
+            entity=entity,
+            entity_type=entity_type,
+            evidence=evidence,
+            selected_tag=predicted_tag,
+            gold_tag=gold_tag,
         )
 
     def _rule_validate(
@@ -149,36 +192,6 @@ class ValidatorCorrectorAgent:
     ) -> ValidationDecision:
         rule_flags = validate_prediction(entity_type, candidates, selection.selected_tag)["flags"]
         top_tag = candidates[0]["tag"] if candidates else ""
-
-        if mode in {"offline_build", "online_with_gt"} and gold_tag is not None:
-            if selection.selected_tag == gold_tag:
-                risk_note = self._risk_note(rule_flags)
-                return ValidationDecision(
-                    action="keep",
-                    final_tag=selection.selected_tag,
-                    passed=True,
-                    rationale="Gold-supervised validator accepted the selector output." + risk_note,
-                    flags=rule_flags,
-                )
-            if attempt < max_iters:
-                feedback = f"Previous tag {selection.selected_tag} was wrong; prefer {gold_tag}."
-                feedback += self._risk_feedback(rule_flags)
-                return ValidationDecision(
-                    action="retry",
-                    final_tag=selection.selected_tag,
-                    passed=False,
-                    rationale="Gold-supervised validator found an incorrect tag and requests retry.",
-                    feedback_to_selector=feedback,
-                    flags=rule_flags + ["wrong_against_gold"],
-                )
-            risk_note = self._risk_note(rule_flags)
-            return ValidationDecision(
-                action="correct",
-                final_tag=gold_tag,
-                passed=True,
-                rationale="Gold-supervised validator corrected the final tag." + risk_note,
-                flags=rule_flags + ["wrong_against_gold"],
-            )
 
         if rule_flags and attempt < max_iters:
             return ValidationDecision(
@@ -251,7 +264,7 @@ class ValidatorCorrectorAgent:
         can_write_gold = (
             mode in {"offline_build", "online_with_gt"}
             and gold_tag is not None
-            and decision.action in {"keep", "correct"}
+            and decision.action in {"keep", "correct", "supervise_keep", "supervise_correct"}
             and decision.passed
         )
         can_write_unsupervised = mode == "online_without_gt" and decision.action == "keep" and decision.passed
