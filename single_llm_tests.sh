@@ -1,10 +1,12 @@
 #!/usr/bin/env sh
 set -eu
 
-TOTAL_JOBS=12
+TOTAL_JOBS=2
 JOB_INDEX=0
 MODEL_CACHE_MISSING=0
 FINAI_LOCAL_FILES_ONLY="${FINAI_LOCAL_FILES_ONLY:-0}"
+TABLE_EVIDENCE_BACKEND="${TABLE_EVIDENCE_BACKEND:-llama}"
+LIMIT="${LIMIT:-0}"
 export FINAI_LOCAL_FILES_ONLY
 
 is_truthy() {
@@ -50,8 +52,8 @@ check_model_cache() {
 check_model_caches() {
   check_model_cache "Qwen/Qwen3-14B"
   check_model_cache "Qwen/Qwen3-32B"
-  check_model_cache "meta-llama/Llama-3.2-3B-Instruct"
-  check_model_cache "meta-llama/Llama-3.1-8B-Instruct"
+  # check_model_cache "meta-llama/Llama-3.2-3B-Instruct"
+  # check_model_cache "meta-llama/Llama-3.1-8B-Instruct"
 
   if [ "$MODEL_CACHE_MISSING" -ne 0 ]; then
     echo "One or more required model caches are missing while offline/local-only mode is enabled."
@@ -62,71 +64,22 @@ check_model_caches() {
 
 announce_job() {
   JOB_INDEX=$((JOB_INDEX + 1))
-  echo "[$JOB_INDEX/$TOTAL_JOBS] $1 for $2"
+  echo "[$JOB_INDEX/$TOTAL_JOBS] Running single-LLM baseline for $1"
 }
 
-run_offline() {
+run_single_llm_baseline() {
   model="$1"
   suffix="$2"
 
-  announce_job "Running offline test" "$model"
-  python scripts/run_two_agent_system.py \
-    --mode offline \
-    --memory-build data/FinCL-eval-subset-clean-memory.csv \
+  announce_job "$model"
+  python scripts/run_single_llm_baseline.py \
     --test data/FinCL-eval-subset-clean-test.csv \
     --taxonomy data/us_gaap_2024_BM25.jsonl \
-    --table-evidence-backend llama \
+    --model "$model" \
+    --table-evidence-backend "$TABLE_EVIDENCE_BACKEND" \
     --table-evidence-model "$model" \
-    --selector-backend llama \
-    --selector-model "$model" \
-    --validator-backend llama \
-    --validator-model "$model" \
-    --output-dir "outputs/offline_${suffix}_TTT"
-}
-
-run_online_with_gt() {
-  model="$1"
-  suffix="$2"
-
-  announce_job "Running online_with_gt test" "$model"
-  python scripts/run_two_agent_system.py \
-    --mode online_with_gt \
-    --stream data/FinCL-eval-subset-clean-test.csv \
-    --taxonomy data/us_gaap_2024_BM25.jsonl \
-    --table-evidence-backend llama \
-    --table-evidence-model "$model" \
-    --selector-backend llama \
-    --selector-model "$model" \
-    --validator-backend llama \
-    --validator-model "$model" \
-    --output-dir "outputs/online_gt_${suffix}_TTT"
-}
-
-run_online_without_gt() {
-  model="$1"
-  suffix="$2"
-
-  announce_job "Running online_without_gt test" "$model"
-  python scripts/run_two_agent_system.py \
-    --mode online_without_gt \
-    --stream data/FinCL-eval-subset-clean-test.csv \
-    --taxonomy data/us_gaap_2024_BM25.jsonl \
-    --table-evidence-backend llama \
-    --table-evidence-model "$model" \
-    --selector-backend llama \
-    --selector-model "$model" \
-    --validator-backend llama \
-    --validator-model "$model" \
-    --output-dir "outputs/online_without_gt_${suffix}_TTT"
-}
-
-run_suite() {
-  model="$1"
-  suffix="$2"
-
-  run_offline "$model" "$suffix"
-  run_online_with_gt "$model" "$suffix"
-  run_online_without_gt "$model" "$suffix"
+    --limit "$LIMIT" \
+    --output-dir "outputs/single_llm_${suffix}_baseline"
 }
 
 if [ "${SKIP_MODEL_CACHE_CHECK:-0}" != "1" ]; then
@@ -138,7 +91,7 @@ if [ "${PRECHECK_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# ---- CUDA toolkit for DeepSpeed ops ----
+# ---- CUDA toolkit for Hugging Face generation ----
 if [ -z "${CONDA_PREFIX:-}" ]; then
   module purge
 fi
@@ -151,7 +104,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton-${USER:-user}}"
 mkdir -p "$TRITON_CACHE_DIR"
 
-# run_suite "Qwen/Qwen3-14B" "qwen3_14b"
-# run_suite "Qwen/Qwen3-32B" "qwen3_32b"
-run_suite "meta-llama/Llama-3.2-3B-Instruct" "llama3_2_3b"
-# run_suite "meta-llama/Llama-3.1-8B-Instruct" "llama3_1_8b"
+run_single_llm_baseline "Qwen/Qwen3-14B" "qwen3_14b"
+# run_single_llm_baseline "Qwen/Qwen3-32B" "qwen3_32b"
+run_single_llm_baseline "meta-llama/Llama-3.2-3B-Instruct" "llama3_2_3b"
+# run_single_llm_baseline "meta-llama/Llama-3.1-8B-Instruct" "llama3_1_8b"

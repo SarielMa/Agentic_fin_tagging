@@ -1,11 +1,21 @@
 #!/usr/bin/env sh
 set -eu
 
-TOTAL_JOBS=12
+MODEL="Qwen/Qwen3-32B"
+SUFFIX="qwen3_32b"
+TOTAL_JOBS=4
 JOB_INDEX=0
 MODEL_CACHE_MISSING=0
 FINAI_LOCAL_FILES_ONLY="${FINAI_LOCAL_FILES_ONLY:-0}"
+TABLE_EVIDENCE_BACKEND="${TABLE_EVIDENCE_BACKEND:-llama}"
+LIMIT="${LIMIT:-0}"
+CLEAN_OUTPUTS="${CLEAN_OUTPUTS:-0}"
 export FINAI_LOCAL_FILES_ONLY
+
+SINGLE_OUTPUT_DIR="outputs/single_llm_${SUFFIX}_baseline"
+OFFLINE_OUTPUT_DIR="outputs/offline_${SUFFIX}_TTT"
+ONLINE_GT_OUTPUT_DIR="outputs/online_gt_${SUFFIX}_TTT"
+ONLINE_NO_GT_OUTPUT_DIR="outputs/online_without_gt_${SUFFIX}_TTT"
 
 is_truthy() {
   case "${1:-0}" in
@@ -48,85 +58,103 @@ check_model_cache() {
 }
 
 check_model_caches() {
-  check_model_cache "Qwen/Qwen3-14B"
-  check_model_cache "Qwen/Qwen3-32B"
-  check_model_cache "meta-llama/Llama-3.2-3B-Instruct"
-  check_model_cache "meta-llama/Llama-3.1-8B-Instruct"
+  check_model_cache "$MODEL"
 
   if [ "$MODEL_CACHE_MISSING" -ne 0 ]; then
-    echo "One or more required model caches are missing while offline/local-only mode is enabled."
+    echo "Required model cache is missing while offline/local-only mode is enabled."
     echo "Unset FINAI_LOCAL_FILES_ONLY, HF_HUB_OFFLINE, and TRANSFORMERS_OFFLINE to allow downloads."
     exit 1
   fi
 }
 
+prepare_output_dir() {
+  output_dir="$1"
+  if [ ! -d "$output_dir" ]; then
+    return 0
+  fi
+
+  if is_truthy "$CLEAN_OUTPUTS"; then
+    echo "Removing existing output directory: ${output_dir}"
+    rm -rf "$output_dir"
+    return 0
+  fi
+
+  echo "Output directory already exists: ${output_dir}"
+  echo "Set CLEAN_OUTPUTS=1 to remove it before running, or move it aside manually."
+  exit 1
+}
+
+prepare_output_dirs() {
+  prepare_output_dir "$SINGLE_OUTPUT_DIR"
+  prepare_output_dir "$OFFLINE_OUTPUT_DIR"
+  prepare_output_dir "$ONLINE_GT_OUTPUT_DIR"
+  prepare_output_dir "$ONLINE_NO_GT_OUTPUT_DIR"
+}
+
 announce_job() {
   JOB_INDEX=$((JOB_INDEX + 1))
-  echo "[$JOB_INDEX/$TOTAL_JOBS] $1 for $2"
+  echo "[$JOB_INDEX/$TOTAL_JOBS] $1 for $MODEL"
+}
+
+run_single_llm_baseline() {
+  announce_job "Running single-LLM baseline"
+  python scripts/run_single_llm_baseline.py \
+    --test data/FinCL-eval-subset-clean-test.csv \
+    --taxonomy data/us_gaap_2024_BM25.jsonl \
+    --model "$MODEL" \
+    --table-evidence-backend "$TABLE_EVIDENCE_BACKEND" \
+    --table-evidence-model "$MODEL" \
+    --limit "$LIMIT" \
+    --output-dir "$SINGLE_OUTPUT_DIR"
 }
 
 run_offline() {
-  model="$1"
-  suffix="$2"
-
-  announce_job "Running offline test" "$model"
+  announce_job "Running offline TTT"
   python scripts/run_two_agent_system.py \
     --mode offline \
     --memory-build data/FinCL-eval-subset-clean-memory.csv \
     --test data/FinCL-eval-subset-clean-test.csv \
     --taxonomy data/us_gaap_2024_BM25.jsonl \
     --table-evidence-backend llama \
-    --table-evidence-model "$model" \
+    --table-evidence-model "$MODEL" \
     --selector-backend llama \
-    --selector-model "$model" \
+    --selector-model "$MODEL" \
     --validator-backend llama \
-    --validator-model "$model" \
-    --output-dir "outputs/offline_${suffix}_TTT"
+    --validator-model "$MODEL" \
+    --limit "$LIMIT" \
+    --output-dir "$OFFLINE_OUTPUT_DIR"
 }
 
 run_online_with_gt() {
-  model="$1"
-  suffix="$2"
-
-  announce_job "Running online_with_gt test" "$model"
+  announce_job "Running online_with_gt TTT"
   python scripts/run_two_agent_system.py \
     --mode online_with_gt \
     --stream data/FinCL-eval-subset-clean-test.csv \
     --taxonomy data/us_gaap_2024_BM25.jsonl \
     --table-evidence-backend llama \
-    --table-evidence-model "$model" \
+    --table-evidence-model "$MODEL" \
     --selector-backend llama \
-    --selector-model "$model" \
+    --selector-model "$MODEL" \
     --validator-backend llama \
-    --validator-model "$model" \
-    --output-dir "outputs/online_gt_${suffix}_TTT"
+    --validator-model "$MODEL" \
+    --limit "$LIMIT" \
+    --output-dir "$ONLINE_GT_OUTPUT_DIR"
 }
 
 run_online_without_gt() {
-  model="$1"
-  suffix="$2"
-
-  announce_job "Running online_without_gt test" "$model"
+  announce_job "Running online_without_gt TTT"
   python scripts/run_two_agent_system.py \
     --mode online_without_gt \
     --stream data/FinCL-eval-subset-clean-test.csv \
     --taxonomy data/us_gaap_2024_BM25.jsonl \
     --table-evidence-backend llama \
-    --table-evidence-model "$model" \
+    --table-evidence-model "$MODEL" \
     --selector-backend llama \
-    --selector-model "$model" \
+    --selector-model "$MODEL" \
     --validator-backend llama \
-    --validator-model "$model" \
-    --output-dir "outputs/online_without_gt_${suffix}_TTT"
-}
-
-run_suite() {
-  model="$1"
-  suffix="$2"
-
-  run_offline "$model" "$suffix"
-  run_online_with_gt "$model" "$suffix"
-  run_online_without_gt "$model" "$suffix"
+    --validator-model "$MODEL" \
+    --limit "$LIMIT" \
+    --output-dir "$ONLINE_NO_GT_OUTPUT_DIR"
 }
 
 if [ "${SKIP_MODEL_CACHE_CHECK:-0}" != "1" ]; then
@@ -138,7 +166,9 @@ if [ "${PRECHECK_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# ---- CUDA toolkit for DeepSpeed ops ----
+prepare_output_dirs
+
+# ---- CUDA toolkit for Hugging Face generation ----
 if [ -z "${CONDA_PREFIX:-}" ]; then
   module purge
 fi
@@ -151,7 +181,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/triton-${USER:-user}}"
 mkdir -p "$TRITON_CACHE_DIR"
 
-# run_suite "Qwen/Qwen3-14B" "qwen3_14b"
-# run_suite "Qwen/Qwen3-32B" "qwen3_32b"
-run_suite "meta-llama/Llama-3.2-3B-Instruct" "llama3_2_3b"
-# run_suite "meta-llama/Llama-3.1-8B-Instruct" "llama3_1_8b"
+run_single_llm_baseline
+run_offline
+run_online_with_gt
+run_online_without_gt
