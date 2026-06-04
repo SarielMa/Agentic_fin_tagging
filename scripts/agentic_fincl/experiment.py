@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,7 @@ from tqdm.auto import tqdm
 
 from .agents import TagSelectorAgent, ValidatorCorrectorAgent
 from .data import load_taxonomy
+from .evaluation import evaluate_agentic_records, write_agentic_breakdown
 from .evidence import build_evidence_builder
 from .memory_store import LTMStore
 from .retrieval import DynamicLTMRetriever
@@ -170,16 +170,46 @@ class AgenticExperiment:
                 if self.config.limit and row_idx >= self.config.limit:
                     break
 
-        metrics = self._metrics(records, score)
+        metrics = evaluate_agentic_records(
+            records,
+            score,
+            self.config.recall_k,
+            metadata={
+                "selector_backend": self.config.selector_backend,
+                "selector_model": self.config.selector_model if self.config.selector_backend == "llama" else None,
+                "validator_backend": self.config.validator_backend,
+                "validator_model": self.config.validator_model if self.config.validator_backend == "llama" else None,
+                "table_evidence_backend": self.config.table_evidence_backend,
+                "table_evidence_model": self.config.table_evidence_model
+                if self.config.table_evidence_backend == "llama"
+                else None,
+                "top_k": self.config.top_k,
+                "rerank_k": self.config.rerank_k,
+                "max_iters": self.config.max_iters,
+            },
+        )
         metrics["predictions_path"] = str(predictions_path)
         metrics["memory_snapshot"] = self.ltm.snapshot()
         with (phase_dir / "metrics.json").open("w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
-        self._write_breakdown(records, phase_dir, score)
+        write_agentic_breakdown(records, phase_dir, score)
         return metrics
 
     def _run_one(self, row_idx: int, row: Any, agent_mode: str, supervise_after_loop: bool) -> dict[str, Any]:
-        evidence = self.evidence_builder.build(row.context, row.category, row.entity, row.entity_type)
+        pre_evidence_table_patterns = self.retriever.retrieve_table_patterns_for_evidence(
+            row.context,
+            row.category,
+            row.entity,
+            row.entity_type,
+            top_k=self.config.memory_k,
+        )
+        evidence = self.evidence_builder.build(
+            row.context,
+            row.category,
+            row.entity,
+            row.entity_type,
+            table_patterns=pre_evidence_table_patterns,
+        )
         feedback: list[str] = []
         attempts = []
         final_decision = None
@@ -203,6 +233,7 @@ class AgenticExperiment:
                 evidence,
                 candidates[: self.config.rerank_k],
                 feedback,
+                memory_hits=memory_hits,
             )
             decision = self.validator.validate(
                 mode=agent_mode,
@@ -273,6 +304,7 @@ class AgenticExperiment:
                 "category": row.category,
                 "entity": {"value": str(row.entity), "type": row.entity_type},
                 "evidence": evidence,
+                "pre_evidence_table_pattern_hits": pre_evidence_table_patterns[:5],
                 "top_k": candidates[: self.config.save_top_k],
                 "memory_hits": {key: value[:5] for key, value in memory_hits.items()},
                 "attempts": attempts,
@@ -281,84 +313,6 @@ class AgenticExperiment:
                 "post_loop_supervision": supervision_record,
             },
         }
-
-    def _metrics(self, records: list[dict[str, Any]], score: bool) -> dict[str, Any]:
-        n = len(records)
-        metrics: dict[str, Any] = {
-            "num_examples": n,
-            "selector_backend": self.config.selector_backend,
-            "selector_model": self.config.selector_model if self.config.selector_backend == "llama" else None,
-            "validator_backend": self.config.validator_backend,
-            "validator_model": self.config.validator_model if self.config.validator_backend == "llama" else None,
-            "table_evidence_backend": self.config.table_evidence_backend,
-            "table_evidence_model": self.config.table_evidence_model
-            if self.config.table_evidence_backend == "llama"
-            else None,
-            "top_k": self.config.top_k,
-            "rerank_k": self.config.rerank_k,
-            "max_iters": self.config.max_iters,
-        }
-        action_counts: dict[str, int] = {}
-        for record in records:
-            action = record["stm"]["final_action"]
-            action_counts[action] = action_counts.get(action, 0) + 1
-        metrics["action_counts"] = action_counts
-        metrics["flag_rate"] = action_counts.get("flag", 0) / n if n else math.nan
-
-        if not score:
-            return metrics
-
-        correct = sum(1 for record in records if record["correct"])
-        recall_counts = {k: 0 for k in self.config.recall_k}
-        for record in records:
-            gold_tag = record["gold"]["Tag"]
-            candidate_tags = [candidate["tag"] for candidate in record["stm"]["top_k"]]
-            for k in self.config.recall_k:
-                recall_counts[k] += int(gold_tag in candidate_tags[:k])
-        metrics["tag_accuracy"] = correct / n if n else math.nan
-        metrics["recall_at_k"] = {str(k): recall_counts[k] / n if n else math.nan for k in self.config.recall_k}
-        return metrics
-
-    def _write_breakdown(self, records: list[dict[str, Any]], phase_dir: Path, score: bool) -> None:
-        if not records or not score:
-            return
-        rows = []
-        for record in records:
-            candidates = [candidate["tag"] for candidate in record["stm"]["top_k"]]
-            rows.append(
-                {
-                    "category": record["stm"]["category"],
-                    "entity_type": record["gold"]["Type"],
-                    "correct": record["correct"],
-                    "flagged": record["stm"]["final_action"] == "flag",
-                    "recall20": record["gold"]["Tag"] in candidates[:20],
-                    "recall50": record["gold"]["Tag"] in candidates[:50],
-                    "recall100": record["gold"]["Tag"] in candidates[:100],
-                    "recall200": record["gold"]["Tag"] in candidates[:200],
-                }
-            )
-        df = pd.DataFrame(rows)
-        breakdown = {
-            "by_category": self._group_breakdown(df, "category"),
-            "by_entity_type": self._group_breakdown(df, "entity_type"),
-        }
-        with (phase_dir / "breakdown.json").open("w", encoding="utf-8") as f:
-            json.dump(breakdown, f, indent=2)
-
-    @staticmethod
-    def _group_breakdown(df: pd.DataFrame, column: str) -> dict[str, dict[str, float]]:
-        result: dict[str, dict[str, float]] = {}
-        for key, group in df.groupby(column):
-            result[str(key)] = {
-                "n": int(len(group)),
-                "accuracy": float(group["correct"].mean()),
-                "recall20": float(group["recall20"].mean()),
-                "recall50": float(group["recall50"].mean()),
-                "recall100": float(group["recall100"].mean()),
-                "recall200": float(group["recall200"].mean()),
-                "flag_rate": float(group["flagged"].mean()),
-            }
-        return result
 
     def _write_json(self, name: str, payload: dict[str, Any]) -> None:
         with (self.config.output_dir / name).open("w", encoding="utf-8") as f:

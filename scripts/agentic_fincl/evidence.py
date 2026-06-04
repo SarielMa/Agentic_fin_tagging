@@ -9,22 +9,37 @@ from .text_utils import localize_context, normalize_space, row_contains_entity, 
 
 
 class EvidenceBuilder(Protocol):
-    def build(self, context: str, category: str, entity: Any, entity_type: str) -> str:
+    def build(
+        self,
+        context: str,
+        category: str,
+        entity: Any,
+        entity_type: str,
+        table_patterns: list[dict[str, Any]] | None = None,
+    ) -> str:
         ...
 
 
 class HeuristicEvidenceBuilder:
     """Fast default evidence builder."""
 
-    def build(self, context: str, category: str, entity: Any, entity_type: str) -> str:
+    def build(
+        self,
+        context: str,
+        category: str,
+        entity: Any,
+        entity_type: str,
+        table_patterns: list[dict[str, Any]] | None = None,
+    ) -> str:
         return localize_context(context, category, entity)
 
 
 class LlamaTableEvidenceBuilder:
     """LLM evidence builder for table rows, with heuristic fallback.
 
-    The LLM sees only context, category, entity, and entity_type. It never sees
-    the gold US-GAAP answer.
+    The LLM sees context, category, entity, entity_type, and optional table
+    pattern memory from previous samples. It never sees the current sample's
+    gold US-GAAP answer.
     """
 
     def __init__(
@@ -48,12 +63,19 @@ class LlamaTableEvidenceBuilder:
             AutoTokenizer,
         )
 
-    def build(self, context: str, category: str, entity: Any, entity_type: str) -> str:
+    def build(
+        self,
+        context: str,
+        category: str,
+        entity: Any,
+        entity_type: str,
+        table_patterns: list[dict[str, Any]] | None = None,
+    ) -> str:
         if category != "table":
             return self.fallback.build(context, category, entity, entity_type)
 
         table_view = self._compact_table_view(context, entity)
-        prompt = self._build_prompt(table_view, entity, entity_type)
+        prompt = self._build_prompt(table_view, entity, entity_type, table_patterns or [])
         raw = self._generate(prompt)
         parsed = self._parse_json(raw)
         if not parsed:
@@ -104,12 +126,47 @@ class LlamaTableEvidenceBuilder:
         return "\n".join(lines)[:7000]
 
     @staticmethod
-    def _build_prompt(table_view: str, entity: Any, entity_type: str) -> str:
+    def _format_table_patterns(table_patterns: list[dict[str, Any]]) -> str:
+        lines = []
+        for idx, pattern in enumerate(table_patterns[:3], start=1):
+            score = pattern.get("score")
+            try:
+                score_text = f" score={float(score):.3f}" if score is not None else ""
+            except (TypeError, ValueError):
+                score_text = ""
+            fields = [
+                f"memory {idx}{score_text}:",
+                f"prior_entity={pattern.get('entity', '')}",
+                f"prior_tag={pattern.get('tag', '')}",
+                f"prior_pattern={str(pattern.get('pattern', ''))[:500]}",
+                f"prior_evidence={str(pattern.get('evidence', ''))[:700]}",
+            ]
+            lines.append(normalize_space(" ".join(field for field in fields if field)))
+        return "\n".join(lines)
+
+    @classmethod
+    def _build_prompt(
+        cls,
+        table_view: str,
+        entity: Any,
+        entity_type: str,
+        table_patterns: list[dict[str, Any]],
+    ) -> str:
+        memory_text = cls._format_table_patterns(table_patterns)
+        memory_section = ""
+        if memory_text:
+            memory_section = (
+                "Relevant table-pattern memory from previous samples:\n"
+                f"{memory_text}\n\n"
+                "Use these memories as examples of which title, unit, headers, section, row label, "
+                "and nearby rows were useful for similar tables. Do not output a US-GAAP tag.\n\n"
+            )
         return (
             "You are building evidence for US-GAAP XBRL tagging. "
             "Do not predict the US-GAAP tag. Extract table context only.\n\n"
             f"Target entity: {entity}\n"
             f"Target entity type: {entity_type}\n\n"
+            f"{memory_section}"
             "The table below is serialized as numbered rows. Identify the target value's useful context.\n"
             "Return only valid JSON with these keys:\n"
             "{\n"

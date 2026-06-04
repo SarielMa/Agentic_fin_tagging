@@ -68,11 +68,13 @@ The upgraded system uses two agents:
 
 1. **Tag Selector Agent**
    - Retrieves taxonomy candidates.
-   - Uses selector memory, error-book memory, and table-pattern memory.
+   - Uses boosted candidate rankings from LTM.
+   - Reads a compact LTM lesson summary built from selector memory, error-book memory, and table-pattern memory.
    - Selects a candidate tag.
 
 2. **Validator-Corrector Agent**
    - Checks the selector output.
+   - Reads Agent 1's processed memory summary when the validator backend is an LLM.
    - Can keep, correct, retry, or flag the prediction.
    - Controls writes to long-term memory.
 
@@ -96,15 +98,15 @@ For table examples, two backends are available:
 | Backend | Behavior |
 |---|---|
 | `heuristic` | Default. Parses table rows and uses rows containing the target entity. Fast and does not require an LLM. |
-| `llama` | Uses an LLM to produce a compact table description before retrieval. This can include table title, unit, column header, section context, matched row, nearby rows, and a retrieval query. |
+| `llama` | Uses an LLM to produce a compact table description before retrieval. This can include table title, unit, column header, section context, matched row, nearby rows, and a retrieval query. It also receives relevant `table_context_patterns` from prior LTM writes when available. |
 
 The LLM table evidence builder sees only:
 
 ```text
-context + category + entity + entity_type
+context + category + entity + entity_type + prior table_context_patterns
 ```
 
-It does not see the gold tag and is instructed not to predict the US-GAAP tag. Its job is only to build better table evidence.
+It does not see the current sample's gold tag and is instructed not to predict the US-GAAP tag. Its job is only to build better table evidence.
 
 ### ReAct-Style Loop
 
@@ -116,12 +118,12 @@ Initialize STM with:
 
 Build evidence:
   text -> nearby text evidence
-  table -> heuristic row evidence or LLM-generated table description
+  table -> retrieve similar table-pattern memory, then build heuristic row evidence or LLM-generated table description
 
 For attempt = 1..max_iters:
   1. Retrieve candidates from taxonomy + current LTM.
-  2. Agent 1 selects a tag.
-  3. Agent 2 validates the selected tag.
+  2. Agent 1 summarizes relevant LTM lessons and selects a tag.
+  3. Agent 2 validates the selected tag and Agent 1 memory summary.
 
   If Agent 2 returns keep:
       final_tag = Agent 1 tag
@@ -329,6 +331,12 @@ Each prediction record contains:
 ```
 
 ## Evaluation Metrics
+
+Metric and breakdown logic lives in one inspectable module:
+
+```text
+scripts/agentic_fincl/evaluation.py
+```
 
 The main metrics are:
 

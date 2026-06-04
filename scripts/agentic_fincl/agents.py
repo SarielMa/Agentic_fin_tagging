@@ -15,6 +15,7 @@ class Selection:
     confidence: float
     rationale: str
     backend: str
+    memory_context: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,17 +48,25 @@ class TagSelectorAgent:
         evidence: str,
         candidates: list[dict[str, Any]],
         feedback: list[str],
+        memory_hits: dict[str, list[dict[str, Any]]] | None = None,
     ) -> Selection:
-        augmented_evidence = evidence
+        memory_context = self._selector_memory_context(memory_hits or {})
+        evidence_parts = []
         if feedback:
-            augmented_evidence = evidence + "\nValidator feedback from prior attempt: " + " ".join(feedback)
+            evidence_parts.append("Validator feedback from prior attempt: " + " ".join(feedback))
+        if memory_context:
+            evidence_parts.append("Relevant long-term memory lessons for tag selection:\n" + memory_context)
+        evidence_parts.append("Current evidence:\n" + evidence)
+        augmented_evidence = "\n\n".join(evidence_parts)
         selected_tag = self.reranker.choose(entity, entity_type, augmented_evidence, candidates)
         confidence = self._score_confidence(selected_tag, candidates)
+        memory_note = " using retrieved LTM lessons" if memory_context else ""
         return Selection(
             selected_tag=selected_tag,
             confidence=confidence,
-            rationale=f"{self.backend} selector chose {selected_tag}",
+            rationale=f"{self.backend} selector chose {selected_tag}{memory_note}",
             backend=self.backend,
+            memory_context=memory_context,
         )
 
     @staticmethod
@@ -71,6 +80,79 @@ class TagSelectorAgent:
         if top_score <= 0:
             return 0.0
         return float(max(0.0, min(1.0, selected["score"] / top_score)))
+
+    @classmethod
+    def _selector_memory_context(cls, memory_hits: dict[str, list[dict[str, Any]]]) -> str:
+        lines: list[str] = []
+
+        selector_hits = memory_hits.get("selector_memory", [])
+        if selector_hits:
+            lines.append("Prior accepted examples:")
+            for hit in selector_hits[:2]:
+                lines.append(
+                    "- "
+                    + cls._join_fields(
+                        [
+                            ("tag", hit.get("tag")),
+                            ("entity", hit.get("entity")),
+                            ("score", cls._score_text(hit.get("score"))),
+                            ("evidence", cls._clip(hit.get("evidence"), 420)),
+                        ]
+                    )
+                )
+
+        error_hits = memory_hits.get("error_book", [])
+        if error_hits:
+            lines.append("Error-book lessons:")
+            for hit in error_hits[:2]:
+                lines.append(
+                    "- "
+                    + cls._join_fields(
+                        [
+                            ("avoid", hit.get("wrong_tag")),
+                            ("prefer", hit.get("correct_tag")),
+                            ("score", cls._score_text(hit.get("score"))),
+                            ("lesson", cls._clip(hit.get("lesson"), 260)),
+                            ("evidence", cls._clip(hit.get("evidence"), 320)),
+                        ]
+                    )
+                )
+
+        table_hits = memory_hits.get("table_context_patterns", [])
+        if table_hits:
+            lines.append("Similar table patterns:")
+            for hit in table_hits[:2]:
+                lines.append(
+                    "- "
+                    + cls._join_fields(
+                        [
+                            ("tag", hit.get("tag")),
+                            ("entity", hit.get("entity")),
+                            ("score", cls._score_text(hit.get("score"))),
+                            ("pattern", cls._clip(hit.get("pattern"), 360)),
+                        ]
+                    )
+                )
+
+        return cls._clip("\n".join(lines), 1200)
+
+    @staticmethod
+    def _join_fields(fields: list[tuple[str, Any]]) -> str:
+        return "; ".join(f"{key}: {value}" for key, value in fields if value is not None and value != "")
+
+    @staticmethod
+    def _clip(value: Any, max_chars: int) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
+
+    @staticmethod
+    def _score_text(score: Any) -> str:
+        try:
+            return f"{float(score):.3f}"
+        except (TypeError, ValueError):
+            return ""
 
 
 class ValidatorCorrectorAgent:
@@ -393,14 +475,11 @@ class LlamaValidator:
         memory_hits: dict[str, list[dict[str, Any]]],
         gold_tag: str | None,
     ) -> str:
-        memory_summary = []
-        for namespace, hits in memory_hits.items():
-            for hit in hits[:3]:
-                memory_summary.append(f"{namespace}: {hit}")
+        memory_summary = selection.memory_context or "No selector memory summary was available."
         gold_note = f"\nGold tag for supervised memory update: {gold_tag}" if gold_tag else ""
         return (
             f"{evidence}\n\n"
             f"Selector proposed: {selection.selected_tag}\n"
             f"Selector rationale: {selection.rationale}\n"
-            f"Relevant memory:\n" + "\n".join(memory_summary) + gold_note
+            f"Selector memory summary:\n{memory_summary}" + gold_note
         )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from .data import load_taxonomy
+from .evaluation import evaluate_fixed_memory_records, write_fixed_memory_breakdown
 from .rerankers import LlamaReranker, RetrievalTop1Reranker, Reranker
 from .retrieval import LTMRetriever
 from .text_utils import localize_context
@@ -50,9 +50,6 @@ def run_pipeline(config: PipelineConfig) -> dict[str, Any]:
     config.output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = config.output_dir / "predictions.jsonl"
 
-    correct = 0
-    flagged = 0
-    recall_counts = {k: 0 for k in config.recall_k}
     records: list[dict[str, Any]] = []
 
     with predictions_path.open("w", encoding="utf-8") as f:
@@ -61,32 +58,25 @@ def run_pipeline(config: PipelineConfig) -> dict[str, Any]:
             records.append(record)
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-            correct += int(record["correct"])
-            flagged += int(record["stm"]["validation"]["status"] == "flagged")
-            candidate_tags = [candidate["tag"] for candidate in record["stm"]["top_k"]]
-            for k in config.recall_k:
-                recall_counts[k] += int(record["gold"]["Tag"] in candidate_tags[:k])
-
             if config.limit and row_idx >= config.limit:
                 break
 
-    n = len(records)
-    metrics = {
-        "num_examples": n,
-        "reranker": config.reranker,
-        "model": config.model if config.reranker == "llama" else None,
-        "top_k": config.top_k,
-        "rerank_k": config.rerank_k if config.reranker == "llama" else None,
-        "memory_k": config.memory_k,
-        "memory_weight": config.memory_weight,
-        "tag_accuracy": correct / n if n else math.nan,
-        "validation_flag_rate": flagged / n if n else math.nan,
-        "recall_at_k": {str(k): recall_counts[k] / n if n else math.nan for k in config.recall_k},
-        "predictions_path": str(predictions_path),
-    }
+    metrics = evaluate_fixed_memory_records(
+        records,
+        config.recall_k,
+        metadata={
+            "reranker": config.reranker,
+            "model": config.model if config.reranker == "llama" else None,
+            "top_k": config.top_k,
+            "rerank_k": config.rerank_k if config.reranker == "llama" else None,
+            "memory_k": config.memory_k,
+            "memory_weight": config.memory_weight,
+        },
+    )
+    metrics["predictions_path"] = str(predictions_path)
     with (config.output_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
-    write_breakdowns(records, config.output_dir)
+    write_fixed_memory_breakdown(records, config.output_dir)
     return metrics
 
 
@@ -134,46 +124,3 @@ def run_one(
         "correct": is_correct,
         "stm": stm,
     }
-
-
-def write_breakdowns(records: list[dict[str, Any]], output_dir: Path) -> None:
-    rows = []
-    for record in records:
-        candidates = [candidate["tag"] for candidate in record["stm"]["top_k"]]
-        rows.append(
-            {
-                "category": record["stm"]["category"],
-                "entity_type": record["gold"]["Type"],
-                "correct": record["correct"],
-                "flagged": record["stm"]["validation"]["status"] == "flagged",
-                "recall20": record["gold"]["Tag"] in candidates[:20],
-                "recall50": record["gold"]["Tag"] in candidates[:50],
-                "recall100": record["gold"]["Tag"] in candidates[:100],
-                "recall200": record["gold"]["Tag"] in candidates[:200],
-            }
-        )
-    if not rows:
-        return
-    df = pd.DataFrame(rows)
-    breakdown = {
-        "by_category": _group_breakdown(df, "category"),
-        "by_entity_type": _group_breakdown(df, "entity_type"),
-    }
-    with (output_dir / "breakdown.json").open("w", encoding="utf-8") as f:
-        json.dump(breakdown, f, indent=2)
-
-
-def _group_breakdown(df: pd.DataFrame, column: str) -> dict[str, dict[str, float]]:
-    grouped = df.groupby(column)
-    result: dict[str, dict[str, float]] = {}
-    for key, group in grouped:
-        result[str(key)] = {
-            "n": int(len(group)),
-            "accuracy": float(group["correct"].mean()),
-            "recall20": float(group["recall20"].mean()),
-            "recall50": float(group["recall50"].mean()),
-            "recall100": float(group["recall100"].mean()),
-            "recall200": float(group["recall200"].mean()),
-            "flag_rate": float(group["flagged"].mean()),
-        }
-    return result

@@ -185,6 +185,20 @@ class DynamicLTMRetriever:
             "table_context_patterns": table_pattern_hits,
         }
 
+    def retrieve_table_patterns_for_evidence(
+        self,
+        context: str,
+        category: str,
+        entity: Any,
+        entity_type: str,
+        top_k: int = 3,
+    ) -> list[dict[str, Any]]:
+        if category != "table" or top_k <= 0:
+            return []
+        query_evidence = localize_context(context, "table", entity, max_chars=2500)
+        query = build_query_text(entity, entity_type, query_evidence)
+        return self._rank_memory("table_context_patterns", query, entity_type, top_k)
+
     def _taxonomy_scores(self, query: str, allowed: list[int]) -> dict[int, float]:
         q_tax = self.taxonomy_vectorizer.transform([query])
         sims = cosine_similarity(q_tax, self.taxonomy_matrix[allowed]).ravel()
