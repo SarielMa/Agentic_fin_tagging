@@ -73,6 +73,8 @@ class LocalLLM:
             pad_token_id = self.tokenizer.eos_token_id
 
         with self.torch.inference_mode():
+            # Fixed testing uses greedy decoding. Temperature/top_p are sampling-only;
+            # neutral values prevent inherited model sampling config warnings.
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
