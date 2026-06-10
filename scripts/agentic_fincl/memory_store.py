@@ -20,22 +20,32 @@ class LTMStore:
             raise ValueError(f"Unknown memory book: {book}")
         return getattr(self, book)
 
-    def write_correct(self, entity_type: str, context: str, tag: str, comment: str) -> None:
+    def write_correct(self, entity_type: str, value: str, context: str, tag: str, comment: str) -> None:
         self._append(
             "correct_book",
             {
                 "entity_type": entity_type,
+                "value": value,
                 "context": context,
                 "tag": tag,
                 "comment": comment,
             },
         )
 
-    def write_error(self, entity_type: str, context: str, predicted_tag: str, correct_tag: str, comment: str) -> None:
+    def write_error(
+        self,
+        entity_type: str,
+        value: str,
+        context: str,
+        predicted_tag: str,
+        correct_tag: str,
+        comment: str,
+    ) -> None:
         self._append(
             "error_book",
             {
                 "entity_type": entity_type,
+                "value": value,
                 "context": context,
                 "predicted_tag": predicted_tag,
                 "correct_tag": correct_tag,

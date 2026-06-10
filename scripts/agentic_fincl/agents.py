@@ -216,6 +216,7 @@ class ValidatorAgent:
         if correct:
             ltm.write_correct(
                 entity_type=example.entity_type,
+                value=str(example.entity),
                 context=context,
                 tag=selector_tag,
                 comment=comment,
@@ -224,6 +225,7 @@ class ValidatorAgent:
         else:
             ltm.write_error(
                 entity_type=example.entity_type,
+                value=str(example.entity),
                 context=context,
                 predicted_tag=selector_tag,
                 correct_tag=example.answer,
@@ -338,6 +340,7 @@ def _format_memories(book: str, memories: list[dict[str, Any]]) -> str:
                 "- "
                 + "; ".join(
                     [
+                        f"value={_clip(memory.get('value', ''), 90)}",
                         f"tag={memory.get('tag')}",
                         f"comment={_clip(memory.get('comment', ''), 180)}",
                         f"context={_clip(memory.get('context', ''), 220)}",
@@ -349,6 +352,7 @@ def _format_memories(book: str, memories: list[dict[str, Any]]) -> str:
                 "- "
                 + "; ".join(
                     [
+                        f"value={_clip(memory.get('value', ''), 90)}",
                         f"predicted={memory.get('predicted_tag')}",
                         f"correct={memory.get('correct_tag')}",
                         f"comment={_clip(memory.get('comment', ''), 180)}",

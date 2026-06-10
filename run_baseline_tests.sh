@@ -8,6 +8,11 @@ set -eu
 MODEL_RUNS="${MODEL_RUNS:-meta-llama/Llama-3.2-3B-Instruct:llama3_2_3b Qwen/Qwen3-14B:qwen3_14b}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/baseline_three_agent}"
 
+# Readable timestamp shared by every output dir in this invocation so reruns
+# never collide (and the pipeline never halts on an existing dir). Override by
+# exporting RUN_TIMESTAMP to reuse a specific run folder.
+RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date '+%Y%m%d_%H%M%S')}"
+
 TAXONOMY_JSONL="${TAXONOMY_JSONL:-data/us_gaap_2024_BM25.jsonl}"
 MEMORY_BUILD_CSV="${MEMORY_BUILD_CSV:-data/FinCL-eval-subset-clean-memory.csv}"
 TEST_CSV="${TEST_CSV:-data/FinCL-eval-subset-clean-test.csv}"
@@ -110,7 +115,7 @@ run_mode() {
   mode="$1"
   model="$2"
   suffix="$3"
-  output_dir="$OUTPUT_ROOT/${suffix}_${mode}"
+  output_dir="$OUTPUT_ROOT/${suffix}_${mode}_${RUN_TIMESTAMP}"
 
   prepare_output_dir "$output_dir"
   echo "=== $suffix | $mode | limit=$LIMIT ==="
@@ -133,7 +138,7 @@ run_mode() {
 run_single_llm() {
   model="$1"
   suffix="$2"
-  output_dir="$OUTPUT_ROOT/${suffix}_single_llm"
+  output_dir="$OUTPUT_ROOT/${suffix}_single_llm_${RUN_TIMESTAMP}"
 
   prepare_output_dir "$output_dir"
   echo "=== $suffix | single_llm | limit=$LIMIT ==="
