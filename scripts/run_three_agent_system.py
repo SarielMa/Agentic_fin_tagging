@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the two-agent FinCL experiment with offline or online modes."""
+# Entry point for the three-agent baseline CLI.
+"""Run the minimal three-agent FinAI tagging baseline."""
 
 from agentic_fincl.experiment_cli import main
 

@@ -1,3 +1,4 @@
+# Shared Hugging Face causal-LM loading and device helpers.
 from __future__ import annotations
 
 import os

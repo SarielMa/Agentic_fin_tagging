@@ -1,630 +1,408 @@
+# Defines the retriever, selector, validator, and local LLM helpers for the baseline.
 from __future__ import annotations
 
+import json
+import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
-from .memory_store import MemoryWrite
-from .rerankers import LlamaReranker, RetrievalTop1Reranker, Reranker
-from .validation import validate_prediction
+from .data import Example, TaxonomyConcept
+from .hf_generation import load_local_causal_lm, model_input_device, move_inputs_to_device
+from .memory_store import LTMStore
+from .retrieval import TaxonomyBM25, rank_memory
+
+
+TAG_RE = re.compile(r"us-gaap:[A-Za-z][A-Za-z0-9_]*")
 
 
 @dataclass(frozen=True)
 class Selection:
-    selected_tag: str
-    confidence: float
+    tag: str
     rationale: str
-    backend: str
-    memory_context: str = ""
+    raw_output: str
+    correct_memories: list[dict[str, Any]]
+    error_memories: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
-class ValidationDecision:
-    action: str
-    final_tag: str
-    passed: bool
-    rationale: str
-    feedback_to_selector: str = ""
-    memory_writes: list[MemoryWrite] = field(default_factory=list)
-    flags: list[str] = field(default_factory=list)
+class ValidationFeedback:
+    suggested_tag: str
+    feedback: str
+    raw_output: str
+    error_memories: list[dict[str, Any]]
 
 
-class TagSelectorAgent:
-    """Agent 1: read-only tag selector."""
+@dataclass(frozen=True)
+class MemoryWriteResult:
+    book: str
+    comment: str
+    predicted_tag: str
+    correct_tag: str
 
-    def __init__(self, backend: str = "retrieval", model: str = "meta-llama/Llama-3.2-3B-Instruct") -> None:
-        self.backend = backend
-        if backend == "retrieval":
-            self.reranker: Reranker = RetrievalTop1Reranker()
-        elif backend == "llama":
-            self.reranker = LlamaReranker(model)
-        else:
-            raise ValueError(f"Unsupported selector backend: {backend}")
+
+class LocalLLM:
+    """Small deterministic wrapper around a local Hugging Face causal LM."""
+
+    def __init__(self, model_name: str) -> None:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.model_name = model_name
+        self.torch = torch
+        self.tokenizer, self.model, _ = load_local_causal_lm(
+            model_name,
+            torch,
+            AutoModelForCausalLM,
+            AutoTokenizer,
+        )
+        self.max_input_tokens = int(os.environ.get("FINAI_MAX_INPUT_TOKENS", "8192"))
+
+    def generate(self, system: str, user: str, max_new_tokens: int = 128) -> str:
+        prompt = self._prompt(system, user)
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_input_tokens,
+        )
+        inputs = move_inputs_to_device(inputs, model_input_device(self.model))
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        with self.torch.inference_mode():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_token_id,
+            )
+
+        prompt_len = inputs["input_ids"].shape[-1]
+        return self.tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True).strip()
+
+    def _prompt(self, system: str, user: str) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        apply_chat_template = getattr(self.tokenizer, "apply_chat_template", None)
+        if apply_chat_template is None:
+            return f"System:\n{system}\n\nUser:\n{user}\n\nAssistant:\n"
+        try:
+            return apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            return apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+class RetrieverAgent:
+    """Agent 1: type-filtered BM25 over taxonomy concept.text."""
+
+    def __init__(self, taxonomy: list[TaxonomyConcept]) -> None:
+        self.index = TaxonomyBM25(taxonomy)
+
+    def retrieve(self, context: str, entity_type: str, top_k: int = 200) -> list[dict[str, Any]]:
+        return self.index.retrieve(context=context, entity_type=entity_type, top_k=top_k)
+
+
+class SelectorAgent:
+    """Agent 2: selects one tag using candidates plus correct/error LTM memory."""
+
+    def __init__(self, model_name: str, memory_k: int = 5) -> None:
+        self.llm = LocalLLM(model_name)
+        self.memory_k = memory_k
 
     def select(
         self,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
+        example: Example,
+        context: str,
         candidates: list[dict[str, Any]],
-        feedback: list[str],
-        memory_hits: dict[str, list[dict[str, Any]]] | None = None,
+        ltm: LTMStore,
+        feedback: str = "",
     ) -> Selection:
-        memory_context = self._selector_memory_context(memory_hits or {})
-        evidence_parts = []
-        if feedback:
-            evidence_parts.append("Validator feedback from prior attempt: " + " ".join(feedback))
-        if memory_context:
-            evidence_parts.append("Relevant long-term memory lessons for tag selection:\n" + memory_context)
-        evidence_parts.append("Current evidence:\n" + evidence)
-        augmented_evidence = "\n\n".join(evidence_parts)
-        selected_tag = self.reranker.choose(entity, entity_type, augmented_evidence, candidates)
-        confidence = self._score_confidence(selected_tag, candidates)
-        memory_note = " using retrieved LTM lessons" if memory_context else ""
-        return Selection(
-            selected_tag=selected_tag,
-            confidence=confidence,
-            rationale=f"{self.backend} selector chose {selected_tag}{memory_note}",
-            backend=self.backend,
-            memory_context=memory_context,
-        )
+        correct_memories = rank_memory(ltm.records("correct_book"), context, example.entity_type, self.memory_k)
+        error_memories = rank_memory(ltm.records("error_book"), context, example.entity_type, self.memory_k)
 
-    @staticmethod
-    def _score_confidence(selected_tag: str, candidates: list[dict[str, Any]]) -> float:
-        if not candidates:
-            return 0.0
-        selected = next((candidate for candidate in candidates if candidate["tag"] == selected_tag), None)
-        if selected is None:
-            return 0.0
-        top_score = candidates[0]["score"]
-        if top_score <= 0:
-            return 0.0
-        return float(max(0.0, min(1.0, selected["score"] / top_score)))
-
-    @classmethod
-    def _selector_memory_context(cls, memory_hits: dict[str, list[dict[str, Any]]]) -> str:
-        lines: list[str] = []
-
-        selector_hits = memory_hits.get("selector_memory", [])
-        if selector_hits:
-            lines.append("Prior accepted examples:")
-            for hit in selector_hits[:2]:
-                lines.append(
-                    "- "
-                    + cls._join_fields(
-                        [
-                            ("tag", hit.get("tag")),
-                            ("entity", hit.get("entity")),
-                            ("score", cls._score_text(hit.get("score"))),
-                            ("evidence", cls._clip(hit.get("evidence"), 420)),
-                        ]
-                    )
-                )
-
-        error_hits = memory_hits.get("error_book", [])
-        if error_hits:
-            lines.append("Error-book lessons:")
-            for hit in error_hits[:2]:
-                lines.append(
-                    "- "
-                    + cls._join_fields(
-                        [
-                            ("avoid", hit.get("wrong_tag")),
-                            ("prefer", hit.get("correct_tag")),
-                            ("score", cls._score_text(hit.get("score"))),
-                            ("lesson", cls._clip(hit.get("lesson"), 260)),
-                            ("evidence", cls._clip(hit.get("evidence"), 320)),
-                        ]
-                    )
-                )
-
-        table_hits = memory_hits.get("table_context_patterns", [])
-        if table_hits:
-            lines.append("Similar table patterns:")
-            for hit in table_hits[:2]:
-                lines.append(
-                    "- "
-                    + cls._join_fields(
-                        [
-                            ("tag", hit.get("tag")),
-                            ("entity", hit.get("entity")),
-                            ("score", cls._score_text(hit.get("score"))),
-                            ("pattern", cls._clip(hit.get("pattern"), 360)),
-                        ]
-                    )
-                )
-
-        return cls._clip("\n".join(lines), 1200)
-
-    @staticmethod
-    def _join_fields(fields: list[tuple[str, Any]]) -> str:
-        return "; ".join(f"{key}: {value}" for key, value in fields if value is not None and value != "")
-
-    @staticmethod
-    def _clip(value: Any, max_chars: int) -> str:
-        text = re.sub(r"\s+", " ", str(value or "")).strip()
-        if len(text) <= max_chars:
-            return text
-        return text[: max_chars - 3].rstrip() + "..."
-
-    @staticmethod
-    def _score_text(score: Any) -> str:
-        try:
-            return f"{float(score):.3f}"
-        except (TypeError, ValueError):
-            return ""
-
-
-class ValidatorCorrectorAgent:
-    """Agent 2: validates, corrects, and gates LTM writes."""
-
-    def __init__(self, backend: str = "rule", model: str = "meta-llama/Llama-3.2-3B-Instruct") -> None:
-        self.backend = backend
-        self.llama = LlamaValidator(model) if backend == "llama" else None
-        if backend not in {"rule", "llama"}:
-            raise ValueError(f"Unsupported validator backend: {backend}")
-
-    def validate(
-        self,
-        mode: str,
-        category: str,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        selection: Selection,
-        candidates: list[dict[str, Any]],
-        memory_hits: dict[str, list[dict[str, Any]]],
-        gold_tag: str | None,
-        attempt: int,
-        max_iters: int,
-    ) -> ValidationDecision:
-        if self.llama is not None:
-            llm_decision = self.llama.validate(
-                entity=entity,
-                entity_type=entity_type,
-                evidence=evidence,
-                selection=selection,
+        raw_output = self.llm.generate(
+            system=(
+                "You are Agent 2, the selector. Select exactly one US-GAAP tag from the "
+                "candidate list. Use the correct book as positive examples and the error "
+                "book as warnings. Return compact JSON with keys tag and rationale."
+            ),
+            user=_selection_prompt(
+                example=example,
+                context=context,
                 candidates=candidates,
-                memory_hits=memory_hits,
-                gold_tag=None,
-            )
-            return self._attach_memory_writes(
-                llm_decision,
-                mode,
-                category,
-                entity,
-                entity_type,
-                evidence,
-                selection.selected_tag,
-                None,
-            )
-
-        decision = self._rule_validate(
-            mode,
-            entity_type,
-            selection,
-            candidates,
-            None,
-            attempt,
-            max_iters,
+                correct_memories=correct_memories,
+                error_memories=error_memories,
+                feedback=feedback,
+            ),
+            max_new_tokens=128,
         )
-        return self._attach_memory_writes(
-            decision,
-            mode,
-            category,
-            entity,
-            entity_type,
-            evidence,
-            selection.selected_tag,
-            None,
+        tag = _extract_candidate_tag(raw_output, candidates) or _first_candidate_tag(candidates)
+        rationale = _extract_field(raw_output, "rationale") or _clip(raw_output, 240)
+        return Selection(
+            tag=tag,
+            rationale=rationale,
+            raw_output=raw_output,
+            correct_memories=correct_memories,
+            error_memories=error_memories,
         )
 
-    def supervise_after_loop(
+
+class ValidatorAgent:
+    """Agent 3: validates predictions and is the only writer of LTM memory."""
+
+    def __init__(self, model_name: str, memory_k: int = 5) -> None:
+        self.llm = LocalLLM(model_name)
+        self.memory_k = memory_k
+
+    def review_without_gt(
         self,
-        mode: str,
-        category: str,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        predicted_tag: str,
-        gold_tag: str,
-        flags: list[str],
-        memory_lesson: str = "",
-    ) -> ValidationDecision:
-        """Use gold after the loop to write supervised memory.
+        example: Example,
+        context: str,
+        candidates: list[dict[str, Any]],
+        selector_tag: str,
+        ltm: LTMStore,
+    ) -> ValidationFeedback:
+        error_memories = rank_memory(ltm.records("error_book"), context, example.entity_type, self.memory_k)
+        raw_output = self.llm.generate(
+            system=(
+                "You are Agent 3, the validator in testing mode. You cannot see ground truth. "
+                "Independently select the best candidate tag using only the context, candidate "
+                "list, and error book. Return compact JSON with keys tag and feedback."
+            ),
+            user=_validator_prompt(
+                example=example,
+                context=context,
+                candidates=candidates,
+                selector_tag=selector_tag,
+                error_memories=error_memories,
+            ),
+            max_new_tokens=128,
+        )
+        suggested_tag = _extract_candidate_tag(raw_output, candidates) or selector_tag
+        feedback = _extract_field(raw_output, "feedback") or _clip(raw_output, 240)
+        return ValidationFeedback(
+            suggested_tag=suggested_tag,
+            feedback=feedback,
+            raw_output=raw_output,
+            error_memories=error_memories,
+        )
 
-        This method is intentionally separate from ``validate`` so Agent 2 does
-        not reveal the gold label to Agent 1 during retry loops.
-        """
-        if predicted_tag == gold_tag:
-            decision = ValidationDecision(
-                action="supervise_keep",
-                final_tag=predicted_tag,
-                passed=True,
-                rationale="Post-loop supervision confirmed the final tag.",
-                flags=flags,
+    def write_with_gt(
+        self,
+        example: Example,
+        context: str,
+        selector_tag: str,
+        ltm: LTMStore,
+    ) -> MemoryWriteResult:
+        if example.answer is None:
+            raise ValueError("Memory-build mode requires a ground-truth answer.")
+
+        correct = selector_tag == example.answer
+        comment = self._memory_comment(example, context, selector_tag, correct)
+        if correct:
+            ltm.write_correct(
+                entity_type=example.entity_type,
+                context=context,
+                tag=selector_tag,
+                comment=comment,
             )
+            book = "correct_book"
         else:
-            decision = ValidationDecision(
-                action="supervise_correct",
-                final_tag=gold_tag,
-                passed=True,
-                rationale="Post-loop supervision corrected the final tag for memory update.",
-                flags=flags + ["wrong_against_gold"],
+            ltm.write_error(
+                entity_type=example.entity_type,
+                context=context,
+                predicted_tag=selector_tag,
+                correct_tag=example.answer,
+                comment=comment,
             )
-        return self._attach_memory_writes(
-            decision=decision,
-            mode=mode,
-            category=category,
-            entity=entity,
-            entity_type=entity_type,
-            evidence=evidence,
-            selected_tag=predicted_tag,
-            gold_tag=gold_tag,
-            memory_lesson=memory_lesson,
+            book = "error_book"
+
+        return MemoryWriteResult(
+            book=book,
+            comment=comment,
+            predicted_tag=selector_tag,
+            correct_tag=example.answer,
         )
 
-    def _rule_validate(
-        self,
-        mode: str,
-        entity_type: str,
-        selection: Selection,
-        candidates: list[dict[str, Any]],
-        gold_tag: str | None,
-        attempt: int,
-        max_iters: int,
-    ) -> ValidationDecision:
-        rule_flags = validate_prediction(entity_type, candidates, selection.selected_tag)["flags"]
-        top_tag = candidates[0]["tag"] if candidates else ""
-
-        if mode == "online_without_gt":
-            unsupervised_flags = self._unsupervised_risk_flags(selection, candidates, rule_flags)
-            if unsupervised_flags and attempt < max_iters:
-                return ValidationDecision(
-                    action="retry",
-                    final_tag=selection.selected_tag,
-                    passed=False,
-                    rationale="Unsupervised rule critic found risk and requests one retry.",
-                    feedback_to_selector=self._unsupervised_selector_feedback(
-                        selection,
-                        candidates,
-                        unsupervised_flags,
-                    ),
-                    flags=unsupervised_flags,
-                )
-            if unsupervised_flags:
-                return ValidationDecision(
-                    action="flag",
-                    final_tag=selection.selected_tag or top_tag,
-                    passed=False,
-                    rationale="Unsupervised rule critic could not approve without gold.",
-                    flags=unsupervised_flags,
-                )
-            return ValidationDecision(
-                action="keep",
-                final_tag=selection.selected_tag,
-                passed=True,
-                rationale="Unsupervised rule critic accepted a low-risk prediction.",
-                flags=[],
-            )
-
-        if rule_flags and attempt < max_iters:
-            return ValidationDecision(
-                action="retry",
-                final_tag=selection.selected_tag,
-                passed=False,
-                rationale="Validator found rule-based risk and requests one retry.",
-                feedback_to_selector=self._rule_selector_feedback(selection, candidates, rule_flags),
-                flags=rule_flags,
-            )
-
-        if rule_flags:
-            return ValidationDecision(
-                action="flag",
-                final_tag=selection.selected_tag or top_tag,
-                passed=False,
-                rationale="Validator could not safely approve or correct without gold.",
-                flags=rule_flags,
-            )
-
-        return ValidationDecision(
-            action="keep",
-            final_tag=selection.selected_tag,
-            passed=True,
-            rationale="Validator accepted the selector output.",
-            flags=rule_flags,
+    def _memory_comment(self, example: Example, context: str, selector_tag: str, correct: bool) -> str:
+        verdict = "correct" if correct else "wrong"
+        raw_output = self.llm.generate(
+            system=(
+                "You are Agent 3, the validator in memory-build mode. You can see the "
+                "ground-truth tag. Write one concise lesson for future selection."
+            ),
+            user=(
+                f"Entity type: {example.entity_type}\n"
+                f"Entity value: {example.entity}\n"
+                f"Selector prediction: {selector_tag}\n"
+                f"Ground truth: {example.answer}\n"
+                f"Verdict: {verdict}\n"
+                f"Context: {_clip(context, 1800)}\n\n"
+                "Return one short sentence explaining why this memory should guide future cases."
+            ),
+            max_new_tokens=80,
         )
+        comment = _clip(raw_output, 320)
+        if comment:
+            return comment
+        if correct:
+            return "The selected tag matches the ground truth for this entity type and context."
+        return f"The selector predicted {selector_tag}, but the ground truth is {example.answer}."
 
-    @staticmethod
-    def _unsupervised_risk_flags(
-        selection: Selection,
-        candidates: list[dict[str, Any]],
-        rule_flags: list[str],
-    ) -> list[str]:
-        flags = list(rule_flags)
-        if not candidates:
-            return flags + ["no_candidates"]
-        if len(candidates) < 2:
-            flags.append("too_few_candidates")
-            return flags
 
-        top_gap = candidates[0]["score"] - candidates[1]["score"]
-        if selection.selected_tag != candidates[0]["tag"]:
-            flags.append("selected_tag_not_top_candidate")
-        if top_gap < 0.05:
-            flags.append("unsupervised_low_top2_gap")
-        if selection.confidence < 0.95:
-            flags.append("low_selector_confidence")
-        if candidates[0]["score"] <= 0:
-            flags.append("nonpositive_top_score")
-        return flags
-
-    @classmethod
-    def _unsupervised_selector_feedback(
-        cls,
-        selection: Selection,
-        candidates: list[dict[str, Any]],
-        flags: list[str],
-    ) -> str:
-        selected_rank = cls._selected_rank(selection.selected_tag, candidates)
-        parts = [
-            "Unsupervised rule-critic feedback: the prior selection was rejected as unsafe without gold.",
-            f"Selected tag: {selection.selected_tag}.",
-            f"Selected rank: {selected_rank if selected_rank is not None else 'not in top candidates'}.",
-            f"Selector confidence: {selection.confidence:.3f}.",
-            "Risk signals: " + ", ".join(flags) + ".",
-            "Re-evaluate the candidate list and choose the highest-evidence, lowest-risk tag.",
-            "Prefer the top retrieved candidate unless the evidence clearly supports another candidate.",
-            "If choosing against the top candidate, the rationale must explicitly compare row/text evidence against it.",
-            "Top candidates: " + cls._candidate_brief(candidates, limit=8),
+def _selection_prompt(
+    example: Example,
+    context: str,
+    candidates: list[dict[str, Any]],
+    correct_memories: list[dict[str, Any]],
+    error_memories: list[dict[str, Any]],
+    feedback: str,
+) -> str:
+    parts = [
+        f"Entity type: {example.entity_type}",
+        f"Entity value: {example.entity}",
+        "Candidate tags:",
+        _format_candidates(candidates),
+        "Correct book memories:",
+        _format_memories("correct_book", correct_memories),
+        "Error book memories:",
+        _format_memories("error_book", error_memories),
+    ]
+    if feedback:
+        parts.extend(["Validator feedback from prior attempt:", feedback])
+    parts.extend(
+        [
+            "Context:",
+            _clip(context, 2200),
+            'Return JSON only, for example: {"tag": "us-gaap:ExampleTag", "rationale": "..."}',
         ]
-        return " ".join(parts)
+    )
+    return "\n".join(parts)
 
-    @classmethod
-    def _rule_selector_feedback(
-        cls,
-        selection: Selection,
-        candidates: list[dict[str, Any]],
-        flags: list[str],
-    ) -> str:
-        selected_rank = cls._selected_rank(selection.selected_tag, candidates)
-        parts = [
-            "Rule-critic feedback: the previous selection was low confidence or inconsistent.",
-            f"Selected tag: {selection.selected_tag}.",
-            f"Selected rank: {selected_rank if selected_rank is not None else 'not in top candidates'}.",
-            "Risk signals: " + ", ".join(flags) + ".",
-            "Compare the selected tag against the nearest high-scoring alternatives before choosing again.",
-            "Top candidates: " + cls._candidate_brief(candidates, limit=8),
+
+def _validator_prompt(
+    example: Example,
+    context: str,
+    candidates: list[dict[str, Any]],
+    selector_tag: str,
+    error_memories: list[dict[str, Any]],
+) -> str:
+    return "\n".join(
+        [
+            f"Entity type: {example.entity_type}",
+            f"Entity value: {example.entity}",
+            f"Selector prediction: {selector_tag}",
+            "Candidate tags:",
+            _format_candidates(candidates),
+            "Error book memories:",
+            _format_memories("error_book", error_memories),
+            "Context:",
+            _clip(context, 2200),
+            'Return JSON only, for example: {"tag": "us-gaap:ExampleTag", "feedback": "..."}',
         ]
-        return " ".join(parts)
+    )
 
-    @staticmethod
-    def _selected_rank(selected_tag: str, candidates: list[dict[str, Any]]) -> int | None:
-        for idx, candidate in enumerate(candidates, start=1):
-            if candidate.get("tag") == selected_tag:
-                return int(candidate.get("rank", idx))
-        return None
 
-    @classmethod
-    def _candidate_brief(cls, candidates: list[dict[str, Any]], limit: int = 8) -> str:
-        lines = []
-        for candidate in candidates[:limit]:
-            score = TagSelectorAgent._score_text(candidate.get("score"))
-            bm25 = TagSelectorAgent._score_text(candidate.get("bm25_score"))
-            dense = TagSelectorAgent._score_text(candidate.get("dense_score"))
-            memory = TagSelectorAgent._score_text(candidate.get("memory_boost"))
-            score_parts = TagSelectorAgent._join_fields(
-                [
-                    ("score", score),
-                    ("bm25", bm25),
-                    ("dense", dense),
-                    ("memory", memory),
-                ]
-            )
+def _format_candidates(candidates: list[dict[str, Any]]) -> str:
+    if not candidates:
+        return "(none)"
+    lines = []
+    for candidate in candidates:
+        lines.append(
+            f"{candidate['rank']}. {candidate['tag']} | {_clip(candidate.get('text', ''), 90)}"
+        )
+    return "\n".join(lines)
+
+
+def _format_memories(book: str, memories: list[dict[str, Any]]) -> str:
+    if not memories:
+        return "(none)"
+    lines = []
+    for memory in memories:
+        if book == "correct_book":
             lines.append(
-                TagSelectorAgent._join_fields(
+                "- "
+                + "; ".join(
                     [
-                        ("rank", candidate.get("rank")),
-                        ("tag", candidate.get("tag")),
-                        ("text", TagSelectorAgent._clip(candidate.get("text"), 120)),
-                        ("scores", score_parts),
+                        f"tag={memory.get('tag')}",
+                        f"comment={_clip(memory.get('comment', ''), 180)}",
+                        f"context={_clip(memory.get('context', ''), 220)}",
                     ]
                 )
             )
-        return " | ".join(lines)
-
-    @staticmethod
-    def _risk_feedback(flags: list[str]) -> str:
-        if not flags:
-            return ""
-        return " Risk signals: " + ", ".join(flags) + "."
-
-    @staticmethod
-    def _risk_note(flags: list[str]) -> str:
-        if not flags:
-            return ""
-        return " Risk signals were logged: " + ", ".join(flags) + "."
-
-    def _attach_memory_writes(
-        self,
-        decision: ValidationDecision,
-        mode: str,
-        category: str,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        selected_tag: str,
-        gold_tag: str | None,
-        memory_lesson: str = "",
-    ) -> ValidationDecision:
-        writes: list[MemoryWrite] = []
-        can_write_gold = (
-            mode in {"offline_build", "online_with_gt"}
-            and gold_tag is not None
-            and decision.action in {"keep", "correct", "supervise_keep", "supervise_correct"}
-            and decision.passed
-        )
-        can_write_unsupervised = mode == "online_without_gt" and decision.action == "keep" and decision.passed
-
-        if can_write_gold:
-            final_tag = decision.final_tag
-            writes.append(
-                self._selector_memory_write(
-                    category,
-                    entity,
-                    entity_type,
-                    evidence,
-                    final_tag,
-                    mode,
-                    lesson=memory_lesson,
+        else:
+            lines.append(
+                "- "
+                + "; ".join(
+                    [
+                        f"predicted={memory.get('predicted_tag')}",
+                        f"correct={memory.get('correct_tag')}",
+                        f"comment={_clip(memory.get('comment', ''), 180)}",
+                        f"context={_clip(memory.get('context', ''), 220)}",
+                    ]
                 )
             )
-            if selected_tag != gold_tag:
-                writes.append(
-                    self._error_book_write(
-                        category,
-                        entity,
-                        entity_type,
-                        evidence,
-                        selected_tag,
-                        gold_tag,
-                        decision,
-                        lesson=memory_lesson,
-                    )
-                )
-            if category == "table":
-                writes.append(self._table_pattern_write(entity, entity_type, evidence, final_tag, mode, lesson=memory_lesson))
-        elif can_write_unsupervised:
-            writes.append(self._selector_memory_write(category, entity, entity_type, evidence, decision.final_tag, mode))
-            if category == "table":
-                writes.append(self._table_pattern_write(entity, entity_type, evidence, decision.final_tag, mode))
-
-        return ValidationDecision(
-            action=decision.action,
-            final_tag=decision.final_tag,
-            passed=decision.passed,
-            rationale=decision.rationale,
-            feedback_to_selector=decision.feedback_to_selector,
-            memory_writes=writes,
-            flags=decision.flags,
-        )
-
-    @staticmethod
-    def _selector_memory_write(
-        category: str,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        tag: str,
-        source: str,
-        lesson: str = "",
-    ) -> MemoryWrite:
-        payload = {
-            "source": source,
-            "category": category,
-            "entity": str(entity),
-            "entity_type": entity_type,
-            "evidence": evidence,
-            "tag": tag,
-        }
-        if lesson:
-            payload["lesson"] = lesson
-        return MemoryWrite(namespace="selector_memory", payload=payload)
-
-    @staticmethod
-    def _error_book_write(
-        category: str,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        wrong_tag: str,
-        correct_tag: str,
-        decision: ValidationDecision,
-        lesson: str = "",
-    ) -> MemoryWrite:
-        return MemoryWrite(
-            namespace="error_book",
-            payload={
-                "category": category,
-                "entity": str(entity),
-                "entity_type": entity_type,
-                "evidence": evidence,
-                "wrong_tag": wrong_tag,
-                "correct_tag": correct_tag,
-                "reason": decision.rationale,
-                "lesson": lesson or f"When similar evidence appears, avoid {wrong_tag} and prefer {correct_tag}.",
-                "flags": decision.flags,
-            },
-        )
-
-    @staticmethod
-    def _table_pattern_write(
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        tag: str,
-        source: str,
-        lesson: str = "",
-    ) -> MemoryWrite:
-        payload = {
-            "source": source,
-            "entity": str(entity),
-            "entity_type": entity_type,
-            "pattern": evidence[:600],
-            "evidence": evidence,
-            "tag": tag,
-        }
-        if lesson:
-            payload["lesson"] = lesson
-        return MemoryWrite(namespace="table_context_patterns", payload=payload)
+    return "\n".join(lines)
 
 
-class LlamaValidator:
-    def __init__(self, model: str) -> None:
-        self.reranker = LlamaReranker(model)
+def _extract_candidate_tag(text: str, candidates: list[dict[str, Any]]) -> str:
+    candidate_tags = {candidate["tag"] for candidate in candidates}
+    suffix_to_tag = {tag.split(":", 1)[-1]: tag for tag in candidate_tags}
 
-    def validate(
-        self,
-        entity: Any,
-        entity_type: str,
-        evidence: str,
-        selection: Selection,
-        candidates: list[dict[str, Any]],
-        memory_hits: dict[str, list[dict[str, Any]]],
-        gold_tag: str | None,
-    ) -> ValidationDecision:
-        validator_candidates = candidates[:20]
-        prompt_evidence = self._validator_evidence(evidence, selection, memory_hits, gold_tag)
-        final_tag = self.reranker.choose(entity, entity_type, prompt_evidence, validator_candidates)
-        if gold_tag is not None and final_tag != gold_tag:
-            return ValidationDecision(
-                action="correct",
-                final_tag=gold_tag,
-                passed=True,
-                rationale="LLM validator output differed from gold; gold-supervised correction applied.",
-                flags=["wrong_against_gold"],
-            )
-        action = "keep" if final_tag == selection.selected_tag else "correct"
-        return ValidationDecision(
-            action=action,
-            final_tag=final_tag,
-            passed=True,
-            rationale=f"LLM validator chose {final_tag}.",
-            flags=[],
-        )
+    for match in TAG_RE.findall(text or ""):
+        if match in candidate_tags:
+            return match
 
-    @staticmethod
-    def _validator_evidence(
-        evidence: str,
-        selection: Selection,
-        memory_hits: dict[str, list[dict[str, Any]]],
-        gold_tag: str | None,
-    ) -> str:
-        memory_summary = selection.memory_context or "No selector memory summary was available."
-        gold_note = f"\nGold tag for supervised memory update: {gold_tag}" if gold_tag else ""
-        return (
-            f"{evidence}\n\n"
-            f"Selector proposed: {selection.selected_tag}\n"
-            f"Selector rationale: {selection.rationale}\n"
-            f"Selector memory summary:\n{memory_summary}" + gold_note
-        )
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", text or "")
+    for token in tokens:
+        tag = suffix_to_tag.get(token)
+        if tag is not None:
+            return tag
+    return ""
+
+
+def _extract_field(text: str, field: str) -> str:
+    parsed = _extract_json(text)
+    if isinstance(parsed, dict):
+        value = parsed.get(field)
+        if value is not None:
+            return _clip(value, 500)
+    pattern = re.compile(rf'"?{re.escape(field)}"?\s*:\s*"([^"]+)"', flags=re.I)
+    match = pattern.search(text or "")
+    if match:
+        return _clip(match.group(1), 500)
+    return ""
+
+
+def _extract_json(text: str) -> Any:
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _first_candidate_tag(candidates: list[dict[str, Any]]) -> str:
+    return str(candidates[0]["tag"]) if candidates else ""
+
+
+def _clip(value: Any, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."

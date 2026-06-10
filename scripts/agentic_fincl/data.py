@@ -1,8 +1,10 @@
+# Loads taxonomy JSONL records and FinCL CSV examples into small typed objects.
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -14,14 +16,14 @@ class TaxonomyConcept:
     text: str
 
 
-def tag_terms(tag: str) -> str:
-    tag = tag.split(":", 1)[-1]
-    chars: list[str] = []
-    for i, char in enumerate(tag):
-        if i > 0 and char.isupper() and (not tag[i - 1].isupper()):
-            chars.append(" ")
-        chars.append(char)
-    return " ".join("".join(chars).split())
+@dataclass(frozen=True)
+class Example:
+    row_index: int
+    context: str
+    category: str
+    entity: Any
+    entity_type: str
+    answer: str | None
 
 
 def load_taxonomy(path: Path) -> list[TaxonomyConcept]:
@@ -29,16 +31,32 @@ def load_taxonomy(path: Path) -> list[TaxonomyConcept]:
     with path.open(encoding="utf-8") as f:
         for line in f:
             item = json.loads(line)
-            tag = f"us-gaap:{item['us_gaap_tag']}"
             concepts.append(
                 TaxonomyConcept(
-                    tag=tag,
-                    entity_type=item["entity_type"],
-                    text=item.get("text") or tag_terms(tag),
+                    tag=f"us-gaap:{item['us_gaap_tag']}",
+                    entity_type=str(item["entity_type"]),
+                    text=str(item.get("text") or item["us_gaap_tag"]),
                 )
             )
     return concepts
 
 
-def load_split(memory_csv: Path, test_csv: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return pd.read_csv(memory_csv), pd.read_csv(test_csv)
+def load_examples(path: Path, limit: int = 0) -> list[Example]:
+    df = pd.read_csv(path)
+    if limit > 0:
+        df = df.iloc[:limit]
+    examples: list[Example] = []
+    for row_index, row in enumerate(df.itertuples(index=False), start=0):
+        answer = getattr(row, "answer", None)
+        answer_text = None if answer is None or pd.isna(answer) else str(answer)
+        examples.append(
+            Example(
+                row_index=row_index,
+                context=str(row.context),
+                category=str(row.category),
+                entity=row.entity,
+                entity_type=str(row.entity_type),
+                answer=answer_text,
+            )
+        )
+    return examples
