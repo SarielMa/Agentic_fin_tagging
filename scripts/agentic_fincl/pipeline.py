@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 from .agents import RetrieverAgent, SelectorAgent, ValidatorAgent
 from .data import Example, load_examples, load_taxonomy
 from .evaluation import evaluate_records
@@ -92,7 +94,7 @@ class BaselinePipeline:
         """Supervised phase: one selector pass, then validator writes one memory."""
 
         records = []
-        for example in examples:
+        for example in tqdm(examples, desc=f"{self.config.mode} memory-build", unit="example"):
             record = self._memory_build_one(example)
             records.append(record)
         return self._write_phase(
@@ -106,7 +108,7 @@ class BaselinePipeline:
         """Unsupervised phase: selector, validator feedback, selector retry."""
 
         records = []
-        for example in examples:
+        for example in tqdm(examples, desc=f"{self.config.mode} testing", unit="example"):
             record = self._testing_one(example)
             records.append(record)
         return self._write_phase(

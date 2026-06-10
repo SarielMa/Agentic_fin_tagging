@@ -77,6 +77,8 @@ class LocalLLM:
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
                 pad_token_id=pad_token_id,
             )
 

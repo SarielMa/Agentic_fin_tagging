@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 from .agents import (
     LocalLLM,
     RetrieverAgent,
@@ -43,7 +45,10 @@ class SingleLLMTester:
     def run(self) -> dict[str, Any]:
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         examples = load_examples(self.config.test_csv, self.config.limit)
-        records = [self._run_one(example) for example in examples]
+        records = [
+            self._run_one(example)
+            for example in tqdm(examples, desc="single_llm testing", unit="example")
+        ]
 
         predictions_path = self.config.output_dir / "predictions.jsonl"
         with predictions_path.open("w", encoding="utf-8") as f:
