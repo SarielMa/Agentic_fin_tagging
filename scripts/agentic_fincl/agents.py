@@ -229,6 +229,7 @@ class ValidatorCorrectorAgent:
         predicted_tag: str,
         gold_tag: str,
         flags: list[str],
+        memory_lesson: str = "",
     ) -> ValidationDecision:
         """Use gold after the loop to write supervised memory.
 
@@ -260,6 +261,7 @@ class ValidatorCorrectorAgent:
             evidence=evidence,
             selected_tag=predicted_tag,
             gold_tag=gold_tag,
+            memory_lesson=memory_lesson,
         )
 
     def _rule_validate(
@@ -275,23 +277,44 @@ class ValidatorCorrectorAgent:
         rule_flags = validate_prediction(entity_type, candidates, selection.selected_tag)["flags"]
         top_tag = candidates[0]["tag"] if candidates else ""
 
+        if mode == "online_without_gt":
+            unsupervised_flags = self._unsupervised_risk_flags(selection, candidates, rule_flags)
+            if unsupervised_flags and attempt < max_iters:
+                return ValidationDecision(
+                    action="retry",
+                    final_tag=selection.selected_tag,
+                    passed=False,
+                    rationale="Unsupervised rule critic found risk and requests one retry.",
+                    feedback_to_selector=self._unsupervised_selector_feedback(
+                        selection,
+                        candidates,
+                        unsupervised_flags,
+                    ),
+                    flags=unsupervised_flags,
+                )
+            if unsupervised_flags:
+                return ValidationDecision(
+                    action="flag",
+                    final_tag=selection.selected_tag or top_tag,
+                    passed=False,
+                    rationale="Unsupervised rule critic could not approve without gold.",
+                    flags=unsupervised_flags,
+                )
+            return ValidationDecision(
+                action="keep",
+                final_tag=selection.selected_tag,
+                passed=True,
+                rationale="Unsupervised rule critic accepted a low-risk prediction.",
+                flags=[],
+            )
+
         if rule_flags and attempt < max_iters:
             return ValidationDecision(
                 action="retry",
                 final_tag=selection.selected_tag,
                 passed=False,
                 rationale="Validator found rule-based risk and requests one retry.",
-                feedback_to_selector="The previous selection was low confidence or inconsistent; reconsider candidates."
-                + self._risk_feedback(rule_flags),
-                flags=rule_flags,
-            )
-
-        if mode == "online_without_gt" and self._low_risk(selection, candidates, rule_flags):
-            return ValidationDecision(
-                action="keep",
-                final_tag=selection.selected_tag,
-                passed=True,
-                rationale="Unsupervised validator accepted a low-risk prediction.",
+                feedback_to_selector=self._rule_selector_feedback(selection, candidates, rule_flags),
                 flags=rule_flags,
             )
 
@@ -313,11 +336,102 @@ class ValidatorCorrectorAgent:
         )
 
     @staticmethod
-    def _low_risk(selection: Selection, candidates: list[dict[str, Any]], flags: list[str]) -> bool:
-        if flags or len(candidates) < 2:
-            return False
+    def _unsupervised_risk_flags(
+        selection: Selection,
+        candidates: list[dict[str, Any]],
+        rule_flags: list[str],
+    ) -> list[str]:
+        flags = list(rule_flags)
+        if not candidates:
+            return flags + ["no_candidates"]
+        if len(candidates) < 2:
+            flags.append("too_few_candidates")
+            return flags
+
         top_gap = candidates[0]["score"] - candidates[1]["score"]
-        return selection.selected_tag == candidates[0]["tag"] and top_gap >= 0.05 and selection.confidence >= 0.95
+        if selection.selected_tag != candidates[0]["tag"]:
+            flags.append("selected_tag_not_top_candidate")
+        if top_gap < 0.05:
+            flags.append("unsupervised_low_top2_gap")
+        if selection.confidence < 0.95:
+            flags.append("low_selector_confidence")
+        if candidates[0]["score"] <= 0:
+            flags.append("nonpositive_top_score")
+        return flags
+
+    @classmethod
+    def _unsupervised_selector_feedback(
+        cls,
+        selection: Selection,
+        candidates: list[dict[str, Any]],
+        flags: list[str],
+    ) -> str:
+        selected_rank = cls._selected_rank(selection.selected_tag, candidates)
+        parts = [
+            "Unsupervised rule-critic feedback: the prior selection was rejected as unsafe without gold.",
+            f"Selected tag: {selection.selected_tag}.",
+            f"Selected rank: {selected_rank if selected_rank is not None else 'not in top candidates'}.",
+            f"Selector confidence: {selection.confidence:.3f}.",
+            "Risk signals: " + ", ".join(flags) + ".",
+            "Re-evaluate the candidate list and choose the highest-evidence, lowest-risk tag.",
+            "Prefer the top retrieved candidate unless the evidence clearly supports another candidate.",
+            "If choosing against the top candidate, the rationale must explicitly compare row/text evidence against it.",
+            "Top candidates: " + cls._candidate_brief(candidates, limit=8),
+        ]
+        return " ".join(parts)
+
+    @classmethod
+    def _rule_selector_feedback(
+        cls,
+        selection: Selection,
+        candidates: list[dict[str, Any]],
+        flags: list[str],
+    ) -> str:
+        selected_rank = cls._selected_rank(selection.selected_tag, candidates)
+        parts = [
+            "Rule-critic feedback: the previous selection was low confidence or inconsistent.",
+            f"Selected tag: {selection.selected_tag}.",
+            f"Selected rank: {selected_rank if selected_rank is not None else 'not in top candidates'}.",
+            "Risk signals: " + ", ".join(flags) + ".",
+            "Compare the selected tag against the nearest high-scoring alternatives before choosing again.",
+            "Top candidates: " + cls._candidate_brief(candidates, limit=8),
+        ]
+        return " ".join(parts)
+
+    @staticmethod
+    def _selected_rank(selected_tag: str, candidates: list[dict[str, Any]]) -> int | None:
+        for idx, candidate in enumerate(candidates, start=1):
+            if candidate.get("tag") == selected_tag:
+                return int(candidate.get("rank", idx))
+        return None
+
+    @classmethod
+    def _candidate_brief(cls, candidates: list[dict[str, Any]], limit: int = 8) -> str:
+        lines = []
+        for candidate in candidates[:limit]:
+            score = TagSelectorAgent._score_text(candidate.get("score"))
+            bm25 = TagSelectorAgent._score_text(candidate.get("bm25_score"))
+            dense = TagSelectorAgent._score_text(candidate.get("dense_score"))
+            memory = TagSelectorAgent._score_text(candidate.get("memory_boost"))
+            score_parts = TagSelectorAgent._join_fields(
+                [
+                    ("score", score),
+                    ("bm25", bm25),
+                    ("dense", dense),
+                    ("memory", memory),
+                ]
+            )
+            lines.append(
+                TagSelectorAgent._join_fields(
+                    [
+                        ("rank", candidate.get("rank")),
+                        ("tag", candidate.get("tag")),
+                        ("text", TagSelectorAgent._clip(candidate.get("text"), 120)),
+                        ("scores", score_parts),
+                    ]
+                )
+            )
+        return " | ".join(lines)
 
     @staticmethod
     def _risk_feedback(flags: list[str]) -> str:
@@ -341,6 +455,7 @@ class ValidatorCorrectorAgent:
         evidence: str,
         selected_tag: str,
         gold_tag: str | None,
+        memory_lesson: str = "",
     ) -> ValidationDecision:
         writes: list[MemoryWrite] = []
         can_write_gold = (
@@ -353,11 +468,32 @@ class ValidatorCorrectorAgent:
 
         if can_write_gold:
             final_tag = decision.final_tag
-            writes.append(self._selector_memory_write(category, entity, entity_type, evidence, final_tag, mode))
+            writes.append(
+                self._selector_memory_write(
+                    category,
+                    entity,
+                    entity_type,
+                    evidence,
+                    final_tag,
+                    mode,
+                    lesson=memory_lesson,
+                )
+            )
             if selected_tag != gold_tag:
-                writes.append(self._error_book_write(category, entity, entity_type, evidence, selected_tag, gold_tag, decision))
+                writes.append(
+                    self._error_book_write(
+                        category,
+                        entity,
+                        entity_type,
+                        evidence,
+                        selected_tag,
+                        gold_tag,
+                        decision,
+                        lesson=memory_lesson,
+                    )
+                )
             if category == "table":
-                writes.append(self._table_pattern_write(entity, entity_type, evidence, final_tag, mode))
+                writes.append(self._table_pattern_write(entity, entity_type, evidence, final_tag, mode, lesson=memory_lesson))
         elif can_write_unsupervised:
             writes.append(self._selector_memory_write(category, entity, entity_type, evidence, decision.final_tag, mode))
             if category == "table":
@@ -381,18 +517,19 @@ class ValidatorCorrectorAgent:
         evidence: str,
         tag: str,
         source: str,
+        lesson: str = "",
     ) -> MemoryWrite:
-        return MemoryWrite(
-            namespace="selector_memory",
-            payload={
-                "source": source,
-                "category": category,
-                "entity": str(entity),
-                "entity_type": entity_type,
-                "evidence": evidence,
-                "tag": tag,
-            },
-        )
+        payload = {
+            "source": source,
+            "category": category,
+            "entity": str(entity),
+            "entity_type": entity_type,
+            "evidence": evidence,
+            "tag": tag,
+        }
+        if lesson:
+            payload["lesson"] = lesson
+        return MemoryWrite(namespace="selector_memory", payload=payload)
 
     @staticmethod
     def _error_book_write(
@@ -403,6 +540,7 @@ class ValidatorCorrectorAgent:
         wrong_tag: str,
         correct_tag: str,
         decision: ValidationDecision,
+        lesson: str = "",
     ) -> MemoryWrite:
         return MemoryWrite(
             namespace="error_book",
@@ -414,24 +552,31 @@ class ValidatorCorrectorAgent:
                 "wrong_tag": wrong_tag,
                 "correct_tag": correct_tag,
                 "reason": decision.rationale,
-                "lesson": f"When similar evidence appears, avoid {wrong_tag} and prefer {correct_tag}.",
+                "lesson": lesson or f"When similar evidence appears, avoid {wrong_tag} and prefer {correct_tag}.",
                 "flags": decision.flags,
             },
         )
 
     @staticmethod
-    def _table_pattern_write(entity: Any, entity_type: str, evidence: str, tag: str, source: str) -> MemoryWrite:
-        return MemoryWrite(
-            namespace="table_context_patterns",
-            payload={
-                "source": source,
-                "entity": str(entity),
-                "entity_type": entity_type,
-                "pattern": evidence[:600],
-                "evidence": evidence,
-                "tag": tag,
-            },
-        )
+    def _table_pattern_write(
+        entity: Any,
+        entity_type: str,
+        evidence: str,
+        tag: str,
+        source: str,
+        lesson: str = "",
+    ) -> MemoryWrite:
+        payload = {
+            "source": source,
+            "entity": str(entity),
+            "entity_type": entity_type,
+            "pattern": evidence[:600],
+            "evidence": evidence,
+            "tag": tag,
+        }
+        if lesson:
+            payload["lesson"] = lesson
+        return MemoryWrite(namespace="table_context_patterns", payload=payload)
 
 
 class LlamaValidator:

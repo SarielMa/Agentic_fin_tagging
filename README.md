@@ -97,8 +97,8 @@ For table examples, two backends are available:
 
 | Backend | Behavior |
 |---|---|
-| `heuristic` | Default. Parses table rows and uses rows containing the target entity. Fast and does not require an LLM. |
-| `llama` | Uses an LLM to produce a compact table description before retrieval. This can include table title, unit, column header, section context, matched row, nearby rows, and a retrieval query. It also receives relevant `table_context_patterns` from prior LTM writes when available. |
+| `heuristic` | Default. Parses table rows, uses rows containing the target entity, and rewrites them as normalized text evidence. Fast and does not require an LLM. |
+| `llama` | Uses an LLM to produce a compact normalized table-as-text description before retrieval. This can include table title, unit, column header, section context, matched row, nearby rows, and a retrieval query. It also receives relevant `table_context_patterns` from prior LTM writes when available. |
 
 The LLM table evidence builder sees only:
 
@@ -117,12 +117,12 @@ Initialize STM with:
   context, category, entity, entity_type
 
 Build evidence:
-  text -> nearby text evidence
-  table -> retrieve similar table-pattern memory, then build heuristic row evidence or LLM-generated table description
+  text -> rewrite nearby context as normalized text evidence with entity and entity_type
+  table -> retrieve similar table-pattern memory, then rewrite table context as normalized text evidence
 
 For attempt = 1..max_iters:
-  1. Retrieve candidates from taxonomy + current LTM.
-  2. Agent 1 summarizes relevant LTM lessons and selects a tag.
+  1. Retrieve taxonomy candidates with BM25 by default, optionally combine dense scores, then apply current LTM boosts.
+  2. Agent 1 summarizes relevant LTM lessons and selects from the retrieved candidates.
   3. Agent 2 validates the selected tag and Agent 1 memory summary.
 
   If Agent 2 returns keep:
@@ -152,6 +152,12 @@ The previous selection was low confidence or inconsistent; reconsider candidates
 
 LTM is durable memory across samples. It is updated only after a final accepted or corrected decision, not after every retry. Therefore, LTM updates affect later samples, while STM feedback affects the next loop attempt for the same sample.
 
+Agentic runs now refuse to start from an output directory that already contains LTM records unless `--resume-ltm` is passed. Use a fresh `--output-dir` for comparable retrieval metrics.
+
+When gold labels are available, the system can also run post-prediction supervised memory refinement with `--supervised-memory-iters`. This happens only after the current prediction is fixed and scored. The gold tag is injected or boosted in a supervised candidate list if needed, Agent 1 is reprompted with teacher feedback, and the resulting lesson is written to LTM for future examples. This improves memory quality without letting the current example's gold tag affect its own evaluated prediction.
+
+Retrieval uses BM25 by default. Candidate concepts are filtered by `entity_type` before scoring. The taxonomy text indexed by BM25 is controlled by `--taxonomy-doc-mode`: `text` indexes only the taxonomy `text` field, `text_tag_terms` indexes `text` plus split tag terms when they differ, and `full` keeps the older broader document with `text`, split tag terms, raw tag, and entity type. Dense retrieval is optional through `--dense-weight` and `--dense-model`; if dense weight is enabled without a model, the code uses a local SVD dense fallback, so the run does not require a new model download. The agentic outputs save both raw taxonomy candidates in `raw_top_k` and memory-adjusted candidates in `top_k`.
+
 ## Run Modes
 
 ### Offline Evaluation
@@ -162,6 +168,7 @@ Offline mode is the main held-out evaluation setting. It has two phases:
 Phase 1: memory-build set
   gold labels are hidden during the Agent1-Agent2 loop
   after the loop produces a final tag, gold is used for supervision
+  optional supervised refinement injects/boosts gold only for LTM construction
   LTM is updated from the post-loop supervised keep/correction
 
 Phase 2: held-out test set
@@ -176,6 +183,7 @@ Pseudo-code:
 for sample in memory_build:
     run Agent1-Agent2 loop without gold
     compare final_tag with answer after the loop
+    optionally refine memory with gold-injected supervised candidates
     update LTM using post-loop supervision
 
 freeze LTM
@@ -205,6 +213,7 @@ Pseudo-code:
 for sample in stream:
     run Agent1-Agent2 loop without gold
     compare final_tag with answer after the loop
+    optionally refine memory with gold-injected supervised candidates
     update LTM using post-loop supervision
 ```
 
@@ -322,6 +331,7 @@ Each prediction record contains:
   "correct": true,
   "stm": {
     "evidence": "...",
+    "raw_top_k": [],
     "top_k": [],
     "memory_hits": {},
     "attempts": [],
@@ -343,7 +353,8 @@ The main metrics are:
 | Metric | Meaning |
 |---|---|
 | `tag_accuracy` | Fraction of examples where final predicted tag equals `answer` |
-| `recall_at_k` | Whether the gold tag appears in the retrieved top-k candidate list |
+| `recall_at_k` | Whether the gold tag appears in the raw taxonomy top-k candidate list. In BM25-only runs this is pure BM25 recall. |
+| `post_memory_recall_at_k` | Whether the gold tag appears in the memory-adjusted `top_k` list, reported when `raw_top_k` is available. |
 | `flag_rate` | Fraction of examples where the final validator action is `flag` |
 | `action_counts` | Counts of final validator actions: `keep`, `correct`, `flag`, etc. |
 

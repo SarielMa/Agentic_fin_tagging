@@ -103,3 +103,16 @@ def localize_context(context: str, category: str, entity: Any, max_chars: int = 
 
 def build_query_text(entity: Any, entity_type: str, evidence: str) -> str:
     return normalize_space(f"entity {entity} type {entity_type} context {evidence}")
+
+
+def rewrite_evidence_for_retrieval(evidence: str, category: str, entity: Any, entity_type: str) -> str:
+    """Normalize evidence into one retrieval-query style across categories."""
+    evidence_text = normalize_space(str(evidence).replace("[ROW]", " row: ").replace("|", ";"))
+    fields = [
+        ("format", "table_as_text" if category == "table" else "narrative_text"),
+        ("entity", str(entity)),
+        ("entity_type", entity_type),
+        ("target_value", str(entity)),
+        ("text_evidence", evidence_text),
+    ]
+    return normalize_space(" ".join(f"{key}: {value}" for key, value in fields if value))

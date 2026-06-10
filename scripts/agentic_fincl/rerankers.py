@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any, Protocol
 
@@ -29,7 +30,7 @@ class LlamaReranker:
         self,
         model_name: str,
         device: str | None = None,
-        max_input_tokens: int = 4096,
+        max_input_tokens: int = 12288,
         max_new_tokens: int = 48,
     ) -> None:
         import torch
@@ -63,10 +64,17 @@ class LlamaReranker:
         )
         inputs = move_inputs_to_device(inputs, self.device or model_input_device(self.model))
         with self.torch.no_grad():
+            generation_config = copy.deepcopy(getattr(self.model, "generation_config", None))
+            if generation_config is not None:
+                generation_config.do_sample = False
+                generation_config.temperature = None
+                generation_config.top_p = None
+                generation_config.top_k = None
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
+                generation_config=generation_config,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         generated = self.tokenizer.decode(output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
@@ -76,7 +84,8 @@ class LlamaReranker:
     @staticmethod
     def _build_prompt(entity: Any, entity_type: str, evidence: str, candidates: list[dict[str, Any]]) -> str:
         candidate_lines = "\n".join(
-            f"{i}. {candidate['tag']} | {candidate['text']}" for i, candidate in enumerate(candidates, start=1)
+            f"{i}. {candidate['tag']} | {str(candidate['text'])[:160]}"
+            for i, candidate in enumerate(candidates, start=1)
         )
         return (
             "You are a financial tagging assistant trained in US-GAAP taxonomy.\n"

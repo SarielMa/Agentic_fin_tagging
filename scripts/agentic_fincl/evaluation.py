@@ -91,7 +91,7 @@ def write_breakdown(
     score: bool,
     section_key: str,
     flag_getter: FlagGetter | None = None,
-    recall_points: tuple[int, ...] = (20, 50, 100, 200),
+    recall_points: tuple[int, ...] = (20, 50, 100, 200, 500),
 ) -> None:
     if not records or not score:
         return
@@ -100,7 +100,9 @@ def write_breakdown(
     rows = []
     for record in records:
         section = record[section_key]
-        candidate_tags = _candidate_tags(record, section_key)
+        has_raw_top_k = "raw_top_k" in section
+        candidate_tags = _candidate_tags(record, section_key, raw=has_raw_top_k)
+        post_memory_tags = _candidate_tags(record, section_key) if has_raw_top_k else []
         row = {
             "category": section["category"],
             "entity_type": record["gold"]["Type"],
@@ -108,6 +110,8 @@ def write_breakdown(
         }
         for k in recall_points:
             row[f"recall{k}"] = record["gold"]["Tag"] in candidate_tags[:k]
+            if has_raw_top_k:
+                row[f"post_memory_recall{k}"] = record["gold"]["Tag"] in post_memory_tags[:k]
         if flag_getter is not None:
             row["flagged"] = flag_getter(record)
         rows.append(row)
@@ -144,19 +148,30 @@ def _add_scored_metrics(
 
     n = len(records)
     correct = sum(1 for record in records if record["correct"])
+    has_raw_top_k = bool(records) and all("raw_top_k" in record[section_key] for record in records)
     recall_counts = {k: 0 for k in recall_k}
     for record in records:
         gold_tag = record["gold"]["Tag"]
-        candidate_tags = _candidate_tags(record, section_key)
+        candidate_tags = _candidate_tags(record, section_key, raw=has_raw_top_k)
         for k in recall_k:
             recall_counts[k] += int(gold_tag in candidate_tags[:k])
 
     metrics["tag_accuracy"] = _rate(correct, n)
     metrics["recall_at_k"] = {str(k): _rate(recall_counts[k], n) for k in recall_k}
+    if has_raw_top_k:
+        post_memory_counts = {k: 0 for k in recall_k}
+        for record in records:
+            gold_tag = record["gold"]["Tag"]
+            candidate_tags = _candidate_tags(record, section_key)
+            for k in recall_k:
+                post_memory_counts[k] += int(gold_tag in candidate_tags[:k])
+        metrics["post_memory_recall_at_k"] = {str(k): _rate(post_memory_counts[k], n) for k in recall_k}
 
 
-def _candidate_tags(record: Record, section_key: str) -> list[str]:
-    return [candidate["tag"] for candidate in record[section_key]["top_k"]]
+def _candidate_tags(record: Record, section_key: str, raw: bool = False) -> list[str]:
+    section = record[section_key]
+    key = "raw_top_k" if raw and "raw_top_k" in section else "top_k"
+    return [candidate["tag"] for candidate in section[key]]
 
 
 def _group_breakdown(
@@ -173,6 +188,9 @@ def _group_breakdown(
         }
         for k in recall_points:
             row[f"recall{k}"] = float(group[f"recall{k}"].mean())
+            post_memory_column = f"post_memory_recall{k}"
+            if post_memory_column in group:
+                row[post_memory_column] = float(group[post_memory_column].mean())
         if include_flag_rate:
             row["flag_rate"] = float(group["flagged"].mean())
         result[str(key)] = row

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from typing import Any, Protocol
 
 from .hf_generation import load_local_causal_lm, model_input_device, move_inputs_to_device
-from .text_utils import localize_context, normalize_space, row_contains_entity, table_rows
+from .text_utils import (
+    localize_context,
+    normalize_space,
+    rewrite_evidence_for_retrieval,
+    row_contains_entity,
+    table_rows,
+)
 
 
 class EvidenceBuilder(Protocol):
@@ -31,7 +38,8 @@ class HeuristicEvidenceBuilder:
         entity_type: str,
         table_patterns: list[dict[str, Any]] | None = None,
     ) -> str:
-        return localize_context(context, category, entity)
+        evidence = localize_context(context, category, entity)
+        return rewrite_evidence_for_retrieval(evidence, category, entity, entity_type)
 
 
 class LlamaTableEvidenceBuilder:
@@ -96,10 +104,17 @@ class LlamaTableEvidenceBuilder:
         )
         inputs = move_inputs_to_device(inputs, self.device or model_input_device(self.model))
         with self.torch.no_grad():
+            generation_config = copy.deepcopy(getattr(self.model, "generation_config", None))
+            if generation_config is not None:
+                generation_config.do_sample = False
+                generation_config.temperature = None
+                generation_config.top_p = None
+                generation_config.top_k = None
             output = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
+                generation_config=generation_config,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
         return self.tokenizer.decode(output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
@@ -199,10 +214,17 @@ class LlamaTableEvidenceBuilder:
 
     @staticmethod
     def _format_evidence(parsed: dict[str, Any], entity: Any, entity_type: str) -> str:
+        row_text = normalize_space(
+            " ".join(
+                str(parsed.get(key, ""))
+                for key in ("table_title", "section_context", "matched_row", "nearby_rows", "retrieval_query")
+            )
+        )
         fields = [
-            ("format", "table"),
+            ("format", "table_as_text"),
             ("entity", str(entity)),
             ("entity_type", entity_type),
+            ("target_value", str(entity)),
             ("table_title", parsed.get("table_title", "")),
             ("unit", parsed.get("unit", "")),
             ("column_header", parsed.get("column_header", "")),
@@ -210,6 +232,7 @@ class LlamaTableEvidenceBuilder:
             ("matched_row", parsed.get("matched_row", "")),
             ("nearby_rows", parsed.get("nearby_rows", "")),
             ("retrieval_query", parsed.get("retrieval_query", "")),
+            ("text_evidence", row_text),
         ]
         return normalize_space(" ".join(f"{key}: {value}" for key, value in fields if value))
 

@@ -15,9 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from tqdm.auto import tqdm
 
 
@@ -26,11 +25,11 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from agentic_fincl.data import TaxonomyConcept, load_taxonomy, tag_terms  # noqa: E402
+from agentic_fincl.data import TaxonomyConcept, load_taxonomy  # noqa: E402
 from agentic_fincl.evaluation import evaluate_single_llm_records, write_single_llm_breakdown  # noqa: E402
 from agentic_fincl.evidence import build_evidence_builder  # noqa: E402
 from agentic_fincl.rerankers import LlamaReranker  # noqa: E402
-from agentic_fincl.text_utils import build_query_text, normalize_space  # noqa: E402
+from agentic_fincl.retrieval import HybridTextIndex, TAXONOMY_DOC_MODES, normalize_scores, taxonomy_document  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -42,32 +41,35 @@ class BaselineConfig:
     table_evidence_backend: str = "heuristic"
     table_evidence_model: str | None = None
     top_k: int = 200
-    rerank_k: int = 20
+    rerank_k: int = 200
     save_top_k: int = 200
     recall_k: tuple[int, ...] = (1, 5, 10, 20, 50, 100, 200)
     limit: int = 0
-    max_input_tokens: int = 4096
+    bm25_weight: float = 1.0
+    dense_weight: float = 0.0
+    dense_model: str = ""
+    taxonomy_doc_mode: str = "full"
+    max_input_tokens: int = 12288
     max_new_tokens: int = 48
 
 
 class TaxonomyOnlyRetriever:
-    """TF-IDF taxonomy retriever with no memory and no feedback loop."""
+    """Hybrid taxonomy retriever with no memory and no feedback loop."""
 
-    def __init__(self, taxonomy: list[TaxonomyConcept]) -> None:
+    def __init__(
+        self,
+        taxonomy: list[TaxonomyConcept],
+        bm25_weight: float = 1.0,
+        dense_weight: float = 0.0,
+        dense_model: str = "",
+        taxonomy_doc_mode: str = "full",
+    ) -> None:
         self.taxonomy = taxonomy
+        self.bm25_weight = bm25_weight
+        self.dense_weight = dense_weight
         self.by_type = self._index_concepts_by_type(taxonomy)
-        docs = [
-            normalize_space(f"{concept.text} {tag_terms(concept.tag)} {concept.entity_type}")
-            for concept in taxonomy
-        ]
-        self.vectorizer = TfidfVectorizer(
-            lowercase=True,
-            analyzer="word",
-            ngram_range=(1, 2),
-            min_df=1,
-            norm="l2",
-        )
-        self.matrix = self.vectorizer.fit_transform(docs)
+        docs = [taxonomy_document(concept, taxonomy_doc_mode) for concept in taxonomy]
+        self.index = HybridTextIndex(docs, bm25_weight, dense_weight, dense_model)
 
     @staticmethod
     def _index_concepts_by_type(taxonomy: list[TaxonomyConcept]) -> dict[str, list[int]]:
@@ -77,14 +79,18 @@ class TaxonomyOnlyRetriever:
         return by_type
 
     def retrieve(self, entity: Any, entity_type: str, evidence: str, top_k: int) -> list[dict[str, Any]]:
-        query = build_query_text(entity, entity_type, evidence)
+        query = evidence
         allowed = self.by_type.get(entity_type, list(range(len(self.taxonomy))))
-        q_tax = self.vectorizer.transform([query])
-        sims = cosine_similarity(q_tax, self.matrix[allowed]).ravel()
+        _, bm25, dense = self.index.scores(query)
+        allowed_array = np.array(allowed, dtype=int)
+        bm25_allowed = normalize_scores(bm25[allowed_array]) if allowed_array.size else np.zeros(0, dtype=float)
+        dense_allowed = normalize_scores(dense[allowed_array]) if allowed_array.size else np.zeros(0, dtype=float)
+        hybrid_allowed = self.bm25_weight * bm25_allowed + self.dense_weight * dense_allowed
+        bm25_lookup = {idx: float(bm25_allowed[pos]) for pos, idx in enumerate(allowed)}
+        dense_lookup = {idx: float(dense_allowed[pos]) for pos, idx in enumerate(allowed)}
         ranked = sorted(
-            ((allowed[pos], float(score)) for pos, score in enumerate(sims)),
-            key=lambda item: item[1],
-            reverse=True,
+            ((allowed[pos], float(score)) for pos, score in enumerate(hybrid_allowed)),
+            key=lambda item: (-item[1], item[0]),
         )[:top_k]
         return [
             {
@@ -93,6 +99,9 @@ class TaxonomyOnlyRetriever:
                 "entity_type": self.taxonomy[idx].entity_type,
                 "text": self.taxonomy[idx].text,
                 "score": score,
+                "bm25_score": bm25_lookup.get(idx, 0.0),
+                "dense_score": dense_lookup.get(idx, 0.0),
+                "memory_boost": 0.0,
             }
             for rank, (idx, score) in enumerate(ranked, start=1)
         ]
@@ -103,7 +112,13 @@ class SingleLLMBaseline:
         self.config = config
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.taxonomy = load_taxonomy(config.taxonomy_jsonl)
-        self.retriever = TaxonomyOnlyRetriever(self.taxonomy)
+        self.retriever = TaxonomyOnlyRetriever(
+            self.taxonomy,
+            bm25_weight=config.bm25_weight,
+            dense_weight=config.dense_weight,
+            dense_model=config.dense_model,
+            taxonomy_doc_mode=config.taxonomy_doc_mode,
+        )
         table_model = config.table_evidence_model or config.model
         self.evidence_builder = build_evidence_builder(config.table_evidence_backend, table_model)
         self.reranker = LlamaReranker(
@@ -153,6 +168,11 @@ class SingleLLMBaseline:
                 else None,
                 "top_k": self.config.top_k,
                 "rerank_k": self.config.rerank_k,
+                "retrieval": "bm25" if self.config.dense_weight <= 0 else "hybrid_bm25_dense",
+                "bm25_weight": self.config.bm25_weight,
+                "dense_weight": self.config.dense_weight,
+                "dense_model": (self.config.dense_model or "svd_fallback") if self.config.dense_weight > 0 else None,
+                "taxonomy_doc_mode": self.config.taxonomy_doc_mode,
             },
         )
         metrics["predictions_path"] = str(predictions_path)
@@ -215,11 +235,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-evidence-backend", choices=["heuristic", "llama"], default="heuristic")
     parser.add_argument("--table-evidence-model", default=None)
     parser.add_argument("--top-k", type=int, default=200)
-    parser.add_argument("--rerank-k", type=int, default=20)
+    parser.add_argument("--rerank-k", type=int, default=200)
     parser.add_argument("--save-top-k", type=int, default=200)
     parser.add_argument("--recall-k", type=int, nargs="+", default=[1, 5, 10, 20, 50, 100, 200])
     parser.add_argument("--limit", type=int, default=0, help="Optional smoke-test limit.")
-    parser.add_argument("--max-input-tokens", type=int, default=4096)
+    parser.add_argument("--bm25-weight", type=float, default=1.0)
+    parser.add_argument("--dense-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--dense-model",
+        default="",
+        help="Optional local sentence-transformer model for dense retrieval; empty uses the SVD fallback.",
+    )
+    parser.add_argument("--taxonomy-doc-mode", choices=TAXONOMY_DOC_MODES, default="full")
+    parser.add_argument("--max-input-tokens", type=int, default=12288)
     parser.add_argument("--max-new-tokens", type=int, default=48)
     return parser.parse_args()
 
@@ -237,6 +265,10 @@ def config_from_args(args: argparse.Namespace) -> BaselineConfig:
         save_top_k=args.save_top_k,
         recall_k=tuple(args.recall_k),
         limit=args.limit,
+        bm25_weight=args.bm25_weight,
+        dense_weight=args.dense_weight,
+        dense_model=args.dense_model,
+        taxonomy_doc_mode=args.taxonomy_doc_mode,
         max_input_tokens=args.max_input_tokens,
         max_new_tokens=args.max_new_tokens,
     )
