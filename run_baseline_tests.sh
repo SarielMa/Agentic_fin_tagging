@@ -5,7 +5,13 @@ set -eu
 # Modes: single_llm, offline, online_gt, online_wo_gt
 # Models: Llama-3.2-3B and Qwen3-14B by default
 
-MODEL_RUNS="${MODEL_RUNS:-meta-llama/Llama-3.2-3B-Instruct:llama3_2_3b Qwen/Qwen3-14B:qwen3_14b}"
+# One model per line, format: <hf_model_id>:<output_suffix>
+# Add or remove models by editing this list (comment out with # to disable).
+MODEL_RUNS="${MODEL_RUNS:-$(cat <<'EOF'
+Qwen/Qwen3-14B:qwen3_14b
+meta-llama/Llama-3.2-3B-Instruct:llama3_2_3b
+EOF
+)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/baseline_three_agent}"
 
 # Readable timestamp shared by every output dir in this invocation so reruns
@@ -34,6 +40,9 @@ SKIP_MODEL_CACHE_CHECK="${SKIP_MODEL_CACHE_CHECK:-0}"
 FINAI_LOCAL_FILES_ONLY="${FINAI_LOCAL_FILES_ONLY:-0}"
 
 export FINAI_LOCAL_FILES_ONLY
+
+# Drop blank lines and #-comments so models can be toggled with a leading #.
+MODEL_RUNS=$(printf '%s\n' "$MODEL_RUNS" | sed 's/#.*//' | grep -v '^[[:space:]]*$' || true)
 
 is_truthy() {
   case "${1:-0}" in
