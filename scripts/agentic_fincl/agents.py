@@ -56,7 +56,12 @@ class LocalLLM:
             AutoModelForCausalLM,
             AutoTokenizer,
         )
-        self.max_input_tokens = int(os.environ.get("FINAI_MAX_INPUT_TOKENS", "8192"))
+        # Qwen3-14B has a 40,960-token native context. The old 8,192 default
+        # truncated the prompt from the right, cutting the context block and the
+        # validator feedback (both appended after the 200-candidate list) so the
+        # selector chose blind. Default to 32,768 to keep the full prompt, with
+        # headroom under the model limit for generation.
+        self.max_input_tokens = int(os.environ.get("FINAI_MAX_INPUT_TOKENS", "32768"))
 
     def generate(self, system: str, user: str, max_new_tokens: int = 128) -> str:
         prompt = self._prompt(system, user)
