@@ -191,7 +191,16 @@ class ValidatorAgent:
         selector_tag: str,
         ltm: LTMStore,
     ) -> ValidationFeedback:
-        error_memories = rank_memory(ltm.records("error_book"), context, example.entity_type, self.memory_k)
+        # Prediction-aware error retrieval, two steps:
+        #   1. keep only past errors whose predicted_tag matches the selector's current pick;
+        #   2. rank those survivors by context BM25.
+        # If step 1 leaves nothing, error_memories is empty and the validator falls back to
+        # its own knowledge (the prompt renders the error book as "(none)").
+        same_pred_errors = [
+            record for record in ltm.records("error_book")
+            if record.get("predicted_tag") == selector_tag
+        ]
+        error_memories = rank_memory(same_pred_errors, context, example.entity_type, self.memory_k)
         raw_output = self.llm.generate(
             system=(
                 "You are Agent 3, the validator in testing mode. You cannot see ground truth. "
