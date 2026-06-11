@@ -22,6 +22,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-k", type=int, default=5)
     parser.add_argument("--recall-k", type=int, nargs="+", default=[1, 5, 10, 20, 50, 100, 200])
     parser.add_argument("--limit", type=int, default=0, help="0 means use the full CSV.")
+    parser.add_argument(
+        "--coach-mode",
+        choices=["hint", "oracle"],
+        default="hint",
+        help="Memory-build critic retry: 'hint' gives a non-leaking corrective hint; "
+        "'oracle' reveals the ground-truth tag (for A/B comparison).",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +46,7 @@ def config_from_args(args: argparse.Namespace) -> BaselineConfig:
         memory_k=args.memory_k,
         recall_k=tuple(args.recall_k),
         limit=args.limit,
+        coach_mode=args.coach_mode,
     )
 
 

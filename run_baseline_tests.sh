@@ -28,6 +28,8 @@ TOP_K="${TOP_K:-200}"
 MEMORY_K="${MEMORY_K:-5}"
 RECALL_K="${RECALL_K:-1 5 10 20 50 100 200}"
 LIMIT="${LIMIT:-0}"
+# Memory-build critic retry: 'hint' (non-leaking corrective hint) or 'oracle' (reveal GT tag).
+COACH_MODE="${COACH_MODE:-hint}"
 
 RUN_OFFLINE="${RUN_OFFLINE:-1}"
 RUN_ONLINE_GT="${RUN_ONLINE_GT:-1}"
@@ -141,6 +143,7 @@ run_mode() {
     --top-k "$TOP_K" \
     --memory-k "$MEMORY_K" \
     --recall-k $RECALL_K \
+    --coach-mode "$COACH_MODE" \
     --limit "$LIMIT"
 }
 

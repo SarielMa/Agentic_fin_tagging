@@ -29,6 +29,7 @@ class BaselineConfig:
     memory_k: int = 5
     recall_k: tuple[int, ...] = (1, 5, 10, 20, 50, 100, 200)
     limit: int = 0
+    coach_mode: str = "hint"
 
 
 class BaselinePipeline:
@@ -101,7 +102,7 @@ class BaselinePipeline:
             phase_dir=phase_dir,
             records=records,
             phase="memory_build",
-            iterations=1,
+            iterations=2,
         )
 
     def _run_testing(self, examples: list[Example], phase_dir: Path) -> dict[str, Any]:
@@ -119,17 +120,44 @@ class BaselinePipeline:
         )
 
     def _memory_build_one(self, example: Example) -> dict[str, Any]:
+        """Supervised teach-then-retry: if the student is wrong, the GT-aware critic
+        coaches one retry, and whichever tag is finally produced is written to memory.
+        A successful retry lands the example in correct_book, growing positive signal."""
+
         context = context_text(example.context)
         candidates = self.retriever.retrieve(context, example.entity_type, self.config.top_k)
-        selection = self.selector.select(example, context, candidates, self.ltm)
-        write_result = self.validator.write_with_gt(example, context, selection.tag, self.ltm)
+
+        first = self.selector.select(example, context, candidates, self.ltm)
+        attempts = [first]
+        coaching = None
+        final_tag = first.tag
+
+        if example.answer is not None and first.tag != example.answer:
+            coaching = self.validator.coach_with_gt(
+                example=example,
+                context=context,
+                candidates=candidates,
+                selector_tag=first.tag,
+                coach_mode=self.config.coach_mode,
+            )
+            retry = self.selector.select(
+                example=example,
+                context=context,
+                candidates=candidates,
+                ltm=self.ltm,
+                feedback=coaching.hint,
+            )
+            attempts.append(retry)
+            final_tag = retry.tag
+
+        write_result = self.validator.write_with_gt(example, context, final_tag, self.ltm)
         return self._record(
             example=example,
             context=context,
             candidates=candidates,
-            final_tag=selection.tag,
-            selector_attempts=[selection],
-            validator_feedback=None,
+            final_tag=final_tag,
+            selector_attempts=attempts,
+            validator_feedback=coaching,
             memory_write=write_result,
             phase="memory_build",
         )

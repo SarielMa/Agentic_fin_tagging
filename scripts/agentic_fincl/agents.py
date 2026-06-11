@@ -34,6 +34,16 @@ class ValidationFeedback:
 
 
 @dataclass(frozen=True)
+class GTCoaching:
+    """Critic feedback produced during memory-build, where ground truth is known."""
+
+    hint: str
+    suggested_tag: str
+    raw_output: str
+    coach_mode: str
+
+
+@dataclass(frozen=True)
 class MemoryWriteResult:
     book: str
     comment: str
@@ -205,6 +215,53 @@ class ValidatorAgent:
             raw_output=raw_output,
             error_memories=error_memories,
         )
+
+    def coach_with_gt(
+        self,
+        example: Example,
+        context: str,
+        candidates: list[dict[str, Any]],
+        selector_tag: str,
+        coach_mode: str = "hint",
+    ) -> GTCoaching:
+        """Memory-build critic: the student was wrong, so use ground truth to coach a retry.
+
+        coach_mode="hint": describe the correct concept family and why the prediction is
+        wrong, WITHOUT revealing the literal ground-truth tag (no test-time oracle leak).
+        coach_mode="oracle": reveal the ground-truth tag directly (for A/B comparison).
+        """
+        if example.answer is None:
+            raise ValueError("coach_with_gt requires a ground-truth answer.")
+
+        if coach_mode == "oracle":
+            hint = f"The correct tag is {example.answer}. Re-select it from the candidate list."
+            return GTCoaching(hint=hint, suggested_tag=example.answer, raw_output="", coach_mode=coach_mode)
+
+        raw_output = self.llm.generate(
+            system=(
+                "You are Agent 3, the validator in memory-build mode. You can see the "
+                "ground-truth tag but must NOT reveal it verbatim. The selector picked the "
+                "wrong tag. Write a short corrective hint that points to the correct concept "
+                "family and explains why the prediction is wrong, so the selector can find the "
+                "right candidate itself. Return compact JSON with keys hint and family."
+            ),
+            user=(
+                f"Entity type: {example.entity_type}\n"
+                f"Entity value: {example.entity}\n"
+                f"Selector prediction (wrong): {selector_tag}\n"
+                f"Ground-truth tag (do not quote it): {example.answer}\n"
+                "Candidate tags:\n"
+                f"{_format_candidates(candidates)}\n"
+                "Context:\n"
+                f"{_clip(context, 2200)}\n"
+                'Return JSON only, for example: {"hint": "...", "family": "..."}'
+            ),
+            max_new_tokens=128,
+        )
+        hint = _extract_field(raw_output, "hint") or _clip(raw_output, 240)
+        if not hint:
+            hint = f"{selector_tag} is wrong; reconsider the candidate that matches this line item."
+        return GTCoaching(hint=hint, suggested_tag="", raw_output=raw_output, coach_mode=coach_mode)
 
     def write_with_gt(
         self,
