@@ -86,7 +86,7 @@ export SKIP_CUDA_SETUP=1
 export RUN_SINGLE_LLM="${RUN_SINGLE_LLM:-0}"
 export RUN_OFFLINE="${RUN_OFFLINE:-1}"
 export RUN_ONLINE_GT="${RUN_ONLINE_GT:-1}"
-export RUN_ONLINE_WO_GT="${RUN_ONLINE_WO_GT:-0}"
+export RUN_ONLINE_WO_GT="${RUN_ONLINE_WO_GT:-1}"
 
 # Raised input cap (also the new code default) — keep it explicit and overridable.
 export FINAI_MAX_INPUT_TOKENS="${FINAI_MAX_INPUT_TOKENS:-32768}"
