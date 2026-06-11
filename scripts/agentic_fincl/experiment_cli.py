@@ -29,6 +29,26 @@ def parse_args() -> argparse.Namespace:
         help="Memory-build critic retry: 'hint' gives a non-leaking corrective hint; "
         "'oracle' reveals the ground-truth tag (for A/B comparison).",
     )
+    parser.add_argument(
+        "--coach-retries",
+        type=int,
+        default=2,
+        help="Max coached retries in memory-build before falling back (0 disables retries).",
+    )
+    parser.add_argument(
+        "--oracle-fallback",
+        dest="oracle_fallback",
+        action="store_true",
+        default=True,
+        help="If the student still fails after retries, bank the GT exemplar in correct_book "
+        "and the contrastive miss in error_book (default on).",
+    )
+    parser.add_argument(
+        "--no-oracle-fallback",
+        dest="oracle_fallback",
+        action="store_false",
+        help="Disable the GT exemplar fallback; a final miss goes only to error_book.",
+    )
     return parser.parse_args()
 
 
@@ -47,6 +67,8 @@ def config_from_args(args: argparse.Namespace) -> BaselineConfig:
         recall_k=tuple(args.recall_k),
         limit=args.limit,
         coach_mode=args.coach_mode,
+        coach_retries=args.coach_retries,
+        oracle_fallback=args.oracle_fallback,
     )
 
 

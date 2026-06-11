@@ -30,6 +30,9 @@ RECALL_K="${RECALL_K:-1 5 10 20 50 100 200}"
 LIMIT="${LIMIT:-0}"
 # Memory-build critic retry: 'hint' (non-leaking corrective hint) or 'oracle' (reveal GT tag).
 COACH_MODE="${COACH_MODE:-hint}"
+# Max coached retries before fallback, and whether a final miss still banks the GT exemplar.
+COACH_RETRIES="${COACH_RETRIES:-2}"
+ORACLE_FALLBACK="${ORACLE_FALLBACK:-1}"
 
 RUN_OFFLINE="${RUN_OFFLINE:-1}"
 RUN_ONLINE_GT="${RUN_ONLINE_GT:-1}"
@@ -144,6 +147,8 @@ run_mode() {
     --memory-k "$MEMORY_K" \
     --recall-k $RECALL_K \
     --coach-mode "$COACH_MODE" \
+    --coach-retries "$COACH_RETRIES" \
+    $(is_truthy "$ORACLE_FALLBACK" && echo --oracle-fallback || echo --no-oracle-fallback) \
     --limit "$LIMIT"
 }
 

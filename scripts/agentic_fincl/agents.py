@@ -222,6 +222,7 @@ class ValidatorAgent:
         context: str,
         candidates: list[dict[str, Any]],
         selector_tag: str,
+        tried_tags: list[str] | None = None,
         coach_mode: str = "hint",
     ) -> GTCoaching:
         """Memory-build critic: the student was wrong, so use ground truth to coach a retry.
@@ -229,6 +230,9 @@ class ValidatorAgent:
         coach_mode="hint": describe the correct concept family and why the prediction is
         wrong, WITHOUT revealing the literal ground-truth tag (no test-time oracle leak).
         coach_mode="oracle": reveal the ground-truth tag directly (for A/B comparison).
+
+        ``tried_tags`` lists every candidate the student has already picked and had
+        rejected; passing it lets successive hints escalate instead of repeating.
         """
         if example.answer is None:
             raise ValueError("coach_with_gt requires a ground-truth answer.")
@@ -237,18 +241,20 @@ class ValidatorAgent:
             hint = f"The correct tag is {example.answer}. Re-select it from the candidate list."
             return GTCoaching(hint=hint, suggested_tag=example.answer, raw_output="", coach_mode=coach_mode)
 
+        rejected = ", ".join(dict.fromkeys(tried_tags or [selector_tag]))
         raw_output = self.llm.generate(
             system=(
                 "You are Agent 3, the validator in memory-build mode. You can see the "
-                "ground-truth tag but must NOT reveal it verbatim. The selector picked the "
-                "wrong tag. Write a short corrective hint that points to the correct concept "
-                "family and explains why the prediction is wrong, so the selector can find the "
-                "right candidate itself. Return compact JSON with keys hint and family."
+                "ground-truth tag but must NOT reveal it verbatim. The selector keeps picking "
+                "wrong tags. Write a short corrective hint that points to the correct concept "
+                "family and explains why the already-rejected tags are wrong, so the selector "
+                "can find the right candidate itself. Do not repeat a rejected tag. Return "
+                "compact JSON with keys hint and family."
             ),
             user=(
                 f"Entity type: {example.entity_type}\n"
                 f"Entity value: {example.entity}\n"
-                f"Selector prediction (wrong): {selector_tag}\n"
+                f"Already-rejected tags (all wrong): {rejected}\n"
                 f"Ground-truth tag (do not quote it): {example.answer}\n"
                 "Candidate tags:\n"
                 f"{_format_candidates(candidates)}\n"
@@ -260,7 +266,7 @@ class ValidatorAgent:
         )
         hint = _extract_field(raw_output, "hint") or _clip(raw_output, 240)
         if not hint:
-            hint = f"{selector_tag} is wrong; reconsider the candidate that matches this line item."
+            hint = f"{rejected} are wrong; reconsider the candidate that matches this line item."
         return GTCoaching(hint=hint, suggested_tag="", raw_output=raw_output, coach_mode=coach_mode)
 
     def write_with_gt(
@@ -297,6 +303,42 @@ class ValidatorAgent:
 
         return MemoryWriteResult(
             book=book,
+            comment=comment,
+            predicted_tag=selector_tag,
+            correct_tag=example.answer,
+        )
+
+    def write_fallback_with_gt(
+        self,
+        example: Example,
+        context: str,
+        selector_tag: str,
+        ltm: LTMStore,
+    ) -> MemoryWriteResult:
+        """Student failed after all coached retries. Bank the ground-truth (label -> tag)
+        exemplar in correct_book regardless (its value is the mapping, not whether the
+        student earned it) AND record the contrastive miss in error_book."""
+        if example.answer is None:
+            raise ValueError("Memory-build mode requires a ground-truth answer.")
+
+        comment = self._memory_comment(example, context, selector_tag, correct=False)
+        ltm.write_correct(
+            entity_type=example.entity_type,
+            value=str(example.entity),
+            context=context,
+            tag=example.answer,
+            comment=comment,
+        )
+        ltm.write_error(
+            entity_type=example.entity_type,
+            value=str(example.entity),
+            context=context,
+            predicted_tag=selector_tag,
+            correct_tag=example.answer,
+            comment=comment,
+        )
+        return MemoryWriteResult(
+            book="correct_book+error_book",
             comment=comment,
             predicted_tag=selector_tag,
             correct_tag=example.answer,

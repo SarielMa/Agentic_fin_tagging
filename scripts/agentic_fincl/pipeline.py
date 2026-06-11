@@ -30,6 +30,8 @@ class BaselineConfig:
     recall_k: tuple[int, ...] = (1, 5, 10, 20, 50, 100, 200)
     limit: int = 0
     coach_mode: str = "hint"
+    coach_retries: int = 2
+    oracle_fallback: bool = True
 
 
 class BaselinePipeline:
@@ -120,26 +122,35 @@ class BaselinePipeline:
         )
 
     def _memory_build_one(self, example: Example) -> dict[str, Any]:
-        """Supervised teach-then-retry: if the student is wrong, the GT-aware critic
-        coaches one retry, and whichever tag is finally produced is written to memory.
-        A successful retry lands the example in correct_book, growing positive signal."""
+        """Supervised teach-then-retry: while the student is wrong, the GT-aware critic
+        coaches up to ``coach_retries`` retries, each hint told which tags were already
+        rejected so it escalates. A successful retry lands the example in correct_book.
+
+        If the student still fails and ``oracle_fallback`` is set, the ground-truth
+        (label -> tag) exemplar is banked in correct_book anyway (its value is the
+        mapping, not whether the student earned it) and the contrastive miss is written
+        to error_book. This de-starves the positive book without leaking GT at test time."""
 
         context = context_text(example.context)
         candidates = self.retriever.retrieve(context, example.entity_type, self.config.top_k)
 
         first = self.selector.select(example, context, candidates, self.ltm)
         attempts = [first]
-        coaching = None
+        coachings: list[Any] = []
         final_tag = first.tag
 
-        if example.answer is not None and first.tag != example.answer:
+        has_gt = example.answer is not None
+        tried = [first.tag]
+        while has_gt and final_tag != example.answer and len(coachings) < self.config.coach_retries:
             coaching = self.validator.coach_with_gt(
                 example=example,
                 context=context,
                 candidates=candidates,
-                selector_tag=first.tag,
+                selector_tag=final_tag,
+                tried_tags=tried,
                 coach_mode=self.config.coach_mode,
             )
+            coachings.append(coaching)
             retry = self.selector.select(
                 example=example,
                 context=context,
@@ -149,15 +160,23 @@ class BaselinePipeline:
             )
             attempts.append(retry)
             final_tag = retry.tag
+            tried.append(final_tag)
 
-        write_result = self.validator.write_with_gt(example, context, final_tag, self.ltm)
+        earned = has_gt and final_tag == example.answer
+        if earned or not has_gt:
+            write_result = self.validator.write_with_gt(example, context, final_tag, self.ltm)
+        elif self.config.oracle_fallback:
+            write_result = self.validator.write_fallback_with_gt(example, context, final_tag, self.ltm)
+        else:
+            write_result = self.validator.write_with_gt(example, context, final_tag, self.ltm)
+
         return self._record(
             example=example,
             context=context,
             candidates=candidates,
             final_tag=final_tag,
             selector_attempts=attempts,
-            validator_feedback=coaching,
+            validator_feedback=coachings[-1] if coachings else None,
             memory_write=write_result,
             phase="memory_build",
         )
