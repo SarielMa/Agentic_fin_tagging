@@ -70,7 +70,7 @@ class BaselinePipeline:
             stream_path = self.config.stream_csv or self.config.test_csv
             summary = {
                 "mode": "online_gt",
-                "online_gt": self._run_memory_build(
+                "online_gt": self._run_online_gt(
                     load_examples(stream_path, self.config.limit),
                     self.config.output_dir / "online_gt",
                 ),
@@ -120,6 +120,40 @@ class BaselinePipeline:
             phase="testing",
             iterations=2,
         )
+
+    def _run_online_gt(self, examples: list[Example], phase_dir: Path) -> dict[str, Any]:
+        """Online supervised evaluation: test first, then reveal GT for future memory."""
+
+        records = []
+        for example in tqdm(examples, desc=f"{self.config.mode} testing", unit="example"):
+            record = self._online_gt_one(example)
+            records.append(record)
+        return self._write_phase(
+            phase_dir=phase_dir,
+            records=records,
+            phase="online_gt_testing",
+            iterations=2,
+        )
+
+    def _online_gt_one(self, example: Example) -> dict[str, Any]:
+        if example.answer is None:
+            raise ValueError("online_gt requires every stream example to have a ground-truth answer.")
+
+        record = self._testing_one(example)
+        record["ltm_counts_before_gt_update"] = record["ltm_counts"]
+
+        memory_record = self._memory_build_one(example)
+        record["memory_write"] = memory_record["memory_write"]
+        record["memory_write_timing"] = "after_testing"
+        record["ltm_counts_after_gt_update"] = memory_record["ltm_counts"]
+        record["post_gt_memory_build"] = {
+            "prediction": memory_record["prediction"],
+            "correct": memory_record["correct"],
+            "selector": memory_record["selector"],
+            "validator": memory_record["validator"],
+            "memory_write": memory_record["memory_write"],
+        }
+        return record
 
     def _memory_build_one(self, example: Example) -> dict[str, Any]:
         """Supervised teach-then-retry: while the student is wrong, the GT-aware critic

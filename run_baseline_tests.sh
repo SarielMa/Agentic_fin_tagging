@@ -3,13 +3,14 @@ set -eu
 
 # Minimal baseline tests.
 # Modes: single_llm, offline, online_gt, online_wo_gt
-# Models: Llama-3.2-3B and Qwen3-14B by default
+# Models: Llama-3.2-3B, Llama-3.3-70B, and Qwen3-14B by default
 
 # One model per line, format: <hf_model_id>:<output_suffix>
 # Add or remove models by editing this list (comment out with # to disable).
 MODEL_RUNS="${MODEL_RUNS:-$(cat <<'EOF'
 Qwen/Qwen3-14B:qwen3_14b
 meta-llama/Llama-3.2-3B-Instruct:llama3_2_3b
+meta-llama/Llama-3.3-70B-Instruct:llama3_3_70b
 EOF
 )}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/baseline_three_agent}"

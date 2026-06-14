@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=finai_baseline
 #SBATCH --mail-type=ALL
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=b200:1
 #SBATCH --mem=128G
@@ -83,7 +83,7 @@ export SKIP_CUDA_SETUP=1
 
 # Focus this run on the cap fix: compare single_llm vs offline. Override any of
 # these on submission, e.g.  sbatch --export=ALL,RUN_ONLINE_GT=1 apply_server_baseline.sh
-export RUN_SINGLE_LLM="${RUN_SINGLE_LLM:-0}"
+export RUN_SINGLE_LLM="${RUN_SINGLE_LLM:-1}"
 export RUN_OFFLINE="${RUN_OFFLINE:-1}"
 export RUN_ONLINE_GT="${RUN_ONLINE_GT:-1}"
 export RUN_ONLINE_WO_GT="${RUN_ONLINE_WO_GT:-1}"
