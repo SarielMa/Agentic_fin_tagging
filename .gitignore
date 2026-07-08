@@ -82,3 +82,7 @@ po_variants_runs_april24
 
 # README files generated inside checkpoints
 **/checkpoint-*/README.md
+*.parquet
+.hf_cache/
+FinTagging_Original/
+FinTagging_800_200_HF/
