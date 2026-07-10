@@ -8,7 +8,8 @@ set -euo pipefail
 REPO_ROOT="$(readlink -f "$(dirname "$0")")"
 
 DATASET_PATH="${DATASET_PATH:-${REPO_ROOT}/FinTagging_800_200_value_type_sft_arrow}"
-DEFAULT_MODELS="Qwen/Qwen2.5-14B-Instruct meta-llama/Llama-3.3-70B-Instruct"
+# Qwen/Qwen2.5-14B-Instruct already completed (job 17415324); only the Llama leg remains.
+DEFAULT_MODELS="meta-llama/Llama-3.3-70B-Instruct"
 if [[ -n "${MODEL:-}" ]]; then
   MODELS="${MODEL}"
 else
@@ -50,6 +51,12 @@ require_path () {
 
 export TOKENIZERS_PARALLELISM=false
 export NCCL_ASYNC_ERROR_HANDLING=1
+
+# Ensure gated HF repos (e.g. meta-llama/*) are accessible: the pipeline overrides
+# HF_HOME, so the token at ~/.cache/huggingface/token is not auto-discovered.
+if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.cache/huggingface/token" ]]; then
+  export HF_TOKEN="$(cat "${HOME}/.cache/huggingface/token")"
+fi
 
 require_path "${DATASET_PATH}" "SFT dataset"
 require_path "${REPO_ROOT}/sft_value_type_peft_ddp.py" "SFT script"
