@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fintag_text_ctx_sft
 #SBATCH --mail-type=ALL
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=b200:2
 #SBATCH --mem=256G

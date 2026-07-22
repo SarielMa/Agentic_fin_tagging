@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a combined context-aware tagging test set.
+"""Build a combined grounding test set.
 
 This consumes the two first-stage context extraction test sets:
 
@@ -36,7 +36,7 @@ import pandas as pd
 DEFAULT_ORIGINAL_DIR = "FinTagging_800_200_HF"
 DEFAULT_TABLE_CONTEXT_DIR = "FinTagging_800_200_table_context_HF"
 DEFAULT_TEXT_CONTEXT_DIR = "FinTagging_800_200_text_context_HF"
-DEFAULT_OUTPUT_DIR = "FinTagging_800_200_context_tagging_test_HF"
+DEFAULT_OUTPUT_DIR = "FinTagging_800_200_grounding_test_HF"
 
 
 def parse_args() -> argparse.Namespace:
@@ -397,7 +397,7 @@ def main() -> None:
     write_readme(output_dir, report)
 
     print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
-    print(f"\nWrote context-aware tagging test set to: {output_dir}")
+    print(f"\nWrote grounding test set to: {output_dir}")
 
 
 if __name__ == "__main__":

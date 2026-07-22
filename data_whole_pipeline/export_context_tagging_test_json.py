@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export the context-aware tagging test parquet as readable JSON files."""
+"""Export the grounding test parquet as readable JSON files."""
 
 from __future__ import annotations
 
@@ -13,13 +13,13 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_SOURCE_DIR = "FinTagging_800_200_context_tagging_test_HF"
-DEFAULT_OUTPUT_DIR = "FinTagging_800_200_context_tagging_test_JSON"
+DEFAULT_SOURCE_DIR = "FinTagging_800_200_grounding_test_HF"
+DEFAULT_OUTPUT_DIR = "FinTagging_800_200_grounding_test_JSON"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export FinTagging context-aware tagging test data to readable JSON."
+        description="Export FinTagging grounding test data to readable JSON."
     )
     parser.add_argument(
         "--source-dir",
@@ -76,7 +76,7 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def write_readme(output_dir: Path, source_dir: Path, row_count: int) -> None:
-    readme = f"""# FinTagging Context-Aware Tagging Test JSON Export
+    readme = f"""# FinTagging Grounding Test JSON Export
 
 This folder is a readable JSON export of:
 
