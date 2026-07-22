@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=%j_fintag_direct_retrieval_qwen3_b200.txt
+#SBATCH --output=/nfs/roberts/scratch/pi_sjf37/lm2445/logs/%j_fintag_direct_retrieval_qwen3_b200.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -58,10 +58,12 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 export TRITON_CACHE_DIR="/tmp/${USER}/triton_cache"
 mkdir -p "${TRITON_CACHE_DIR}"
 
-export HF_HOME="${HF_HOME:-${REPO_ROOT}/.hf_cache}"
-export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export SCRATCH_ROOT="${SCRATCH_ROOT:-/nfs/roberts/scratch/pi_sjf37/lm2445}"
+export XDG_CACHE_HOME="${SCRATCH_ROOT}/.cache"
+export HF_HOME="${XDG_CACHE_HOME}/huggingface"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export TRANSFORMERS_CACHE="${HF_HUB_CACHE}"
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${TRANSFORMERS_CACHE}" "${HF_HUB_CACHE}"
 
 module load miniconda
@@ -95,10 +97,11 @@ fi
 export TEST_JSONL="${TEST_JSONL:-${REPO_ROOT}/FinTagging_800_200_grounding_test_JSON/data/test.jsonl}"
 export TAXONOMY_JSONL="${TAXONOMY_JSONL:-/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/retrieval_data/us_gaap_2024_enriched/us_gaap_2024_enriched_retrieval.jsonl}"
 export QUERY_MODE="${QUERY_MODE:-direct_retrieval}"
+export RUNS_ROOT="${RUNS_ROOT:-${SCRATCH_ROOT}/runs_fintagging_grounding_baseline}"
 if [[ "${QUERY_MODE}" == "one_pass_grounding" || "${QUERY_MODE}" == "llm_description" ]]; then
-  DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs_fintagging_grounding_baseline/qwen3_32b_one_pass_grounding"
+  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/qwen3_32b_one_pass_grounding"
 else
-  DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs_fintagging_grounding_baseline/qwen3_32b_direct_retrieval"
+  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/qwen3_32b_direct_retrieval"
 fi
 export OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 export TOP_K="${TOP_K:-200}"

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fintag_one_pass
 #SBATCH --mail-type=ALL
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
@@ -16,10 +16,12 @@ set -euo pipefail
 #   BM25 retrieves top-200 using (generated query, entity, type).
 #   The same Qwen reranker and evaluator as direct retrieval are then used.
 
-SCRIPT_DIR="$(readlink -f "$(dirname "$0")")"
+REPO_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline"
 
+export SCRATCH_ROOT="${SCRATCH_ROOT:-/nfs/roberts/scratch/pi_sjf37/lm2445}"
+export RUNS_ROOT="${RUNS_ROOT:-${SCRATCH_ROOT}/runs_fintagging_grounding_baseline}"
 export QUERY_MODE="${QUERY_MODE:-one_pass_grounding}"
-export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/runs_fintagging_grounding_baseline/qwen3_32b_one_pass_grounding}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/qwen3_32b_one_pass_grounding}"
 export QUERY_GENERATION_MODEL="${QUERY_GENERATION_MODEL:-Qwen/Qwen3-32B}"
 export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
 export RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-32B}"
@@ -27,4 +29,4 @@ export RERANK_BACKEND="${RERANK_BACKEND:-vllm}"
 export REUSE_CANDIDATES="${REUSE_CANDIDATES:-1}"
 export RESUME="${RESUME:-1}"
 
-bash "${SCRIPT_DIR}/apply_server_fintagging_direct_retrieval.sh"
+bash "${REPO_ROOT}/apply_server_fintagging_direct_retrieval.sh"
