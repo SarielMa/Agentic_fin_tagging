@@ -26,6 +26,8 @@ LR="${LR:-2e-4}"
 BF16="${BF16:-1}"
 USE_QLORA="${USE_QLORA:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
+CONTEXT_MATCH="${CONTEXT_MATCH:-relaxed}"
+JACCARD_THRESHOLD="${JACCARD_THRESHOLD:-0.6}"
 
 TRAIN="${TRAIN:-1}"
 MERGE="${MERGE:-1}"
@@ -91,6 +93,8 @@ echo "MODEL_DIR    : ${MODEL_DIR}"
 echo "TP           : ${TP}"
 echo "MAX_LEN      : ${MAX_LEN}"
 echo "MAX_NEW_TOKENS: ${MAX_NEW_TOKENS}"
+echo "CONTEXT_MATCH : ${CONTEXT_MATCH}"
+echo "JACCARD_THRESHOLD: ${JACCARD_THRESHOLD}"
 echo "EPOCHS       : ${EPOCHS}"
 echo "LR           : ${LR}"
 echo "USE_QLORA    : ${USE_QLORA}"
@@ -151,6 +155,8 @@ if [[ "${EVAL}" == "1" ]]; then
     --task text \
     --split test \
     --predictions "${PRED_DIR}/test_predictions.jsonl" \
+    --context-match "${CONTEXT_MATCH}" \
+    --jaccard-threshold "${JACCARD_THRESHOLD}" \
     --output-json "${EVAL_DIR}/test_metrics.json" \
     --per-row-csv "${EVAL_DIR}/test_per_row.csv" \
     2>&1 | tee "${LOG_DIR}/eval.log"

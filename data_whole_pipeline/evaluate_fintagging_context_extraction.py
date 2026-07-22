@@ -80,6 +80,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Prediction text column. If omitted, common names are auto-detected.",
     )
+    parser.add_argument(
+        "--context-match",
+        default="relaxed",
+        choices=["relaxed", "exact"],
+        help=(
+            "How to match context strings. relaxed accepts exact normalized match, "
+            "substring containment either direction, or token Jaccard above the threshold. "
+            "Default: %(default)s"
+        ),
+    )
+    parser.add_argument(
+        "--jaccard-threshold",
+        type=float,
+        default=0.6,
+        help="Token Jaccard threshold for --context-match relaxed. Default: %(default)s",
+    )
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--per-row-csv", default=None)
     return parser.parse_args()
@@ -121,6 +137,38 @@ def normalize_context(value: Any) -> str | None:
     if text.lower() in {"", "none", "null", "na", "n/a"}:
         return None
     return re.sub(r"\s+", " ", text)
+
+
+def context_tokens(value: str | None) -> set[str]:
+    if value is None:
+        return set()
+    return set(re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", value.lower()))
+
+
+def jaccard_similarity(left: str | None, right: str | None) -> float:
+    left_tokens = context_tokens(left)
+    right_tokens = context_tokens(right)
+    if not left_tokens and not right_tokens:
+        return 1.0
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def relaxed_context_match(gold: Any, pred: Any, threshold: float) -> bool:
+    gold_context = normalize_context(gold)
+    pred_context = normalize_context(pred)
+    if gold_context == pred_context:
+        return True
+    if gold_context is None or pred_context is None:
+        return False
+
+    gold_lower = gold_context.lower()
+    pred_lower = pred_context.lower()
+    if gold_lower in pred_lower or pred_lower in gold_lower:
+        return True
+
+    return jaccard_similarity(gold_context, pred_context) >= threshold
 
 
 def extract_balanced_json(text: str, start_char: str, end_char: str) -> str | None:
@@ -342,15 +390,138 @@ def counter_matches(gold: Counter[tuple[Any, ...]], pred: Counter[tuple[Any, ...
     return sum((gold & pred).values())
 
 
+def counter_to_list(counter: Counter[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+    values: list[tuple[Any, ...]] = []
+    for key, count in counter.items():
+        values.extend([key] * count)
+    return values
+
+
+def maximum_bipartite_matches(
+    gold_items: list[tuple[Any, ...]],
+    pred_items: list[tuple[Any, ...]],
+    is_match,
+) -> int:
+    """Return duplicate-aware max matches between gold and predicted entries."""
+    pred_match_for_gold = [-1] * len(pred_items)
+
+    def try_match(gold_idx: int, seen_pred: set[int]) -> bool:
+        for pred_idx, pred_item in enumerate(pred_items):
+            if pred_idx in seen_pred:
+                continue
+            if not is_match(gold_items[gold_idx], pred_item):
+                continue
+            seen_pred.add(pred_idx)
+            if pred_match_for_gold[pred_idx] == -1 or try_match(
+                pred_match_for_gold[pred_idx], seen_pred
+            ):
+                pred_match_for_gold[pred_idx] = gold_idx
+                return True
+        return False
+
+    matches = 0
+    for gold_idx in range(len(gold_items)):
+        if try_match(gold_idx, set()):
+            matches += 1
+    return matches
+
+
+def contexts_match(
+    gold_contexts: tuple[Any, ...],
+    pred_contexts: tuple[Any, ...],
+    context_match: str,
+    jaccard_threshold: float,
+) -> bool:
+    if len(gold_contexts) != len(pred_contexts):
+        return False
+    if context_match == "exact":
+        return gold_contexts == pred_contexts
+    return all(
+        relaxed_context_match(gold, pred, threshold=jaccard_threshold)
+        for gold, pred in zip(gold_contexts, pred_contexts)
+    )
+
+
+def full_keys_match(
+    gold_key: tuple[Any, ...],
+    pred_key: tuple[Any, ...],
+    task: str,
+    context_match: str,
+    jaccard_threshold: float,
+) -> bool:
+    if gold_key[:2] != pred_key[:2]:
+        return False
+    if task == "table":
+        return contexts_match(
+            gold_key[2:4],
+            pred_key[2:4],
+            context_match=context_match,
+            jaccard_threshold=jaccard_threshold,
+        )
+    return contexts_match(
+        gold_key[2:3],
+        pred_key[2:3],
+        context_match=context_match,
+        jaccard_threshold=jaccard_threshold,
+    )
+
+
+def key_matches(
+    gold: Counter[tuple[Any, ...]],
+    pred: Counter[tuple[Any, ...]],
+    task: str,
+    context_match: str,
+    jaccard_threshold: float,
+) -> int:
+    if context_match == "exact":
+        return counter_matches(gold, pred)
+    return maximum_bipartite_matches(
+        counter_to_list(gold),
+        counter_to_list(pred),
+        lambda gold_key, pred_key: full_keys_match(
+            gold_key,
+            pred_key,
+            task=task,
+            context_match=context_match,
+            jaccard_threshold=jaccard_threshold,
+        ),
+    )
+
+
+def context_matches(
+    gold: Counter[tuple[Any, ...]],
+    pred: Counter[tuple[Any, ...]],
+    context_match: str,
+    jaccard_threshold: float,
+) -> int:
+    if context_match == "exact":
+        return counter_matches(gold, pred)
+    return maximum_bipartite_matches(
+        counter_to_list(gold),
+        counter_to_list(pred),
+        lambda gold_contexts, pred_contexts: contexts_match(
+            gold_contexts,
+            pred_contexts,
+            context_match=context_match,
+            jaccard_threshold=jaccard_threshold,
+        ),
+    )
+
+
 def evaluate(
     gold_rows: list[dict[str, Any]],
     predictions: list[Any],
     task: str,
+    context_match: str,
+    jaccard_threshold: float,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     full_tp = full_pred_total = full_gold_total = 0
+    exact_full_tp = 0
     pair_tp = pair_pred_total = pair_gold_total = 0
     context_tp = context_pred_total = context_gold_total = 0
+    exact_context_tp = 0
     exact_match_count = 0
+    relaxed_match_count = 0
     parse_success_count = 0
     valid_pred_entry_count = 0
     per_row: list[dict[str, Any]] = []
@@ -361,8 +532,16 @@ def evaluate(
         gold_keys, _, gold_valid_entries = key_counter(row["answer"], task=task)
         pred_keys, pred_parse_ok, pred_valid_entries = key_counter(prediction, task=task)
 
-        full_matches = counter_matches(gold_keys, pred_keys)
+        full_matches = key_matches(
+            gold_keys,
+            pred_keys,
+            task=task,
+            context_match=context_match,
+            jaccard_threshold=jaccard_threshold,
+        )
+        exact_full_matches = counter_matches(gold_keys, pred_keys)
         full_tp += full_matches
+        exact_full_tp += exact_full_matches
         full_pred_total += sum(pred_keys.values())
         full_gold_total += sum(gold_keys.values())
 
@@ -375,13 +554,25 @@ def evaluate(
 
         gold_contexts = project_key_counts(gold_keys, context_indices)
         pred_contexts = project_key_counts(pred_keys, context_indices)
-        context_matches = counter_matches(gold_contexts, pred_contexts)
-        context_tp += context_matches
+        row_context_matches = context_matches(
+            gold_contexts,
+            pred_contexts,
+            context_match=context_match,
+            jaccard_threshold=jaccard_threshold,
+        )
+        exact_context_matches = counter_matches(gold_contexts, pred_contexts)
+        context_tp += row_context_matches
+        exact_context_tp += exact_context_matches
         context_pred_total += sum(pred_contexts.values())
         context_gold_total += sum(gold_contexts.values())
 
         exact = gold_keys == pred_keys
+        relaxed_exact = (
+            full_matches == sum(gold_keys.values())
+            and full_matches == sum(pred_keys.values())
+        )
         exact_match_count += int(exact)
+        relaxed_match_count += int(relaxed_exact)
         parse_success_count += int(pred_parse_ok)
         valid_pred_entry_count += pred_valid_entries
 
@@ -392,25 +583,35 @@ def evaluate(
                 "gold_entry_count": gold_valid_entries,
                 "pred_entry_count": pred_valid_entries,
                 "full_matches": full_matches,
+                "exact_full_matches": exact_full_matches,
                 "pair_matches": pair_matches,
-                "context_matches": context_matches,
+                "context_matches": row_context_matches,
+                "exact_context_matches": exact_context_matches,
                 "json_parse_ok": pred_parse_ok,
                 "exact_match": exact,
+                "relaxed_match": relaxed_exact,
             }
         )
 
     n = len(gold_rows)
     metrics = {
         "task": task,
+        "context_match": context_match,
+        "jaccard_threshold": jaccard_threshold,
         "sample_count": n,
         "json_parse_success_rate": round(parse_success_count / n, 6) if n else 0.0,
         "exact_row_match_rate": round(exact_match_count / n, 6) if n else 0.0,
+        "row_match_rate": round(relaxed_match_count / n, 6) if n else 0.0,
         "gold_entry_count": full_gold_total,
         "pred_entry_count": full_pred_total,
         "valid_pred_entry_count": valid_pred_entry_count,
         "full_entry": {
             **prf(full_tp, full_pred_total, full_gold_total),
             "true_positive": full_tp,
+        },
+        "full_entry_exact": {
+            **prf(exact_full_tp, full_pred_total, full_gold_total),
+            "true_positive": exact_full_tp,
         },
         "numeric_entity_datatype": {
             **prf(pair_tp, pair_pred_total, pair_gold_total),
@@ -419,6 +620,10 @@ def evaluate(
         "context_only": {
             **prf(context_tp, context_pred_total, context_gold_total),
             "true_positive": context_tp,
+        },
+        "context_only_exact": {
+            **prf(exact_context_tp, context_pred_total, context_gold_total),
+            "true_positive": exact_context_tp,
         },
     }
     return metrics, per_row
@@ -438,7 +643,13 @@ def main() -> None:
         predictions = align_predictions(gold_rows, prediction_rows, prediction_column)
         prediction_source = args.predictions
 
-    metrics, per_row = evaluate(gold_rows, predictions, task=args.task)
+    metrics, per_row = evaluate(
+        gold_rows,
+        predictions,
+        task=args.task,
+        context_match=args.context_match,
+        jaccard_threshold=args.jaccard_threshold,
+    )
     metrics["gold_dataset"] = args.gold_dataset
     metrics["split"] = args.split
     metrics["prediction_source"] = prediction_source
