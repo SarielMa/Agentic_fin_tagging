@@ -91,11 +91,36 @@ fi
 export QUERY_MODE="${QUERY_MODE:-direct_retrieval}"
 export RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs_fintagging_fulltagging}"
 export EXTRACTOR_TAG="${EXTRACTOR_TAG:-qwen2.5_14b_extractors}"
-if [[ "${QUERY_MODE}" == "one_pass_grounding" || "${QUERY_MODE}" == "llm_description" ]]; then
-  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_one_pass_grounding"
-else
-  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_direct_retrieval"
-fi
+case "${QUERY_MODE}" in
+  direct|direct_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_direct_retrieval"
+    ;;
+  llm_description|one_pass_grounding)
+    DEFAULT_METHOD_DIR="qwen3_32b_one_pass_grounding"
+    ;;
+  intrinsic|self_refinement|intrinsic_self_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_intrinsic_self_refinement"
+    ;;
+  feedback|retrieval_feedback|retrieval_feedback_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_retrieval_feedback_refinement"
+    ;;
+  parallel|parallel_sampling)
+    DEFAULT_METHOD_DIR="qwen3_32b_parallel_sampling"
+    ;;
+  decomposed|decomposed_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_decomposed_retrieval"
+    ;;
+  operator|operator_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_operator_refinement"
+    ;;
+  memory|memory_guided_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_memory_guided_refinement"
+    ;;
+  *)
+    DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
+    ;;
+esac
+DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/${DEFAULT_METHOD_DIR}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 
 export RUN_EXTRACTION="${RUN_EXTRACTION:-1}"
@@ -110,6 +135,10 @@ export EXTRACTION_GPU_MEMORY_UTILIZATION="${EXTRACTION_GPU_MEMORY_UTILIZATION:-0
 export EXTRACTION_MAX_MODEL_LEN="${EXTRACTION_MAX_MODEL_LEN:-16384}"
 export EXTRACTION_MAX_NUM_SEQS="${EXTRACTION_MAX_NUM_SEQS:-8}"
 export TOP_K="${TOP_K:-200}"
+export RETRIEVAL_ROUNDS="${RETRIEVAL_ROUNDS:-4}"
+export FEEDBACK_CANDIDATE_COUNT="${FEEDBACK_CANDIDATE_COUNT:-10}"
+export RRF_KAPPA="${RRF_KAPPA:-60.0}"
+export MEMORY_TOP_K="${MEMORY_TOP_K:-3}"
 export REUSE_CANDIDATES="${REUSE_CANDIDATES:-1}"
 export TYPE_FILTER="${TYPE_FILTER:-1}"
 export RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-32B}"
@@ -175,6 +204,10 @@ echo "HF_HOME=${HF_HOME}"
 echo "HF_HUB_CACHE=${HF_HUB_CACHE}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "TOP_K=${TOP_K}"
+echo "RETRIEVAL_ROUNDS=${RETRIEVAL_ROUNDS}"
+echo "FEEDBACK_CANDIDATE_COUNT=${FEEDBACK_CANDIDATE_COUNT}"
+echo "RRF_KAPPA=${RRF_KAPPA}"
+echo "MEMORY_TOP_K=${MEMORY_TOP_K}"
 echo "REUSE_CANDIDATES=${REUSE_CANDIDATES}"
 echo "RUN_RERANK=${RUN_RERANK}"
 echo "RERANK_MODEL=${RERANK_MODEL}"

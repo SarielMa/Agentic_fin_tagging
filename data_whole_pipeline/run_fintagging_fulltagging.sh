@@ -18,11 +18,36 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HUB_CACHE}}"
 RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs_fintagging_fulltagging}"
 EXTRACTOR_TAG="${EXTRACTOR_TAG:-qwen2.5_14b_extractors}"
 QUERY_MODE="${QUERY_MODE:-direct_retrieval}"
-if [[ "${QUERY_MODE}" == "one_pass_grounding" || "${QUERY_MODE}" == "llm_description" ]]; then
-  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_one_pass_grounding"
-else
-  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_direct_retrieval"
-fi
+case "${QUERY_MODE}" in
+  direct|direct_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_direct_retrieval"
+    ;;
+  llm_description|one_pass_grounding)
+    DEFAULT_METHOD_DIR="qwen3_32b_one_pass_grounding"
+    ;;
+  intrinsic|self_refinement|intrinsic_self_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_intrinsic_self_refinement"
+    ;;
+  feedback|retrieval_feedback|retrieval_feedback_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_retrieval_feedback_refinement"
+    ;;
+  parallel|parallel_sampling)
+    DEFAULT_METHOD_DIR="qwen3_32b_parallel_sampling"
+    ;;
+  decomposed|decomposed_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_decomposed_retrieval"
+    ;;
+  operator|operator_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_operator_refinement"
+    ;;
+  memory|memory_guided_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_memory_guided_refinement"
+    ;;
+  *)
+    DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
+    ;;
+esac
+DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/${DEFAULT_METHOD_DIR}"
 OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 
 MODE="${MODE:-full}"

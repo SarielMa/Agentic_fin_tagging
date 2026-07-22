@@ -11,6 +11,10 @@ description from the source context, entity, and type, then uses that descriptio
 with the entity/type as the BM25 query. Candidate reranking and evaluation are
 shared with direct retrieval.
 
+Additional comparison methods change only the candidate-generation stage. They
+generate one or more retrieval queries, retrieve with the same BM25 index, fuse
+multi-round candidates with RRF, and then use the same reranker and evaluator.
+
 Retrieval-only stages can run on CPU. LLM query generation and reranking require
 the model backend selected by the command line.
 """
@@ -22,6 +26,7 @@ import gc
 import json
 import math
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from html import unescape
@@ -48,9 +53,44 @@ TAG_PREFIX = "us-gaap:"
 QUERY_MODE_ALIASES = {
     "direct": "direct_retrieval",
     "direct_retrieval": "direct_retrieval",
+    "decomposed": "decomposed_retrieval",
+    "decomposed_retrieval": "decomposed_retrieval",
+    "feedback": "retrieval_feedback_refinement",
+    "intrinsic": "intrinsic_self_refinement",
+    "intrinsic_self_refinement": "intrinsic_self_refinement",
     "llm_description": "one_pass_grounding",
+    "memory": "memory_guided_refinement",
+    "memory_guided_refinement": "memory_guided_refinement",
     "one_pass_grounding": "one_pass_grounding",
+    "operator": "operator_refinement",
+    "operator_refinement": "operator_refinement",
+    "parallel": "parallel_sampling",
+    "parallel_sampling": "parallel_sampling",
+    "retrieval_feedback": "retrieval_feedback_refinement",
+    "retrieval_feedback_refinement": "retrieval_feedback_refinement",
+    "self_refinement": "intrinsic_self_refinement",
 }
+MULTI_ROUND_QUERY_MODES = {
+    "intrinsic_self_refinement",
+    "retrieval_feedback_refinement",
+    "parallel_sampling",
+    "decomposed_retrieval",
+    "operator_refinement",
+    "memory_guided_refinement",
+}
+LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
+STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
+DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
+OPERATOR_LIBRARY = (
+    "direct_label",
+    "row_column",
+    "relative_time",
+    "roll_forward",
+    "dimensional",
+    "aggregation",
+    "rate",
+    "schedule",
+)
 STOPWORDS = {
     "a",
     "an",
@@ -121,6 +161,8 @@ class Example:
     input_type: str
     entity: str
     entity_type: str
+    row_context: str
+    column_context: str
     original_context: str
     query_context: str
     gold_tags: list[str]
@@ -237,6 +279,24 @@ def parse_json_object(text: str) -> tuple[dict[str, Any], bool]:
     return {}, False
 
 
+def parse_json_value(text: str) -> tuple[Any, bool]:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    cleaned = cleaned.strip("`")
+    candidates = [
+        cleaned,
+        extract_balanced_json(cleaned, "{", "}"),
+        extract_balanced_json(cleaned, "[", "]"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate), True
+        except json.JSONDecodeError:
+            continue
+    return None, False
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
@@ -267,6 +327,8 @@ def load_examples(path: Path, limit: int | None = None) -> list[Example]:
             or ""
         )
         entity_type = normalize_space(fields.get("datatype") or fields.get("type") or "")
+        row_context = normalize_space(fields.get("row_context", ""))
+        column_context = normalize_space(fields.get("column_context", ""))
         gold_tags = [normalize_tag(tag) for tag in row.get("ground_truth_concepts", []) if normalize_tag(tag)]
         examples.append(
             Example(
@@ -276,6 +338,8 @@ def load_examples(path: Path, limit: int | None = None) -> list[Example]:
                 input_type=normalize_space(row.get("input_type", "")),
                 entity=entity,
                 entity_type=entity_type,
+                row_context=row_context,
+                column_context=column_context,
                 original_context=original_context,
                 query_context=visible_context,
                 gold_tags=gold_tags,
@@ -384,6 +448,28 @@ def build_direct_query(example: Example) -> str:
     return normalize_space(f"{example.entity} {example.entity_type} {example.query_context}")
 
 
+def serialize_evidence(example: Example, context_max_chars: int) -> str:
+    lines = [
+        f"Entity value: {example.entity}",
+        f"Datatype: {example.entity_type}",
+        f"Input type: {example.input_type}",
+    ]
+    if example.row_context:
+        lines.append(f"Row context: {example.row_context}")
+    if example.column_context:
+        lines.append(f"Column context: {example.column_context}")
+    lines.append("Source context:")
+    lines.append(truncate_text(example.query_context, context_max_chars))
+    return "\n".join(lines)
+
+
+def retrieval_query_from_grounding(example: Example, grounding: str) -> str:
+    grounding = normalize_space(grounding)
+    if not grounding:
+        grounding = build_direct_query(example)
+    return normalize_space(f"{example.entity} {example.entity_type} {grounding}")
+
+
 def build_retrieval_query(
     example: Example,
     query_mode: str,
@@ -453,12 +539,131 @@ def aggregate_metric_rows(rows: list[dict[str, Any]], top_ks: tuple[int, ...]) -
     return metrics
 
 
+def retrieve_candidates(
+    retriever: TaxonomyRetriever,
+    query: str,
+    entity_type: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    return [
+        concept_to_candidate(concept, rank, score)
+        for rank, (concept, score) in enumerate(
+            retriever.retrieve(query, entity_type, top_k),
+            start=1,
+        )
+    ]
+
+
+def fuse_round_candidates(
+    rounds: list[dict[str, Any]],
+    top_k: int,
+    rrf_kappa: float,
+) -> list[dict[str, Any]]:
+    scores: dict[str, float] = defaultdict(float)
+    best_rank: dict[str, int] = {}
+    first_round: dict[str, int] = {}
+    best_candidate: dict[str, dict[str, Any]] = {}
+    round_hits: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for round_record in rounds:
+        round_idx = int(round_record.get("round", 1))
+        for candidate in round_record.get("candidates", []):
+            tag = normalize_tag(candidate.get("tag"))
+            rank = int(candidate.get("rank", 0) or 0)
+            if not tag or rank <= 0:
+                continue
+            scores[tag] += 1.0 / (rrf_kappa + rank)
+            if tag not in best_rank or rank < best_rank[tag]:
+                best_rank[tag] = rank
+                best_candidate[tag] = dict(candidate)
+            if tag not in first_round:
+                first_round[tag] = round_idx
+            round_hits[tag].append(
+                {
+                    "round": round_idx,
+                    "rank": rank,
+                    "bm25_score": candidate.get("bm25_score"),
+                }
+            )
+
+    ranked_tags = sorted(
+        scores,
+        key=lambda tag: (-scores[tag], first_round.get(tag, 10**9), best_rank.get(tag, 10**9), tag),
+    )[:top_k]
+
+    fused: list[dict[str, Any]] = []
+    for final_rank, tag in enumerate(ranked_tags, start=1):
+        candidate = dict(best_candidate[tag])
+        candidate["rank"] = final_rank
+        candidate["rrf_score"] = round(scores[tag], 8)
+        candidate["best_round_rank"] = best_rank[tag]
+        candidate["first_retrieved_round"] = first_round[tag]
+        candidate["round_hits"] = round_hits[tag]
+        fused.append(candidate)
+    return fused
+
+
+def finalize_candidate_record(
+    example: Example,
+    query_mode: str,
+    rounds: list[dict[str, Any]],
+    top_k: int,
+    rrf_kappa: float,
+    total_llm_calls: int = 0,
+    total_prompt_tokens: int = 0,
+    total_completion_tokens: int = 0,
+    wall_time: float | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    final_candidates = fuse_round_candidates(rounds, top_k, rrf_kappa)
+    candidate_tags = [candidate["tag"] for candidate in final_candidates]
+    retrieval_metrics = metric_row(candidate_tags, example.gold_tags, (10, 50, top_k))
+    search_coverage = any(tag in set(candidate_tags) for tag in example.gold_tags)
+    last_round = rounds[-1] if rounds else {}
+    record: dict[str, Any] = {
+        "instance_id": example.example_idx,
+        "example_idx": example.example_idx,
+        "context_id": example.context_id,
+        "source_sample_idx": example.source_sample_idx,
+        "input_type": example.input_type,
+        "entity": example.entity,
+        "type": example.entity_type,
+        "row_context": example.row_context,
+        "column_context": example.column_context,
+        "gold_tags": example.gold_tags,
+        "gold_concept": example.gold_tags[0] if example.gold_tags else None,
+        "method": query_mode,
+        "query_mode": query_mode,
+        "query": last_round.get("query", ""),
+        "query_context": example.query_context,
+        "query_description": last_round.get("grounding"),
+        "rounds": rounds,
+        "final_candidates": final_candidates,
+        "candidates": final_candidates,
+        "candidate_union_tags": candidate_tags,
+        "search_coverage": search_coverage,
+        "retrieval_metrics": retrieval_metrics,
+        "gold_rank": retrieval_metrics.get("rank"),
+        "total_llm_calls": total_llm_calls,
+        "total_retrieval_calls": len(rounds),
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_tokens": total_prompt_tokens + total_completion_tokens,
+    }
+    if wall_time is not None:
+        record["wall_time"] = round(wall_time, 6)
+    if extra_fields:
+        record.update(extra_fields)
+    return record
+
+
 def build_candidate_records(
     examples: list[Example],
     taxonomy: list[Concept],
     top_k: int,
     type_filter: bool,
     query_mode: str,
+    rrf_kappa: float = 60.0,
     query_descriptions: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     query_mode = canonical_query_mode(query_mode)
@@ -466,34 +671,24 @@ def build_candidate_records(
     records: list[dict[str, Any]] = []
     for example in examples:
         query, query_description = build_retrieval_query(example, query_mode, query_descriptions)
-        candidates = [
-            concept_to_candidate(concept, rank, score)
-            for rank, (concept, score) in enumerate(
-                retriever.retrieve(query, example.entity_type, top_k),
-                start=1,
-            )
-        ]
-        candidate_tags = [candidate["tag"] for candidate in candidates]
-        retrieval_metrics = metric_row(candidate_tags, example.gold_tags, (10, 50, top_k))
-        search_coverage = any(tag in set(candidate_tags) for tag in example.gold_tags)
-        records.append(
+        candidates = retrieve_candidates(retriever, query, example.entity_type, top_k)
+        rounds = [
             {
-                "example_idx": example.example_idx,
-                "context_id": example.context_id,
-                "source_sample_idx": example.source_sample_idx,
-                "input_type": example.input_type,
-                "entity": example.entity,
-                "type": example.entity_type,
-                "gold_tags": example.gold_tags,
-                "query_mode": query_mode,
+                "round": 1,
+                "grounding": query_description,
                 "query": query,
-                "query_context": example.query_context,
-                "query_description": query_description,
                 "candidates": candidates,
-                "candidate_union_tags": candidate_tags,
-                "search_coverage": search_coverage,
-                "retrieval_metrics": retrieval_metrics,
             }
+        ]
+        records.append(
+            finalize_candidate_record(
+                example,
+                query_mode=query_mode,
+                rounds=rounds,
+                top_k=top_k,
+                rrf_kappa=rrf_kappa,
+                total_llm_calls=1 if query_mode == "one_pass_grounding" else 0,
+            )
         )
     return records
 
@@ -851,6 +1046,636 @@ def release_model_handles(*handles: Any) -> None:
         torch.cuda.empty_cache()
 
 
+class QueryGenerator:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        tokenizer: Any | None = None,
+        llm: Any | None = None,
+    ) -> None:
+        self.args = args
+        self.tokenizer = tokenizer
+        self.llm = llm
+        self.loaded_here = tokenizer is None or llm is None
+        if self.tokenizer is None or self.llm is None:
+            if args.query_generation_backend == "vllm":
+                self.tokenizer, self.llm = load_vllm_engine(args, args.query_generation_model)
+            else:
+                self.tokenizer, self.llm = load_rerank_model(
+                    args.query_generation_model,
+                    bf16=args.bf16,
+                    trust_remote_code=args.trust_remote_code,
+                    attn_implementation=args.attn_implementation,
+                )
+
+    @property
+    def backend(self) -> str:
+        return self.args.query_generation_backend
+
+    @property
+    def model_name(self) -> str:
+        return self.args.query_generation_model
+
+    def count_text_tokens(self, text: str) -> int:
+        return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def generate_many(self, prompts: list[str]) -> list[str]:
+        if not prompts:
+            return []
+        if self.args.query_generation_backend == "vllm":
+            from vllm import SamplingParams
+
+            sampling_params = SamplingParams(
+                temperature=self.args.query_temperature,
+                top_p=self.args.query_top_p,
+                max_tokens=self.args.query_max_new_tokens,
+            )
+            raw_outputs: list[str] = []
+            for start in range(0, len(prompts), self.args.vllm_batch_size):
+                batch = prompts[start : start + self.args.vllm_batch_size]
+                outputs = self.llm.generate(batch, sampling_params)
+                raw_outputs.extend(output.outputs[0].text.strip() if output.outputs else "" for output in outputs)
+            return raw_outputs
+
+        return [
+            generate_text(
+                self.tokenizer,
+                self.llm,
+                prompt,
+                max_input_tokens=self.args.query_max_input_tokens,
+                max_new_tokens=self.args.query_max_new_tokens,
+                temperature=self.args.query_temperature,
+                top_p=self.args.query_top_p,
+            )
+            for prompt in prompts
+        ]
+
+    def generate_one(self, prompt: str) -> str:
+        return self.generate_many([prompt])[0]
+
+    def close(self) -> None:
+        if self.loaded_here:
+            release_model_handles(self.llm, self.tokenizer)
+            self.llm = None
+            self.tokenizer = None
+
+
+def build_prompt_under_query_budget(
+    tokenizer: Any,
+    message_builder: Any,
+    context_max_chars: int,
+    max_input_tokens: int,
+) -> tuple[str, int, int]:
+    context_options = [
+        context_max_chars,
+        min(context_max_chars, 8000),
+        min(context_max_chars, 5000),
+        min(context_max_chars, 2500),
+    ]
+    last_prompt = ""
+    last_tokens = 0
+    for ctx_chars in context_options:
+        messages = message_builder(ctx_chars)
+        prompt = messages_to_prompt(tokenizer, messages)
+        token_count = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+        last_prompt = prompt
+        last_tokens = token_count
+        if token_count <= max_input_tokens:
+            return prompt, token_count, ctx_chars
+    return last_prompt, last_tokens, min(context_options)
+
+
+def build_feedback_prompt_under_query_budget(
+    tokenizer: Any,
+    message_builder: Any,
+    context_max_chars: int,
+    doc_max_chars: int,
+    max_input_tokens: int,
+) -> tuple[str, int, int, int]:
+    context_options = [
+        context_max_chars,
+        min(context_max_chars, 8000),
+        min(context_max_chars, 5000),
+        min(context_max_chars, 2500),
+    ]
+    doc_options = [doc_max_chars, min(doc_max_chars, 240), min(doc_max_chars, 120), 0]
+    last_prompt = ""
+    last_tokens = 0
+    for ctx_chars in context_options:
+        for doc_chars in doc_options:
+            messages = message_builder(ctx_chars, doc_chars)
+            prompt = messages_to_prompt(tokenizer, messages)
+            token_count = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+            last_prompt = prompt
+            last_tokens = token_count
+            if token_count <= max_input_tokens:
+                return prompt, token_count, ctx_chars, doc_chars
+    return last_prompt, last_tokens, min(context_options), min(doc_options)
+
+
+def llm_call_record(
+    kind: str,
+    raw_output: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    parse_ok: bool,
+    backend: str,
+    model_name: str,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "kind": kind,
+        "parse_ok": parse_ok,
+        "raw_output": raw_output,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "backend": backend,
+        "model": model_name,
+    }
+    if extra_fields:
+        record.update(extra_fields)
+    return record
+
+
+def extract_query_from_output(raw_output: str, fallback: str) -> tuple[str, bool]:
+    return parse_query_description(raw_output, fallback)
+
+
+def scalar_text(value: Any) -> str:
+    if isinstance(value, str):
+        return normalize_space(value)
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return normalize_space(", ".join(scalar_text(item) for item in value if scalar_text(item)))
+    if isinstance(value, dict):
+        return normalize_space(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    return normalize_space(value)
+
+
+def normalized_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [normalize_space(item) for item in value if normalize_space(item)]
+    text = normalize_space(value)
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"[,;]", text) if part.strip()]
+
+
+def bool_from_any(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return normalize_space(value).lower() in {"yes", "true", "1", "y"}
+
+
+def format_feedback_candidates(
+    candidates: list[dict[str, Any]],
+    entity_type: str,
+    limit: int,
+    doc_max_chars: int,
+) -> str:
+    compatible = [candidate for candidate in candidates if not entity_type or candidate.get("type") == entity_type]
+    if len(compatible) < limit:
+        seen = {candidate.get("tag") for candidate in compatible}
+        compatible.extend(candidate for candidate in candidates if candidate.get("tag") not in seen)
+    selected = compatible[:limit]
+    if not selected:
+        return "No candidates were retrieved."
+    return "\n\n".join(format_candidate_for_prompt(candidate, doc_max_chars) for candidate in selected)
+
+
+def build_intrinsic_refinement_messages(
+    example: Example,
+    previous_grounding: str,
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    user = f"""You are given evidence from a financial document and your previous semantic interpretation of this evidence.
+
+Critically evaluate your previous interpretation without seeing any retrieved taxonomy candidates. Consider whether you may have:
+- Misidentified the entity type or accounting family
+- Chosen the wrong temporal scope
+- Confused a subtotal with a line item
+- Missed a qualifier such as net vs gross or beginning vs ending
+- Applied the wrong aggregation level
+
+Return JSON only with this schema:
+{{"critique": "brief critique", "query": "revised semantic retrieval description"}}
+
+Evidence:
+{evidence}
+
+Previous interpretation:
+{previous_grounding}
+
+Rules:
+- Do not include markdown.
+- If the previous interpretation still looks correct, reuse it as the query."""
+    return [
+        {"role": "system", "content": "You refine US-GAAP retrieval queries by self-critique only."},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_retrieval_feedback_messages(
+    example: Example,
+    previous_grounding: str,
+    candidates: list[dict[str, Any]],
+    context_max_chars: int,
+    doc_max_chars: int,
+    feedback_candidate_count: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    candidate_text = format_feedback_candidates(candidates, example.entity_type, feedback_candidate_count, doc_max_chars)
+    user = f"""You are given evidence from a financial document, your previous semantic interpretation, and the top taxonomy concepts retrieved using that interpretation.
+
+Use the retrieved concepts to assess whether the interpretation is on the right track. Rewrite the semantic description to better capture what the evidence expresses. You may change entity type, temporal scope, qualifiers, aggregation level, or any other aspect.
+
+Return JSON only with this schema:
+{{"assessment": "brief assessment of the retrieved neighborhood", "query": "revised semantic retrieval description"}}
+
+Evidence:
+{evidence}
+
+Previous interpretation:
+{previous_grounding}
+
+Retrieved concepts:
+{candidate_text}
+
+Rules:
+- Do not name a gold concept.
+- Do not include markdown."""
+    return [
+        {"role": "system", "content": "You refine US-GAAP retrieval queries using retrieved-neighborhood feedback."},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_parallel_sampling_messages(
+    example: Example,
+    sample_idx: int,
+    total_samples: int,
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    user = f"""Generate a semantic interpretation of financial evidence for retrieving the correct US-GAAP XBRL taxonomy concept.
+
+This is interpretation {sample_idx} of {total_samples}. Explore a different plausible reading of the evidence. Consider varying:
+- The accounting family or entity type
+- The temporal interpretation
+- Whether this is a line item, subtotal, total, or reconciliation entry
+- Measurement basis such as gross/net or beginning/ending
+- The level of aggregation
+
+Return JSON only with this schema:
+{{"query": "distinct semantic retrieval description"}}
+
+Evidence:
+{evidence}
+
+Rules:
+- Make this interpretation meaningfully distinct.
+- Do not include explanations or markdown."""
+    return [
+        {"role": "system", "content": "You generate diverse US-GAAP retrieval hypotheses."},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_decomposed_retrieval_messages(
+    example: Example,
+    total_queries: int,
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    user = f"""Decompose the financial evidence into {total_queries} separate retrieval queries, each focused on a different semantic dimension.
+
+Use these dimensions when {total_queries} is 4:
+1. Entity type and accounting family
+2. Temporal scope
+3. Measurement and qualifiers
+4. Aggregation and structure
+
+Return JSON only with this schema:
+{{"queries": [{{"focus": "entity_family", "query": "..."}}, {{"focus": "temporal", "query": "..."}}, {{"focus": "measurement", "query": "..."}}, {{"focus": "aggregation", "query": "..."}}]}}
+
+Evidence:
+{evidence}
+
+Rules:
+- Each query must be self-contained.
+- Each query should be useful for retrieval on its own.
+- Do not include markdown."""
+    return [
+        {"role": "system", "content": "You decompose financial evidence into dimension-focused US-GAAP retrieval queries."},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_decomposed_queries(raw_output: str, fallback: str, total_queries: int) -> tuple[list[dict[str, str]], bool]:
+    parsed, parse_ok = parse_json_value(raw_output)
+    query_items: list[dict[str, str]] = []
+    if isinstance(parsed, dict):
+        values = parsed.get("queries") or parsed.get("sub_queries") or parsed.get("retrieval_queries")
+        if isinstance(values, list):
+            for idx, item in enumerate(values, start=1):
+                if isinstance(item, dict):
+                    query = scalar_text(item.get("query") or item.get("description"))
+                    focus = scalar_text(item.get("focus") or item.get("dimension") or f"query_{idx}")
+                else:
+                    query = scalar_text(item)
+                    focus = f"query_{idx}"
+                if query:
+                    query_items.append({"focus": focus, "query": query})
+        else:
+            for idx in range(1, total_queries + 1):
+                query = scalar_text(parsed.get(f"query_{idx}") or parsed.get(f"query{idx}"))
+                if query:
+                    query_items.append({"focus": f"query_{idx}", "query": query})
+    elif isinstance(parsed, list):
+        for idx, item in enumerate(parsed, start=1):
+            query = scalar_text(item.get("query") if isinstance(item, dict) else item)
+            focus = scalar_text(item.get("focus") if isinstance(item, dict) else f"query_{idx}")
+            if query:
+                query_items.append({"focus": focus or f"query_{idx}", "query": query})
+
+    if not query_items:
+        cleaned = clean_model_text(raw_output)
+        for line in cleaned.splitlines():
+            line = normalize_space(re.sub(r"^(?:query|interpretation)\s*\d+\s*[:.)-]\s*", "", line, flags=re.I))
+            if line:
+                query_items.append({"focus": f"query_{len(query_items) + 1}", "query": line})
+            if len(query_items) >= total_queries:
+                break
+
+    while len(query_items) < total_queries:
+        query_items.append({"focus": f"fallback_{len(query_items) + 1}", "query": fallback})
+    return query_items[:total_queries], bool(parse_ok and query_items)
+
+
+def build_operator_initial_messages(example: Example, context_max_chars: int) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    user = f"""Produce a structured semantic hypothesis for grounding financial evidence to a US-GAAP XBRL taxonomy concept.
+
+Fill each dimension only if the evidence directly supports it. Use "UNRESOLVED" when unsupported.
+
+Dimensions:
+- FAMILY: broad accounting domain
+- ROLE: specific function
+- EVENT: event or state
+- QUALIFIER: modifiers such as gross/net, current/noncurrent, pre-tax/after-tax, weighted average
+- SCOPE: dimensional context such as segment, geography, plan, security class, subsidiary
+- TEMPORAL: time interpretation
+
+Operator library:
+{", ".join(OPERATOR_LIBRARY)}
+
+Return JSON only with this schema:
+{{"dimensions": {{"FAMILY": "...", "ROLE": "...", "EVENT": "...", "QUALIFIER": "...", "SCOPE": "...", "TEMPORAL": "..."}}, "operators": ["direct_label"], "retrieval_query": "compact retrieval query"}}
+
+Evidence:
+{evidence}"""
+    return [
+        {"role": "system", "content": "You create structured US-GAAP grounding hypotheses."},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_hypothesis(raw_output: str, fallback: str) -> tuple[dict[str, Any], bool]:
+    parsed, parse_ok = parse_json_object(raw_output)
+    dimensions = {dimension: "UNRESOLVED" for dimension in DIMENSIONS}
+    if isinstance(parsed.get("dimensions"), dict):
+        for dimension in DIMENSIONS:
+            value = scalar_text(parsed["dimensions"].get(dimension) or parsed["dimensions"].get(dimension.lower()))
+            if value:
+                dimensions[dimension] = value
+    else:
+        for dimension in DIMENSIONS:
+            value = scalar_text(parsed.get(dimension) or parsed.get(dimension.lower()))
+            if value:
+                dimensions[dimension] = value
+
+    operators = normalized_list(parsed.get("operators") or parsed.get("operator"))
+    operators = [operator for operator in operators if operator in OPERATOR_LIBRARY] or ["direct_label"]
+    retrieval_query = scalar_text(
+        parsed.get("retrieval_query")
+        or parsed.get("query")
+        or parsed.get("semantic_description")
+        or parsed.get("description")
+    )
+    if not retrieval_query:
+        retrieval_query, parse_ok = extract_query_from_output(raw_output, fallback)
+    return {
+        "dimensions": dimensions,
+        "operators": operators,
+        "retrieval_query": retrieval_query or fallback,
+    }, bool(parse_ok and retrieval_query)
+
+
+def build_operator_feedback_messages(
+    example: Example,
+    hypothesis: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    context_max_chars: int,
+    doc_max_chars: int,
+    feedback_candidate_count: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    candidate_text = format_feedback_candidates(candidates, example.entity_type, feedback_candidate_count, doc_max_chars)
+    user = f"""Assess a structured grounding hypothesis using the retrieved taxonomy neighborhood.
+
+For each semantic dimension, decide whether the retrieved concepts SUPPORT, CONTRADICT, or leave UNRESOLVED that dimension. Also identify alternative values and whether there is a structural-strategy mismatch.
+
+Return JSON only with this schema:
+{{"supported_dimensions": ["FAMILY"], "contradicted_dimensions": ["ROLE"], "unresolved_dimensions": ["TEMPORAL"], "alternative_values": {{"ROLE": ["..."]}}, "structural_mismatch": {{"is_mismatch": false, "reason": "..."}}}}
+
+Evidence:
+{evidence}
+
+Current hypothesis:
+{json.dumps(hypothesis, ensure_ascii=False, sort_keys=True)}
+
+Retrieved concepts:
+{candidate_text}
+
+Rules:
+- Do not try to identify the gold concept.
+- Focus only on dimensional assessment.
+- Do not include markdown."""
+    return [
+        {"role": "system", "content": "You provide structured feedback for US-GAAP grounding hypotheses."},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_feedback(raw_output: str) -> tuple[dict[str, Any], bool]:
+    parsed, parse_ok = parse_json_object(raw_output)
+    mismatch = parsed.get("structural_mismatch")
+    if not isinstance(mismatch, dict):
+        mismatch = {
+            "is_mismatch": bool_from_any(mismatch),
+            "reason": scalar_text(mismatch),
+        }
+    alternatives = parsed.get("alternative_values") or parsed.get("alternatives") or {}
+    if not isinstance(alternatives, dict):
+        alternatives = {}
+    return {
+        "supported_dimensions": normalized_list(parsed.get("supported_dimensions") or parsed.get("D+") or parsed.get("supported")),
+        "contradicted_dimensions": normalized_list(parsed.get("contradicted_dimensions") or parsed.get("D-") or parsed.get("contradicted")),
+        "unresolved_dimensions": normalized_list(parsed.get("unresolved_dimensions") or parsed.get("D?") or parsed.get("unresolved")),
+        "alternative_values": {
+            normalize_space(key).upper(): normalized_list(value)
+            for key, value in alternatives.items()
+            if normalize_space(key)
+        },
+        "structural_mismatch": {
+            "is_mismatch": bool_from_any(mismatch.get("is_mismatch")),
+            "reason": scalar_text(mismatch.get("reason")),
+        },
+    }, parse_ok
+
+
+def format_search_history(transitions: list[dict[str, Any]]) -> str:
+    if not transitions:
+        return "No previous interventions."
+    parts = []
+    for transition in transitions:
+        parts.append(
+            json.dumps(
+                {
+                    "from_round": transition.get("from_round"),
+                    "to_round": transition.get("to_round"),
+                    "feedback": transition.get("feedback"),
+                    "directive": transition.get("directive"),
+                    "hypothesis_after": transition.get("revised_hypothesis"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    return "\n".join(parts)
+
+
+def format_operator_memories(memories: list[dict[str, Any]]) -> str:
+    if not memories:
+        return "None."
+    redacted = []
+    for memory in memories:
+        redacted.append(
+            {
+                "evidence_profile": memory.get("evidence_profile"),
+                "feedback": memory.get("feedback"),
+                "directive": memory.get("directive"),
+                "semantic_difference": memory.get("semantic_difference"),
+                "delta_reward": memory.get("delta_reward"),
+            }
+        )
+    return json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+
+
+def build_operator_controller_messages(
+    example: Example,
+    hypothesis: dict[str, Any],
+    feedback: dict[str, Any],
+    transitions: list[dict[str, Any]],
+    positive_memories: list[dict[str, Any]] | None,
+    negative_memories: list[dict[str, Any]] | None,
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    memory_block = ""
+    if positive_memories is not None or negative_memories is not None:
+        memory_block = f"""
+
+Positive memories - interventions that improved retrieval:
+{format_operator_memories(positive_memories or [])}
+
+Negative memories - interventions that did not improve retrieval:
+{format_operator_memories(negative_memories or [])}
+"""
+    user = f"""Select one atomic semantic intervention for the next retrieval round.
+
+Search modes:
+- REFINE: fix a contradicted dimension
+- BRANCH: try an alternative for an unresolved dimension
+- CHANGE_STRATEGY: switch interpretation operator when the structure looks wrong
+
+Rules:
+- Modify exactly one dimension, or one tightly coupled pair.
+- Preserve supported dimensions.
+- Do not repeat a hypothesis already tested.
+
+Return JSON only with this schema:
+{{"mode": "REFINE", "operator": "direct_label", "target_dimension": "ROLE", "semantic_patch": "...", "preserve": ["FAMILY"], "rationale": "..."}}
+
+Evidence:
+{evidence}
+
+Current hypothesis:
+{json.dumps(hypothesis, ensure_ascii=False, sort_keys=True)}
+
+Current feedback:
+{json.dumps(feedback, ensure_ascii=False, sort_keys=True)}
+
+Search history:
+{format_search_history(transitions)}
+{memory_block}"""
+    return [
+        {"role": "system", "content": "You control structured search over US-GAAP grounding hypotheses."},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_directive(raw_output: str) -> tuple[dict[str, Any], bool]:
+    parsed, parse_ok = parse_json_object(raw_output)
+    mode = scalar_text(parsed.get("mode")).upper()
+    if mode not in {"REFINE", "BRANCH", "CHANGE_STRATEGY"}:
+        mode = "BRANCH"
+    operator = scalar_text(parsed.get("operator"))
+    if operator not in OPERATOR_LIBRARY:
+        operator = "direct_label"
+    return {
+        "mode": mode,
+        "operator": operator,
+        "target_dimension": scalar_text(parsed.get("target_dimension") or parsed.get("dimension")).upper(),
+        "semantic_patch": scalar_text(parsed.get("semantic_patch") or parsed.get("patch") or parsed.get("new_value")),
+        "preserve": normalized_list(parsed.get("preserve") or parsed.get("preservation_set")),
+        "rationale": scalar_text(parsed.get("rationale") or parsed.get("reason")),
+    }, parse_ok
+
+
+def build_operator_revision_messages(
+    example: Example,
+    hypothesis: dict[str, Any],
+    directive: dict[str, Any],
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    user = f"""Apply the controller directive to revise a structured grounding hypothesis.
+
+Rules:
+- Apply only the specified change.
+- Preserve all dimensions listed in the preservation set.
+- Do not make additional changes.
+
+Return JSON only with this schema:
+{{"dimensions": {{"FAMILY": "...", "ROLE": "...", "EVENT": "...", "QUALIFIER": "...", "SCOPE": "...", "TEMPORAL": "..."}}, "operators": ["direct_label"], "semantic_difference": "what changed", "retrieval_query": "compact retrieval query"}}
+
+Evidence:
+{evidence}
+
+Current hypothesis:
+{json.dumps(hypothesis, ensure_ascii=False, sort_keys=True)}
+
+Directive:
+{json.dumps(directive, ensure_ascii=False, sort_keys=True)}"""
+    return [
+        {"role": "system", "content": "You revise structured US-GAAP grounding hypotheses."},
+        {"role": "user", "content": user},
+    ]
+
+
 def generate_query_descriptions(
     args: argparse.Namespace,
     examples: list[Example],
@@ -988,6 +1813,627 @@ def generate_query_descriptions_vllm(
 
     if loaded_here:
         release_model_handles(llm, tokenizer)
+
+    return [records[example.example_idx] for example in examples if example.example_idx in records]
+
+
+def load_existing_method_records(path: Path, query_mode: str) -> dict[int, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    records: dict[int, dict[str, Any]] = {}
+    for row in load_jsonl(path):
+        try:
+            if candidate_query_mode(row) != query_mode:
+                continue
+            if "rounds" not in row or "candidates" not in row:
+                continue
+            records[int(row["example_idx"])] = row
+        except (KeyError, TypeError, ValueError):
+            continue
+    return records
+
+
+def make_round_record(
+    retriever: TaxonomyRetriever,
+    example: Example,
+    round_idx: int,
+    grounding: str,
+    top_k: int,
+    llm_calls: list[dict[str, Any]] | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    query = retrieval_query_from_grounding(example, grounding)
+    record: dict[str, Any] = {
+        "round": round_idx,
+        "grounding": normalize_space(grounding),
+        "query": query,
+        "candidates": retrieve_candidates(retriever, query, example.entity_type, top_k),
+    }
+    if llm_calls:
+        record["llm_calls"] = llm_calls
+    if extra_fields:
+        record.update(extra_fields)
+    return record
+
+
+def sum_llm_usage(rounds: list[dict[str, Any]]) -> tuple[int, int, int]:
+    calls = [
+        call
+        for round_record in rounds
+        for call in round_record.get("llm_calls", [])
+    ]
+    prompt_tokens = sum(int(call.get("prompt_tokens", 0) or 0) for call in calls)
+    completion_tokens = sum(int(call.get("completion_tokens", 0) or 0) for call in calls)
+    return len(calls), prompt_tokens, completion_tokens
+
+
+def parse_success_rate_from_records(records: list[dict[str, Any]]) -> float | None:
+    calls = [
+        call
+        for record in records
+        for round_record in record.get("rounds", [])
+        for call in round_record.get("llm_calls", [])
+        if "parse_ok" in call
+    ]
+    if not calls:
+        return None
+    return round(sum(bool(call.get("parse_ok")) for call in calls) / len(calls), 6)
+
+
+def generate_initial_grounding(
+    generator: QueryGenerator,
+    args: argparse.Namespace,
+    example: Example,
+) -> tuple[str, dict[str, Any]]:
+    fallback = build_direct_query(example)
+    prompt, prompt_tokens, used_context_chars = build_query_description_prompt(
+        generator.tokenizer,
+        example,
+        context_max_chars=args.query_context_max_chars,
+        max_input_tokens=args.query_max_input_tokens,
+    )
+    raw_output = generator.generate_one(prompt)
+    query, parse_ok = extract_query_from_output(raw_output, fallback)
+    call = llm_call_record(
+        "initial_grounding",
+        raw_output=raw_output,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=generator.count_text_tokens(raw_output),
+        parse_ok=parse_ok,
+        backend=generator.backend,
+        model_name=generator.model_name,
+        extra_fields={"used_context_max_chars": used_context_chars},
+    )
+    return query, call
+
+
+def generate_query_from_messages(
+    generator: QueryGenerator,
+    kind: str,
+    prompt: str,
+    prompt_tokens: int,
+    fallback: str,
+    extra_fields: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    raw_output = generator.generate_one(prompt)
+    query, parse_ok = extract_query_from_output(raw_output, fallback)
+    call = llm_call_record(
+        kind,
+        raw_output=raw_output,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=generator.count_text_tokens(raw_output),
+        parse_ok=parse_ok,
+        backend=generator.backend,
+        model_name=generator.model_name,
+        extra_fields=extra_fields,
+    )
+    return query, call
+
+
+def build_freeform_method_record(
+    args: argparse.Namespace,
+    query_mode: str,
+    generator: QueryGenerator,
+    retriever: TaxonomyRetriever,
+    example: Example,
+) -> dict[str, Any]:
+    start_time = time.monotonic()
+    rounds: list[dict[str, Any]] = []
+    total_rounds = args.retrieval_rounds
+    fallback = build_direct_query(example)
+
+    if query_mode == "intrinsic_self_refinement":
+        grounding, call = generate_initial_grounding(generator, args, example)
+        rounds.append(make_round_record(retriever, example, 1, grounding, args.top_k, [call]))
+        for round_idx in range(2, total_rounds + 1):
+            prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+                generator.tokenizer,
+                lambda ctx_chars, previous=grounding: build_intrinsic_refinement_messages(
+                    example,
+                    previous,
+                    ctx_chars,
+                ),
+                context_max_chars=args.query_context_max_chars,
+                max_input_tokens=args.query_max_input_tokens,
+            )
+            grounding, call = generate_query_from_messages(
+                generator,
+                "intrinsic_refinement",
+                prompt,
+                prompt_tokens,
+                fallback=grounding or fallback,
+                extra_fields={"used_context_max_chars": used_context_chars},
+            )
+            rounds.append(make_round_record(retriever, example, round_idx, grounding, args.top_k, [call]))
+
+    elif query_mode == "retrieval_feedback_refinement":
+        grounding, call = generate_initial_grounding(generator, args, example)
+        rounds.append(make_round_record(retriever, example, 1, grounding, args.top_k, [call]))
+        for round_idx in range(2, total_rounds + 1):
+            previous_candidates = rounds[-1]["candidates"]
+            prompt, prompt_tokens, used_context_chars, used_doc_chars = build_feedback_prompt_under_query_budget(
+                generator.tokenizer,
+                lambda ctx_chars, doc_chars, previous=grounding, candidates=previous_candidates: build_retrieval_feedback_messages(
+                    example,
+                    previous,
+                    candidates,
+                    ctx_chars,
+                    doc_chars,
+                    args.feedback_candidate_count,
+                ),
+                context_max_chars=args.query_context_max_chars,
+                doc_max_chars=args.candidate_doc_max_chars,
+                max_input_tokens=args.query_max_input_tokens,
+            )
+            grounding, call = generate_query_from_messages(
+                generator,
+                "retrieval_feedback_refinement",
+                prompt,
+                prompt_tokens,
+                fallback=grounding or fallback,
+                extra_fields={
+                    "used_context_max_chars": used_context_chars,
+                    "used_candidate_doc_max_chars": used_doc_chars,
+                },
+            )
+            rounds.append(make_round_record(retriever, example, round_idx, grounding, args.top_k, [call]))
+
+    elif query_mode == "parallel_sampling":
+        for round_idx in range(1, total_rounds + 1):
+            prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+                generator.tokenizer,
+                lambda ctx_chars, sample_idx=round_idx: build_parallel_sampling_messages(
+                    example,
+                    sample_idx,
+                    total_rounds,
+                    ctx_chars,
+                ),
+                context_max_chars=args.query_context_max_chars,
+                max_input_tokens=args.query_max_input_tokens,
+            )
+            grounding, call = generate_query_from_messages(
+                generator,
+                "parallel_sampling",
+                prompt,
+                prompt_tokens,
+                fallback=fallback,
+                extra_fields={"used_context_max_chars": used_context_chars, "sample_idx": round_idx},
+            )
+            rounds.append(make_round_record(retriever, example, round_idx, grounding, args.top_k, [call]))
+
+    elif query_mode == "decomposed_retrieval":
+        prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+            generator.tokenizer,
+            lambda ctx_chars: build_decomposed_retrieval_messages(example, total_rounds, ctx_chars),
+            context_max_chars=args.query_context_max_chars,
+            max_input_tokens=args.query_max_input_tokens,
+        )
+        raw_output = generator.generate_one(prompt)
+        query_items, parse_ok = parse_decomposed_queries(raw_output, fallback, total_rounds)
+        call = llm_call_record(
+            "decomposed_retrieval",
+            raw_output=raw_output,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=generator.count_text_tokens(raw_output),
+            parse_ok=parse_ok,
+            backend=generator.backend,
+            model_name=generator.model_name,
+            extra_fields={"used_context_max_chars": used_context_chars},
+        )
+        for round_idx, query_item in enumerate(query_items, start=1):
+            llm_calls = [call] if round_idx == 1 else []
+            rounds.append(
+                make_round_record(
+                    retriever,
+                    example,
+                    round_idx,
+                    query_item["query"],
+                    args.top_k,
+                    llm_calls,
+                    extra_fields={"focus": query_item.get("focus", f"query_{round_idx}")},
+                )
+            )
+
+    else:
+        raise ValueError(f"Unsupported free-form comparison method: {query_mode}")
+
+    total_llm_calls, total_prompt_tokens, total_completion_tokens = sum_llm_usage(rounds)
+    return finalize_candidate_record(
+        example,
+        query_mode=query_mode,
+        rounds=rounds,
+        top_k=args.top_k,
+        rrf_kappa=args.rrf_kappa,
+        total_llm_calls=total_llm_calls,
+        total_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        wall_time=time.monotonic() - start_time,
+        extra_fields={"rrf_kappa": args.rrf_kappa},
+    )
+
+
+def candidate_reward(candidates: list[dict[str, Any]], gold_tags: list[str]) -> float:
+    rank = first_gold_rank([candidate["tag"] for candidate in candidates], gold_tags)
+    return 0.0 if rank is None else 1.0 / rank
+
+
+def neighborhood_novelty(
+    candidates: list[dict[str, Any]],
+    previous_rounds: list[dict[str, Any]],
+) -> float:
+    current = {candidate["tag"] for candidate in candidates}
+    if not current or not previous_rounds:
+        return 1.0
+    max_overlap = 0.0
+    for round_record in previous_rounds:
+        previous = {candidate["tag"] for candidate in round_record.get("candidates", [])}
+        union = current | previous
+        if union:
+            max_overlap = max(max_overlap, len(current & previous) / len(union))
+    return round(1.0 - max_overlap, 6)
+
+
+def evidence_profile(example: Example) -> dict[str, Any]:
+    return {
+        "input_type": example.input_type,
+        "datatype": example.entity_type,
+        "has_row_context": bool(example.row_context),
+        "has_column_context": bool(example.column_context),
+        "row_context": truncate_text(example.row_context, 240),
+        "column_context": truncate_text(example.column_context, 240),
+    }
+
+
+def transition_memory_text(transition: dict[str, Any]) -> str:
+    return normalize_space(
+        " ".join(
+            [
+                scalar_text(transition.get("evidence_profile")),
+                scalar_text(transition.get("feedback")),
+                scalar_text(transition.get("directive")),
+                scalar_text(transition.get("hypothesis_before")),
+            ]
+        )
+    )
+
+
+def retrieve_operator_memories(
+    memory_store: list[dict[str, Any]],
+    example: Example,
+    hypothesis: dict[str, Any],
+    feedback: dict[str, Any],
+    top_k: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    current_text = normalize_space(
+        " ".join(
+            [
+                serialize_evidence(example, 1200),
+                scalar_text(hypothesis),
+                scalar_text(feedback),
+            ]
+        )
+    )
+    current_tokens = set(tokenize(current_text))
+    current_operators = set(hypothesis.get("operators", []))
+
+    def compatible(memory: dict[str, Any]) -> bool:
+        if memory.get("input_type") != example.input_type:
+            return False
+        if memory.get("type") and memory.get("type") != example.entity_type:
+            return False
+        operator = memory.get("operator")
+        return not current_operators or not operator or operator in current_operators
+
+    def similarity(memory: dict[str, Any]) -> float:
+        memory_tokens = set(tokenize(memory.get("search_text", "")))
+        if not current_tokens or not memory_tokens:
+            return 0.0
+        return len(current_tokens & memory_tokens) / len(current_tokens | memory_tokens)
+
+    compatible_memories = [memory for memory in memory_store if compatible(memory)]
+    if not compatible_memories:
+        compatible_memories = [memory for memory in memory_store if memory.get("input_type") == example.input_type]
+    if not compatible_memories:
+        compatible_memories = list(memory_store)
+
+    positives = [memory for memory in compatible_memories if float(memory.get("delta_reward", 0.0)) > 0.0]
+    negatives = [memory for memory in compatible_memories if float(memory.get("delta_reward", 0.0)) <= 0.0]
+    positives.sort(key=similarity, reverse=True)
+    negatives.sort(key=similarity, reverse=True)
+    return positives[:top_k], negatives[:top_k]
+
+
+def build_operator_transition(
+    example: Example,
+    from_round: dict[str, Any],
+    to_round: dict[str, Any],
+    feedback: dict[str, Any],
+    directive: dict[str, Any],
+) -> dict[str, Any]:
+    reward_before = candidate_reward(from_round.get("candidates", []), example.gold_tags)
+    reward_after = candidate_reward(to_round.get("candidates", []), example.gold_tags)
+    transition = {
+        "from_round": from_round.get("round"),
+        "to_round": to_round.get("round"),
+        "evidence_profile": evidence_profile(example),
+        "input_type": example.input_type,
+        "type": example.entity_type,
+        "hypothesis_before": from_round.get("hypothesis"),
+        "feedback": feedback,
+        "directive": directive,
+        "operator": directive.get("operator"),
+        "target_dimension": directive.get("target_dimension"),
+        "revised_hypothesis": to_round.get("hypothesis"),
+        "semantic_difference": to_round.get("semantic_difference"),
+        "reward_before": round(reward_before, 8),
+        "reward_after": round(reward_after, 8),
+        "delta_reward": round(reward_after - reward_before, 8),
+    }
+    transition["search_text"] = transition_memory_text(transition)
+    return transition
+
+
+def append_memories_from_record(record: dict[str, Any], memory_store: list[dict[str, Any]]) -> None:
+    for transition in record.get("operator_transitions", []):
+        memory_store.append(dict(transition))
+
+
+def build_structured_method_record(
+    args: argparse.Namespace,
+    query_mode: str,
+    generator: QueryGenerator,
+    retriever: TaxonomyRetriever,
+    example: Example,
+    memory_store: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    start_time = time.monotonic()
+    rounds: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    fallback = build_direct_query(example)
+
+    prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+        generator.tokenizer,
+        lambda ctx_chars: build_operator_initial_messages(example, ctx_chars),
+        context_max_chars=args.query_context_max_chars,
+        max_input_tokens=args.query_max_input_tokens,
+    )
+    raw_output = generator.generate_one(prompt)
+    hypothesis, parse_ok = parse_hypothesis(raw_output, fallback)
+    call = llm_call_record(
+        "operator_initial_hypothesis",
+        raw_output=raw_output,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=generator.count_text_tokens(raw_output),
+        parse_ok=parse_ok,
+        backend=generator.backend,
+        model_name=generator.model_name,
+        extra_fields={"used_context_max_chars": used_context_chars},
+    )
+    rounds.append(
+        make_round_record(
+            retriever,
+            example,
+            1,
+            hypothesis["retrieval_query"],
+            args.top_k,
+            [call],
+            extra_fields={"hypothesis": hypothesis},
+        )
+    )
+
+    for round_idx in range(2, args.retrieval_rounds + 1):
+        current_round = rounds[-1]
+        current_hypothesis = current_round.get("hypothesis", hypothesis)
+        feedback_prompt, feedback_prompt_tokens, feedback_context_chars, feedback_doc_chars = build_feedback_prompt_under_query_budget(
+            generator.tokenizer,
+            lambda ctx_chars, doc_chars, current=current_hypothesis, candidates=current_round["candidates"]: build_operator_feedback_messages(
+                example,
+                current,
+                candidates,
+                ctx_chars,
+                doc_chars,
+                args.feedback_candidate_count,
+            ),
+            context_max_chars=args.query_context_max_chars,
+            doc_max_chars=args.candidate_doc_max_chars,
+            max_input_tokens=args.query_max_input_tokens,
+        )
+        feedback_raw = generator.generate_one(feedback_prompt)
+        feedback, feedback_parse_ok = parse_feedback(feedback_raw)
+        feedback_call = llm_call_record(
+            "operator_feedback",
+            raw_output=feedback_raw,
+            prompt_tokens=feedback_prompt_tokens,
+            completion_tokens=generator.count_text_tokens(feedback_raw),
+            parse_ok=feedback_parse_ok,
+            backend=generator.backend,
+            model_name=generator.model_name,
+            extra_fields={
+                "used_context_max_chars": feedback_context_chars,
+                "used_candidate_doc_max_chars": feedback_doc_chars,
+            },
+        )
+
+        positive_memories = negative_memories = None
+        if query_mode == "memory_guided_refinement":
+            positive_memories, negative_memories = retrieve_operator_memories(
+                memory_store or [],
+                example,
+                current_hypothesis,
+                feedback,
+                args.memory_top_k,
+            )
+
+        controller_prompt, controller_prompt_tokens, controller_context_chars = build_prompt_under_query_budget(
+            generator.tokenizer,
+            lambda ctx_chars: build_operator_controller_messages(
+                example,
+                current_hypothesis,
+                feedback,
+                transitions,
+                positive_memories,
+                negative_memories,
+                ctx_chars,
+            ),
+            context_max_chars=args.query_context_max_chars,
+            max_input_tokens=args.query_max_input_tokens,
+        )
+        controller_raw = generator.generate_one(controller_prompt)
+        directive, directive_parse_ok = parse_directive(controller_raw)
+        controller_call = llm_call_record(
+            "operator_controller",
+            raw_output=controller_raw,
+            prompt_tokens=controller_prompt_tokens,
+            completion_tokens=generator.count_text_tokens(controller_raw),
+            parse_ok=directive_parse_ok,
+            backend=generator.backend,
+            model_name=generator.model_name,
+            extra_fields={
+                "used_context_max_chars": controller_context_chars,
+                "positive_memory_count": len(positive_memories or []),
+                "negative_memory_count": len(negative_memories or []),
+            },
+        )
+
+        revision_prompt, revision_prompt_tokens, revision_context_chars = build_prompt_under_query_budget(
+            generator.tokenizer,
+            lambda ctx_chars: build_operator_revision_messages(example, current_hypothesis, directive, ctx_chars),
+            context_max_chars=args.query_context_max_chars,
+            max_input_tokens=args.query_max_input_tokens,
+        )
+        revision_raw = generator.generate_one(revision_prompt)
+        revised_hypothesis, revision_parse_ok = parse_hypothesis(revision_raw, current_hypothesis.get("retrieval_query", fallback))
+        revision_parsed, _ = parse_json_object(revision_raw)
+        semantic_difference = scalar_text(revision_parsed.get("semantic_difference"))
+        revision_call = llm_call_record(
+            "operator_revision",
+            raw_output=revision_raw,
+            prompt_tokens=revision_prompt_tokens,
+            completion_tokens=generator.count_text_tokens(revision_raw),
+            parse_ok=revision_parse_ok,
+            backend=generator.backend,
+            model_name=generator.model_name,
+            extra_fields={"used_context_max_chars": revision_context_chars},
+        )
+
+        new_round = make_round_record(
+            retriever,
+            example,
+            round_idx,
+            revised_hypothesis["retrieval_query"],
+            args.top_k,
+            [feedback_call, controller_call, revision_call],
+            extra_fields={
+                "hypothesis": revised_hypothesis,
+                "feedback_from_previous": feedback,
+                "directive_from_previous": directive,
+                "semantic_difference": semantic_difference,
+            },
+        )
+        new_round["neighborhood_novelty"] = neighborhood_novelty(new_round["candidates"], rounds)
+        transition = build_operator_transition(example, current_round, new_round, feedback, directive)
+        transitions.append(transition)
+        rounds.append(new_round)
+
+    total_llm_calls, total_prompt_tokens, total_completion_tokens = sum_llm_usage(rounds)
+    return finalize_candidate_record(
+        example,
+        query_mode=query_mode,
+        rounds=rounds,
+        top_k=args.top_k,
+        rrf_kappa=args.rrf_kappa,
+        total_llm_calls=total_llm_calls,
+        total_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        wall_time=time.monotonic() - start_time,
+        extra_fields={
+            "rrf_kappa": args.rrf_kappa,
+            "operator_transitions": transitions,
+        },
+    )
+
+
+def build_comparison_candidate_records(
+    args: argparse.Namespace,
+    examples: list[Example],
+    taxonomy: list[Concept],
+    trace_path: Path,
+    tokenizer: Any | None = None,
+    llm: Any | None = None,
+) -> list[dict[str, Any]]:
+    query_mode = canonical_query_mode(args.query_mode)
+    retriever = TaxonomyRetriever(taxonomy, type_filter=args.type_filter)
+    existing = load_existing_method_records(trace_path, query_mode) if args.resume else {}
+    records: dict[int, dict[str, Any]] = {}
+    missing_examples = [example for example in examples if example.example_idx not in existing]
+
+    generator: QueryGenerator | None = None
+    handle = None
+    memory_store: list[dict[str, Any]] = []
+    try:
+        if missing_examples:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if args.resume and trace_path.exists() else "w"
+            handle = trace_path.open(mode, encoding="utf-8")
+            generator = QueryGenerator(args, tokenizer=tokenizer, llm=llm)
+
+        for offset, example in enumerate(examples, start=1):
+            if example.example_idx in existing:
+                record = existing[example.example_idx]
+                records[example.example_idx] = record
+                if query_mode == "memory_guided_refinement":
+                    append_memories_from_record(record, memory_store)
+                continue
+
+            if generator is None or handle is None:
+                raise RuntimeError("Query generator was not initialized for missing comparison records.")
+
+            if query_mode in {"intrinsic_self_refinement", "retrieval_feedback_refinement", "parallel_sampling", "decomposed_retrieval"}:
+                record = build_freeform_method_record(args, query_mode, generator, retriever, example)
+            elif query_mode in STRUCTURED_QUERY_MODES:
+                record = build_structured_method_record(
+                    args,
+                    query_mode,
+                    generator,
+                    retriever,
+                    example,
+                    memory_store=memory_store,
+                )
+            else:
+                raise ValueError(f"Unsupported comparison query_mode={query_mode}")
+
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            records[example.example_idx] = record
+            if query_mode == "memory_guided_refinement":
+                append_memories_from_record(record, memory_store)
+            if offset % args.log_every == 0 or offset == len(examples):
+                print(f"Built {query_mode} candidates for {offset}/{len(examples)} examples")
+    finally:
+        if handle is not None:
+            handle.close()
+        if generator is not None:
+            generator.close()
 
     return [records[example.example_idx] for example in examples if example.example_idx in records]
 
@@ -1307,14 +2753,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taxonomy-jsonl", type=Path, default=DEFAULT_TAXONOMY_JSONL)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--top-k", type=int, default=200)
+    parser.add_argument(
+        "--retrieval-rounds",
+        type=int,
+        default=4,
+        help="Maximum retrieval calls for multi-round comparison methods.",
+    )
+    parser.add_argument(
+        "--feedback-candidate-count",
+        type=int,
+        default=10,
+        help="Number of retrieved candidates shown in feedback prompts.",
+    )
+    parser.add_argument(
+        "--rrf-kappa",
+        type=float,
+        default=60.0,
+        help="RRF smoothing constant for multi-round candidate fusion.",
+    )
+    parser.add_argument(
+        "--memory-top-k",
+        type=int,
+        default=3,
+        help="Positive and negative operator memories shown for memory-guided refinement.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test row limit.")
     parser.add_argument(
         "--query-mode",
         choices=sorted(QUERY_MODE_ALIASES),
         default="direct_retrieval",
         help=(
-            "Retrieval method. Public names are direct_retrieval and "
-            "one_pass_grounding; direct and llm_description are accepted aliases."
+            "Retrieval method. Public names include direct_retrieval, one_pass_grounding, "
+            "intrinsic_self_refinement, retrieval_feedback_refinement, parallel_sampling, "
+            "decomposed_retrieval, operator_refinement, and memory_guided_refinement."
         ),
     )
     parser.add_argument(
@@ -1370,6 +2841,7 @@ def main() -> None:
 
     candidates_path = args.output_dir / "bm25_candidates.jsonl"
     query_description_path = args.query_description_path or (args.output_dir / "query_descriptions.jsonl")
+    grounding_trace_path = args.output_dir / "grounding_traces.jsonl"
     taxonomy = load_taxonomy(args.taxonomy_jsonl)
     query_description_records: list[dict[str, Any]] | None = None
     shared_tokenizer = None
@@ -1413,14 +2885,41 @@ def main() -> None:
                 for record in query_description_records
             }
 
-        candidate_records = build_candidate_records(
-            examples,
-            taxonomy,
-            top_k=args.top_k,
-            type_filter=args.type_filter,
-            query_mode=args.query_mode,
-            query_descriptions=query_descriptions,
-        )
+        if args.query_mode in MULTI_ROUND_QUERY_MODES:
+            can_share_vllm = (
+                args.run_rerank
+                and args.query_generation_backend == "vllm"
+                and args.rerank_backend == "vllm"
+                and args.query_generation_model == args.rerank_model
+            )
+            existing_method_records = (
+                load_existing_method_records(grounding_trace_path, args.query_mode)
+                if args.resume and grounding_trace_path.exists()
+                else {}
+            )
+            missing_method_count = sum(
+                1 for example in examples if example.example_idx not in existing_method_records
+            )
+            if can_share_vllm and missing_method_count and shared_llm is None:
+                shared_tokenizer, shared_llm = load_vllm_engine(args, args.query_generation_model)
+            candidate_records = build_comparison_candidate_records(
+                args,
+                examples,
+                taxonomy,
+                grounding_trace_path,
+                tokenizer=shared_tokenizer,
+                llm=shared_llm,
+            )
+        else:
+            candidate_records = build_candidate_records(
+                examples,
+                taxonomy,
+                top_k=args.top_k,
+                type_filter=args.type_filter,
+                query_mode=args.query_mode,
+                rrf_kappa=args.rrf_kappa,
+                query_descriptions=query_descriptions,
+            )
         write_jsonl(candidates_path, candidate_records)
 
     rerank_predictions = None
@@ -1459,9 +2958,15 @@ def main() -> None:
             "taxonomy_jsonl": str(args.taxonomy_jsonl),
             "candidate_path": str(candidates_path),
             "query_mode": args.query_mode,
+            "retrieval_rounds": args.retrieval_rounds if args.query_mode in MULTI_ROUND_QUERY_MODES else 1,
+            "feedback_candidate_count": args.feedback_candidate_count
+            if args.query_mode in {"retrieval_feedback_refinement", "operator_refinement", "memory_guided_refinement"}
+            else None,
+            "rrf_kappa": args.rrf_kappa,
+            "grounding_trace_path": str(grounding_trace_path) if args.query_mode in MULTI_ROUND_QUERY_MODES else None,
             "query_description_path": str(query_description_path) if args.query_mode == "one_pass_grounding" else None,
-            "query_generation_model": args.query_generation_model if args.query_mode == "one_pass_grounding" else None,
-            "query_generation_backend": args.query_generation_backend if args.query_mode == "one_pass_grounding" else None,
+            "query_generation_model": args.query_generation_model if args.query_mode in LLM_QUERY_MODES else None,
+            "query_generation_backend": args.query_generation_backend if args.query_mode in LLM_QUERY_MODES else None,
             "query_generation_parse_success_rate": (
                 round(
                     sum(bool(record.get("parse_ok")) for record in query_description_records)
@@ -1469,7 +2974,7 @@ def main() -> None:
                     6,
                 )
                 if query_description_records
-                else None
+                else parse_success_rate_from_records(candidate_records)
             ),
             "rerank_prediction_path": str(rerank_path) if args.run_rerank else None,
             "type_filter": args.type_filter,

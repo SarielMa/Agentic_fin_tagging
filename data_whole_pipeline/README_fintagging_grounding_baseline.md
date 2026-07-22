@@ -17,6 +17,24 @@ One-pass grounding:
 2. BM25 retrieves top-200 candidates using `entity + type + generated_query`.
 3. The same Qwen reranker and evaluator are used as direct retrieval.
 
+Additional comparison methods:
+
+- `intrinsic_self_refinement`: B rounds of self-critique and query revision without
+  exposing retrieved candidates to the model.
+- `retrieval_feedback_refinement`: B rounds of free-form query revision after
+  showing the top metadata-compatible retrieved candidates.
+- `parallel_sampling`: B independent retrieval hypotheses with no feedback between
+  hypotheses.
+- `decomposed_retrieval`: one LLM call produces B dimension-focused sub-queries.
+- `operator_refinement`: structured hypothesis, feedback, controller, and revision
+  loop without cross-instance memory.
+- `memory_guided_refinement`: operator refinement plus positive/negative memories
+  from earlier instances in the same stream.
+
+For all comparison methods, the final candidate list is still reranked and
+evaluated by the same shared Qwen reranker and metric code. Multi-round methods
+merge per-round BM25 results with reciprocal-rank fusion before reranking.
+
 Metrics are reported overall and separately under `by_input_type.table` and
 `by_input_type.text`.
 
@@ -32,12 +50,24 @@ Run one-pass grounding:
 sbatch data_whole_pipeline/apply_server_fintagging_one_pass_grounding.sh
 ```
 
+Run the additional comparison methods:
+
+```bash
+sbatch data_whole_pipeline/apply_server_fintagging_intrinsic_self_refinement.sh
+sbatch data_whole_pipeline/apply_server_fintagging_retrieval_feedback_refinement.sh
+sbatch data_whole_pipeline/apply_server_fintagging_parallel_sampling.sh
+sbatch data_whole_pipeline/apply_server_fintagging_decomposed_retrieval.sh
+sbatch data_whole_pipeline/apply_server_fintagging_operator_refinement.sh
+sbatch data_whole_pipeline/apply_server_fintagging_memory_guided_refinement.sh
+```
+
 Useful variants:
 
 ```bash
 sbatch --export=ALL,MODE=retrieval data_whole_pipeline/apply_server_fintagging_direct_retrieval.sh
 sbatch --export=ALL,LIMIT=20 data_whole_pipeline/apply_server_fintagging_direct_retrieval.sh
 sbatch --export=ALL,QUERY_MODE=one_pass_grounding data_whole_pipeline/apply_server_fintagging_direct_retrieval.sh
+sbatch --export=ALL,QUERY_MODE=parallel_sampling,RETRIEVAL_ROUNDS=4 data_whole_pipeline/apply_server_fintagging_direct_retrieval.sh
 sbatch --export=ALL,RERANK_BACKEND=transformers data_whole_pipeline/apply_server_fintagging_direct_retrieval.sh
 ```
 
@@ -54,6 +84,11 @@ For `QUERY_MODE=one_pass_grounding`, Qwen first writes
 as the retrieval query. The output directory defaults to
 `runs_fintagging_grounding_baseline/qwen3_32b_one_pass_grounding`, separate from
 direct retrieval.
+
+For Methods 3-8, Qwen writes `grounding_traces.jsonl`. Each row includes the
+per-round generated grounding, actual BM25 query, retrieved candidates, LLM call
+metadata, and the final RRF-fused candidate set. `bm25_candidates.jsonl` contains
+the same final candidate rows used by the shared reranker.
 
 Outputs:
 

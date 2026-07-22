@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Grounding experiments:
-#   BM25 over enriched US-GAAP definitions, optionally followed by Qwen reranking.
+#   Method-specific query generation -> BM25 candidates -> shared Qwen reranking/eval.
 
 REPO_ROOT="$(readlink -f "$(dirname "$0")")"
 PROJECT_ROOT="$(readlink -f "${REPO_ROOT}/..")"
@@ -16,14 +16,43 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HUB_CACHE}}"
 QUERY_MODE="${QUERY_MODE:-direct_retrieval}"
-if [[ "${QUERY_MODE}" == "one_pass_grounding" || "${QUERY_MODE}" == "llm_description" ]]; then
-  DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs_fintagging_grounding_baseline/qwen3_32b_one_pass_grounding"
-else
-  DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs_fintagging_grounding_baseline/qwen3_32b_direct_retrieval"
-fi
+case "${QUERY_MODE}" in
+  direct|direct_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_direct_retrieval"
+    ;;
+  llm_description|one_pass_grounding)
+    DEFAULT_METHOD_DIR="qwen3_32b_one_pass_grounding"
+    ;;
+  intrinsic|self_refinement|intrinsic_self_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_intrinsic_self_refinement"
+    ;;
+  feedback|retrieval_feedback|retrieval_feedback_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_retrieval_feedback_refinement"
+    ;;
+  parallel|parallel_sampling)
+    DEFAULT_METHOD_DIR="qwen3_32b_parallel_sampling"
+    ;;
+  decomposed|decomposed_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_decomposed_retrieval"
+    ;;
+  operator|operator_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_operator_refinement"
+    ;;
+  memory|memory_guided_refinement)
+    DEFAULT_METHOD_DIR="qwen3_32b_memory_guided_refinement"
+    ;;
+  *)
+    DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
+    ;;
+esac
+DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs_fintagging_grounding_baseline/${DEFAULT_METHOD_DIR}"
 OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 
 TOP_K="${TOP_K:-200}"
+RETRIEVAL_ROUNDS="${RETRIEVAL_ROUNDS:-4}"
+FEEDBACK_CANDIDATE_COUNT="${FEEDBACK_CANDIDATE_COUNT:-10}"
+RRF_KAPPA="${RRF_KAPPA:-60.0}"
+MEMORY_TOP_K="${MEMORY_TOP_K:-3}"
 REUSE_CANDIDATES="${REUSE_CANDIDATES:-1}"
 TYPE_FILTER="${TYPE_FILTER:-1}"
 RUN_RERANK="${RUN_RERANK:-1}"
@@ -75,6 +104,10 @@ ARGS=(
   --taxonomy-jsonl "${TAXONOMY_JSONL}"
   --output-dir "${OUTPUT_DIR}"
   --top-k "${TOP_K}"
+  --retrieval-rounds "${RETRIEVAL_ROUNDS}"
+  --feedback-candidate-count "${FEEDBACK_CANDIDATE_COUNT}"
+  --rrf-kappa "${RRF_KAPPA}"
+  --memory-top-k "${MEMORY_TOP_K}"
   --query-mode "${QUERY_MODE}"
   --rerank-model "${RERANK_MODEL}"
   --rerank-backend "${RERANK_BACKEND}"
@@ -149,6 +182,10 @@ echo "OUTPUT_DIR           : ${OUTPUT_DIR}"
 echo "HF_HOME              : ${HF_HOME}"
 echo "HF_HUB_CACHE         : ${HF_HUB_CACHE}"
 echo "TOP_K                : ${TOP_K}"
+echo "RETRIEVAL_ROUNDS     : ${RETRIEVAL_ROUNDS}"
+echo "FEEDBACK_CANDIDATE_COUNT: ${FEEDBACK_CANDIDATE_COUNT}"
+echo "RRF_KAPPA            : ${RRF_KAPPA}"
+echo "MEMORY_TOP_K         : ${MEMORY_TOP_K}"
 echo "QUERY_MODE           : ${QUERY_MODE}"
 echo "REUSE_CANDIDATES     : ${REUSE_CANDIDATES}"
 echo "TYPE_FILTER          : ${TYPE_FILTER}"
