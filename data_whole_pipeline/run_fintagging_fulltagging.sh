@@ -155,27 +155,49 @@ if [[ "${RUN_EXTRACTION}" == "1" ]]; then
   if [[ "${EXTRACTION_ENFORCE_EAGER}" == "1" ]]; then
     EXTRACTION_EAGER_ARGS=(--enforce-eager)
   fi
-  python "${REPO_ROOT}/generate_fintagging_fulltagging_extractions.py" \
-    --original-test-parquet "${ORIGINAL_TEST_PARQUET}" \
-    --text-extractor-model "${TEXT_EXTRACTOR_MODEL}" \
-    --table-extractor-model "${TABLE_EXTRACTOR_MODEL}" \
-    --output-jsonl "${EXTRACTION_PREDICTIONS}" \
-    --metadata-json "${EXTRACTION_METADATA_JSON}" \
-    --text-max-new-tokens "${TEXT_MAX_NEW_TOKENS}" \
-    --table-max-new-tokens "${TABLE_MAX_NEW_TOKENS}" \
-    --temperature "${EXTRACTION_TEMPERATURE}" \
-    --top-p "${EXTRACTION_TOP_P}" \
-    --backend "${EXTRACTION_BACKEND}" \
-    --batch-size "${EXTRACTION_VLLM_BATCH_SIZE}" \
-    --tensor-parallel-size "${EXTRACTION_TENSOR_PARALLEL_SIZE}" \
-    --gpu-memory-utilization "${EXTRACTION_GPU_MEMORY_UTILIZATION}" \
-    --max-model-len "${EXTRACTION_MAX_MODEL_LEN}" \
-    --max-num-seqs "${EXTRACTION_MAX_NUM_SEQS}" \
-    "${EXTRACTION_BF16_ARGS[@]}" \
-    "${EXTRACTION_REMOTE_CODE_ARGS[@]}" \
-    "${EXTRACTION_EAGER_ARGS[@]}" \
-    "${EXTRACTION_RESUME_ARGS[@]}" \
+  EXTRACTION_COMMON_ARGS=(
+    --original-test-parquet "${ORIGINAL_TEST_PARQUET}"
+    --text-extractor-model "${TEXT_EXTRACTOR_MODEL}"
+    --table-extractor-model "${TABLE_EXTRACTOR_MODEL}"
+    --output-jsonl "${EXTRACTION_PREDICTIONS}"
+    --text-max-new-tokens "${TEXT_MAX_NEW_TOKENS}"
+    --table-max-new-tokens "${TABLE_MAX_NEW_TOKENS}"
+    --temperature "${EXTRACTION_TEMPERATURE}"
+    --top-p "${EXTRACTION_TOP_P}"
+    --backend "${EXTRACTION_BACKEND}"
+    --batch-size "${EXTRACTION_VLLM_BATCH_SIZE}"
+    --tensor-parallel-size "${EXTRACTION_TENSOR_PARALLEL_SIZE}"
+    --gpu-memory-utilization "${EXTRACTION_GPU_MEMORY_UTILIZATION}"
+    --max-model-len "${EXTRACTION_MAX_MODEL_LEN}"
+    --max-num-seqs "${EXTRACTION_MAX_NUM_SEQS}"
+    "${EXTRACTION_BF16_ARGS[@]}"
+    "${EXTRACTION_REMOTE_CODE_ARGS[@]}"
+    "${EXTRACTION_EAGER_ARGS[@]}"
+    "${EXTRACTION_RESUME_ARGS[@]}"
     "${LIMIT_ARGS[@]}"
+  )
+
+  if [[ "${EXTRACTION_BACKEND}" == "vllm" ]]; then
+    python "${REPO_ROOT}/generate_fintagging_fulltagging_extractions.py" \
+      "${EXTRACTION_COMMON_ARGS[@]}" \
+      --metadata-json "${EXTRACTION_METADATA_JSON%.json}_text.json" \
+      --task text
+
+    EXTRACTION_APPEND_ARGS=()
+    if [[ -f "${EXTRACTION_PREDICTIONS}" ]]; then
+      EXTRACTION_APPEND_ARGS=(--append)
+    fi
+    python "${REPO_ROOT}/generate_fintagging_fulltagging_extractions.py" \
+      "${EXTRACTION_COMMON_ARGS[@]}" \
+      --metadata-json "${EXTRACTION_METADATA_JSON%.json}_table.json" \
+      --task table \
+      "${EXTRACTION_APPEND_ARGS[@]}"
+  else
+    python "${REPO_ROOT}/generate_fintagging_fulltagging_extractions.py" \
+      "${EXTRACTION_COMMON_ARGS[@]}" \
+      --metadata-json "${EXTRACTION_METADATA_JSON}" \
+      --task all
+  fi
 
   python "${REPO_ROOT}/build_fintagging_fulltagging_grounding_input.py" \
     --original-test-parquet "${ORIGINAL_TEST_PARQUET}" \

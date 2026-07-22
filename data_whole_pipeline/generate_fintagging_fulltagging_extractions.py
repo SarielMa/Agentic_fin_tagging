@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-jsonl", type=Path, required=True)
     parser.add_argument("--metadata-json", type=Path, default=None)
     parser.add_argument("--split", default="test")
+    parser.add_argument("--task", choices=["all", "text", "table"], default="all")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--text-max-new-tokens", type=int, default=2048)
     parser.add_argument("--table-max-new-tokens", type=int, default=4096)
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to output without using existing rows to skip predictions.",
+    )
     return parser.parse_args()
 
 
@@ -240,14 +246,15 @@ def main() -> None:
 
     rows = dataframe_rows(args.original_test_parquet, args.limit)
     existing = load_existing_predictions(args.output_jsonl) if args.resume else {}
-    mode = "a" if args.resume and args.output_jsonl.exists() else "w"
+    mode = "a" if (args.append or (args.resume and args.output_jsonl.exists())) else "w"
+    selected_tasks = ("text", "table") if args.task == "all" else (args.task,)
     pending_by_task = {
         task: [
             row
             for row in rows
             if row["input_type"] == task and int(row["source_sample_idx"]) not in existing
         ]
-        for task in ("text", "table")
+        for task in selected_tasks
     }
 
     stats: dict[str, Any] = {
@@ -255,6 +262,7 @@ def main() -> None:
         "output_jsonl": str(args.output_jsonl),
         "split": args.split,
         "routing_method": "html_table_markup",
+        "selected_tasks": list(selected_tasks),
         "sample_count": len(rows),
         "input_type_counts": {
             task: sum(1 for row in rows if row["input_type"] == task)
@@ -273,10 +281,12 @@ def main() -> None:
     }
 
     with args.output_jsonl.open(mode, encoding="utf-8") as handle:
-        for task, model_path, max_new_tokens in (
-            ("text", args.text_extractor_model, args.text_max_new_tokens),
-            ("table", args.table_extractor_model, args.table_max_new_tokens),
-        ):
+        task_configs = {
+            "text": (args.text_extractor_model, args.text_max_new_tokens),
+            "table": (args.table_extractor_model, args.table_max_new_tokens),
+        }
+        for task in selected_tasks:
+            model_path, max_new_tokens = task_configs[task]
             pending = pending_by_task[task]
             if not pending:
                 continue
