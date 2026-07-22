@@ -1,31 +1,25 @@
 #!/bin/bash
-#SBATCH --job-name=fintag_direct
+#SBATCH --job-name=fintag_full_direct
 #SBATCH --mail-type=ALL
-#SBATCH --time=8:00:00
+#SBATCH --time=08:00:00
 #SBATCH --nodes=1
-#SBATCH --gpus=b200:1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus=b200:2
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline/%j_fintag_direct_retrieval_qwen3_b200.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline/%j_fintag_fulltagging_direct_retrieval_qwen3_b200.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
 
-# Direct retrieval grounding method.
-#
-# What to run:
-#   full      = BM25 retrieval + Qwen rerank + metrics
-#   retrieval = BM25 retrieval only
-#   dryrun    = check environment and paths only
-#
-# Examples:
-#   sbatch apply_server_fintagging_direct_retrieval.sh
-#   sbatch --export=ALL,MODE=retrieval apply_server_fintagging_direct_retrieval.sh
-#   sbatch --export=ALL,LIMIT=20 apply_server_fintagging_direct_retrieval.sh
+# FullTagging direct retrieval:
+#   run extractor predictions from original contexts, then call the same
+#   direct retrieval/rerank grounding pipeline with extracted entity/type inputs.
+
 MODE="${MODE:-full}"
 
 REPO_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline"
-PIPELINE_SH="${REPO_ROOT}/run_fintagging_grounding_baseline.sh"
+PIPELINE_SH="${REPO_ROOT}/run_fintagging_fulltagging.sh"
 
 for var in CONDA_EXE CONDA_PREFIX CONDA_PREFIX_1 CONDA_PREFIX_2 CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL CONDA_PYTHON_EXE CONDA_PKGS_DIRS CONDA_ENVS_PATH _CE_CONDA _CE_M _CONDA_EXE _CONDA_ROOT; do
   unset "${var}" || true
@@ -94,16 +88,27 @@ if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.cache/huggingface/token" ]]; then
   export HF_TOKEN="$(cat "${HOME}/.cache/huggingface/token")"
 fi
 
-export TEST_JSONL="${TEST_JSONL:-${REPO_ROOT}/FinTagging_800_200_grounding_test_JSON/data/test.jsonl}"
-export TAXONOMY_JSONL="${TAXONOMY_JSONL:-/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/retrieval_data/us_gaap_2024_enriched/us_gaap_2024_enriched_retrieval.jsonl}"
 export QUERY_MODE="${QUERY_MODE:-direct_retrieval}"
-export RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs_fintagging_grounding_baseline}"
+export RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs_fintagging_fulltagging}"
+export EXTRACTOR_TAG="${EXTRACTOR_TAG:-qwen2.5_14b_extractors}"
 if [[ "${QUERY_MODE}" == "one_pass_grounding" || "${QUERY_MODE}" == "llm_description" ]]; then
-  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/qwen3_32b_one_pass_grounding"
+  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_one_pass_grounding"
 else
-  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/qwen3_32b_direct_retrieval"
+  DEFAULT_OUTPUT_DIR="${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_direct_retrieval"
 fi
 export OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
+
+export RUN_EXTRACTION="${RUN_EXTRACTION:-1}"
+export TEXT_EXTRACTOR_MODEL="${TEXT_EXTRACTOR_MODEL:-${REPO_ROOT}/runs_fintagging_text_context/qwen2.5_14b_instruct/sft_3ep/merged}"
+export TABLE_EXTRACTOR_MODEL="${TABLE_EXTRACTOR_MODEL:-${REPO_ROOT}/runs_fintagging_table_context/qwen2.5_14b_instruct/sft_3ep/merged}"
+export TEXT_EXTRACTION_PREDICTIONS="${TEXT_EXTRACTION_PREDICTIONS:-${REPO_ROOT}/runs_fintagging_text_context/qwen2.5_14b_instruct/sft_3ep/predictions/test_predictions.jsonl}"
+export TABLE_EXTRACTION_PREDICTIONS="${TABLE_EXTRACTION_PREDICTIONS:-${REPO_ROOT}/runs_fintagging_table_context/qwen2.5_14b_instruct/sft_3ep/predictions/test_predictions.jsonl}"
+export EXTRACTION_BACKEND="${EXTRACTION_BACKEND:-vllm}"
+export EXTRACTION_VLLM_BATCH_SIZE="${EXTRACTION_VLLM_BATCH_SIZE:-16}"
+export EXTRACTION_TENSOR_PARALLEL_SIZE="${EXTRACTION_TENSOR_PARALLEL_SIZE:-1}"
+export EXTRACTION_GPU_MEMORY_UTILIZATION="${EXTRACTION_GPU_MEMORY_UTILIZATION:-0.9}"
+export EXTRACTION_MAX_MODEL_LEN="${EXTRACTION_MAX_MODEL_LEN:-16384}"
+export EXTRACTION_MAX_NUM_SEQS="${EXTRACTION_MAX_NUM_SEQS:-8}"
 export TOP_K="${TOP_K:-200}"
 export REUSE_CANDIDATES="${REUSE_CANDIDATES:-1}"
 export TYPE_FILTER="${TYPE_FILTER:-1}"
@@ -118,7 +123,7 @@ export QUERY_TEMPERATURE="${QUERY_TEMPERATURE:-0.0}"
 export QUERY_TOP_P="${QUERY_TOP_P:-1.0}"
 export BF16="${BF16:-1}"
 export TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
-export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 export VLLM_BATCH_SIZE="${VLLM_BATCH_SIZE:-32}"
@@ -140,11 +145,14 @@ case "${MODE}" in
   retrieval)
     export RUN_RERANK=0
     ;;
+  prepare)
+    export RUN_RERANK=0
+    ;;
   dryrun)
     export RUN_RERANK=0
     ;;
   *)
-    echo "Unknown MODE=${MODE}. Expected full|retrieval|dryrun." >&2
+    echo "Unknown MODE=${MODE}. Expected full|retrieval|prepare|dryrun." >&2
     exit 1
     ;;
 esac
@@ -153,34 +161,30 @@ echo "============================================================"
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "PIPELINE_SH=${PIPELINE_SH}"
 echo "MODE=${MODE}"
-echo "TEST_JSONL=${TEST_JSONL}"
-echo "TAXONOMY_JSONL=${TAXONOMY_JSONL}"
-echo "OUTPUT_DIR=${OUTPUT_DIR}"
-echo "TOP_K=${TOP_K}"
 echo "QUERY_MODE=${QUERY_MODE}"
-echo "REUSE_CANDIDATES=${REUSE_CANDIDATES}"
-echo "TYPE_FILTER=${TYPE_FILTER}"
-echo "RUN_RERANK=${RUN_RERANK}"
-echo "RERANK_MODEL=${RERANK_MODEL}"
-echo "RERANK_BACKEND=${RERANK_BACKEND}"
-echo "QUERY_GENERATION_MODEL=${QUERY_GENERATION_MODEL}"
-echo "QUERY_GENERATION_BACKEND=${QUERY_GENERATION_BACKEND}"
-echo "QUERY_MAX_NEW_TOKENS=${QUERY_MAX_NEW_TOKENS}"
+echo "OUTPUT_DIR=${OUTPUT_DIR}"
+echo "RUN_EXTRACTION=${RUN_EXTRACTION}"
+echo "TEXT_EXTRACTOR_MODEL=${TEXT_EXTRACTOR_MODEL}"
+echo "TABLE_EXTRACTOR_MODEL=${TABLE_EXTRACTOR_MODEL}"
+echo "EXTRACTION_BACKEND=${EXTRACTION_BACKEND}"
+echo "EXTRACTION_VLLM_BATCH_SIZE=${EXTRACTION_VLLM_BATCH_SIZE}"
+echo "EXTRACTION_TENSOR_PARALLEL_SIZE=${EXTRACTION_TENSOR_PARALLEL_SIZE}"
+echo "RUNS_ROOT=${RUNS_ROOT}"
+echo "EXTRACTOR_TAG=${EXTRACTOR_TAG}"
 echo "HF_HOME=${HF_HOME}"
 echo "HF_HUB_CACHE=${HF_HUB_CACHE}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
-echo "TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE}"
-echo "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION}"
-echo "MAX_NUM_SEQS=${MAX_NUM_SEQS}"
-echo "VLLM_BATCH_SIZE=${VLLM_BATCH_SIZE}"
-echo "CONTEXT_MAX_CHARS=${CONTEXT_MAX_CHARS}"
-echo "CANDIDATE_DOC_MAX_CHARS=${CANDIDATE_DOC_MAX_CHARS}"
-echo "MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS}"
-echo "MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
-echo "RESUME=${RESUME}"
+echo "TOP_K=${TOP_K}"
+echo "REUSE_CANDIDATES=${REUSE_CANDIDATES}"
+echo "RUN_RERANK=${RUN_RERANK}"
+echo "RERANK_MODEL=${RERANK_MODEL}"
+echo "QUERY_GENERATION_MODEL=${QUERY_GENERATION_MODEL}"
 echo "LIMIT=${LIMIT:-<none>}"
 echo "============================================================"
 
+python -m py_compile "${REPO_ROOT}/generate_fintagging_fulltagging_extractions.py"
+python -m py_compile "${REPO_ROOT}/build_fintagging_fulltagging_grounding_input.py"
+python -m py_compile "${REPO_ROOT}/evaluate_fintagging_fulltagging_pipeline.py"
 python -m py_compile "${REPO_ROOT}/run_fintagging_grounding_baseline.py"
 [[ "${MODE}" == "dryrun" ]] && exit 0
 
