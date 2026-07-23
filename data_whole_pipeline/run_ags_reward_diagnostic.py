@@ -356,6 +356,14 @@ def consolidate(
     beta: float,
     normalization_map: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    return rerank_consolidated_base(consolidate_base(rounds, rrf_kappa, normalization_map), beta)
+
+
+def consolidate_base(
+    rounds: list[dict[str, Any]],
+    rrf_kappa: float,
+    normalization_map: dict[str, Any],
+) -> list[dict[str, Any]]:
     base = fuse_round_candidates(
         [{"round": idx + 1, "candidates": round_record["candidates"]} for idx, round_record in enumerate(rounds)],
         None,
@@ -365,9 +373,17 @@ def consolidate(
     rescored = []
     for candidate in base:
         consensus = consensus_agreement(candidate, hypotheses, normalization_map)
-        score = float(candidate.get("rrf_score", 0.0)) + beta * consensus
         updated = dict(candidate)
         updated["consensus_agreement"] = consensus
+        rescored.append(updated)
+    return rescored
+
+
+def rerank_consolidated_base(candidates: list[dict[str, Any]], beta: float) -> list[dict[str, Any]]:
+    rescored = []
+    for candidate in candidates:
+        updated = dict(candidate)
+        score = float(updated.get("rrf_score", 0.0)) + beta * float(updated.get("consensus_agreement", 0.0))
         updated["consensus_beta"] = beta
         updated["rerank_score"] = round(score, 8)
         rescored.append(updated)
@@ -391,8 +407,9 @@ def score_rounds_by_beta(
     normalization_map: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
     scored = {}
+    base = consolidate_base(rounds, rrf_kappa, normalization_map)
     for beta in betas:
-        ranking = consolidate(rounds, rrf_kappa, beta, normalization_map)
+        ranking = rerank_consolidated_base(base, beta)
         y, rank, in_union = utility(ranking, gold_tags)
         scored[beta_key(beta)] = {
             "utility": y,

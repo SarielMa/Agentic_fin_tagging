@@ -213,6 +213,7 @@ def dimension_agreement_verdict(
     dimension: str,
     value: Any,
     normalization_map: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalization_map = normalization_map or load_normalization_map()
     dimension = normalize_dimension_name(dimension)
@@ -230,7 +231,7 @@ def dimension_agreement_verdict(
             "reason": "hypothesis_unresolved",
         }
 
-    profile = parse_candidate_symbolic_profile(candidate, normalization_map)
+    profile = profile or parse_candidate_symbolic_profile(candidate, normalization_map)
     candidate_dim = profile["dimensions"].get(dimension, {})
     candidate_categories = set(candidate_dim.get("categories", []))
     hypothesis_categories = set(normalized.get("categories", []))
@@ -282,9 +283,19 @@ def agree(
     normalization_map: dict[str, Any] | None = None,
 ) -> AgreementResult:
     normalization_map = normalization_map or load_normalization_map()
+    profile = parse_candidate_symbolic_profile(candidate, normalization_map)
+    return agree_with_profile(candidate, hypothesis_dimensions, normalization_map, profile)
+
+
+def agree_with_profile(
+    candidate: dict[str, Any],
+    hypothesis_dimensions: dict[str, Any],
+    normalization_map: dict[str, Any],
+    profile: dict[str, Any],
+) -> AgreementResult:
     canonical = canonical_hypothesis_dimensions(hypothesis_dimensions)
     verdicts = [
-        dimension_agreement_verdict(candidate, dimension, value, normalization_map)
+        dimension_agreement_verdict(candidate, dimension, value, normalization_map, profile)
         for dimension, value in canonical.items()
         if not is_unresolved(value)
     ]
@@ -314,8 +325,10 @@ def consensus_agreement(
 ) -> float:
     if not hypotheses:
         return 0.0
+    normalization_map = normalization_map or load_normalization_map()
+    profile = parse_candidate_symbolic_profile(candidate, normalization_map)
     scores = [
-        agree(candidate, hypothesis.get("dimensions", hypothesis), normalization_map).score
+        agree_with_profile(candidate, hypothesis.get("dimensions", hypothesis), normalization_map, profile).score
         for hypothesis in hypotheses
     ]
     return round(sum(scores) / len(scores), 6)
