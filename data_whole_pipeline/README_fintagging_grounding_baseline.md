@@ -61,6 +61,17 @@ sbatch data_whole_pipeline/apply_server_fintagging_operator_refinement.sh
 sbatch data_whole_pipeline/apply_server_fintagging_memory_guided_refinement.sh
 ```
 
+Run the same methods in the fullTagging extraction-to-grounding setting:
+
+```bash
+sbatch data_whole_pipeline/apply_server_fintagging_fulltagging_intrinsic_self_refinement.sh
+sbatch data_whole_pipeline/apply_server_fintagging_fulltagging_retrieval_feedback_refinement.sh
+sbatch data_whole_pipeline/apply_server_fintagging_fulltagging_parallel_sampling.sh
+sbatch data_whole_pipeline/apply_server_fintagging_fulltagging_decomposed_retrieval.sh
+sbatch data_whole_pipeline/apply_server_fintagging_fulltagging_operator_refinement.sh
+sbatch data_whole_pipeline/apply_server_fintagging_fulltagging_memory_guided_refinement.sh
+```
+
 Useful variants:
 
 ```bash
