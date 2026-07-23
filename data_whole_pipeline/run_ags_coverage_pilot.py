@@ -664,6 +664,10 @@ def compact_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
             "type": candidate.get("type", ""),
             "standard_label": candidate.get("standard_label", ""),
             "bm25_score": candidate.get("bm25_score"),
+            "bm25_normalized_score": candidate.get("bm25_normalized_score"),
+            "label_coverage": candidate.get("label_coverage"),
+            "query_label_coverage": candidate.get("query_label_coverage"),
+            "retrieval_score": candidate.get("retrieval_score"),
         }
         for candidate in candidates
     ]

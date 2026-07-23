@@ -91,8 +91,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-init-seed", type=int, default=20260726)
     parser.add_argument("--init-selection-k", type=int, default=50)
     parser.add_argument("--consensus-betas", default="0.05,0.1,0.2,0.4")
+    parser.add_argument("--label-coverage-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--label-coverage-pool-multiplier",
+        type=int,
+        default=0,
+        help="Pool multiplier for label-coverage rescoring; <=0 scores the full type-filtered pool.",
+    )
     parser.add_argument("--type-filter", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--refresh-retrievals", action="store_true")
+    parser.add_argument("--refresh-agreement-debug", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--dry-run-no-llm", action="store_true")
@@ -165,11 +174,38 @@ def candidate_ids(candidates: list[dict[str, Any]]) -> list[str]:
 
 def candidate_scores(candidates: list[dict[str, Any]]) -> list[float | None]:
     return [
-        candidate.get("rrf_score")
+        candidate.get("rerank_score")
+        if candidate.get("rerank_score") is not None
+        else candidate.get("rrf_score")
         if candidate.get("rrf_score") is not None
+        else candidate.get("retrieval_score")
+        if candidate.get("retrieval_score") is not None
         else candidate.get("bm25_score")
         for candidate in candidates
     ]
+
+
+def adopted_rendering_policy(rendering_gate: dict[str, Any]) -> dict[str, str]:
+    policy = rendering_gate.get("adopted_rendering_by_modality") or {}
+    fallback = str(rendering_gate.get("adopted_rendering") or "dual")
+    return {
+        "table": str(policy.get("table") or fallback),
+        "text": str(policy.get("text") or fallback),
+        "pooled": str(policy.get("pooled") or "modality_conditional"),
+    }
+
+
+def rendering_for_example(example: Example, rendering_policy: dict[str, str]) -> str:
+    return rendering_policy.get(example.input_type, rendering_policy.get("pooled", "dual"))
+
+
+def records_for_example(
+    grouped: dict[str, dict[int, list[dict[str, Any]]]],
+    example: Example,
+    rendering_policy: dict[str, str],
+) -> list[dict[str, Any]]:
+    rendering = rendering_for_example(example, rendering_policy)
+    return grouped[rendering][example.example_idx]
 
 
 def retrieve_rendering(
@@ -225,6 +261,11 @@ def run_tokenization_self_check(
     failures = []
     label_rank1_failures = []
     seen: set[tuple[str, str]] = set()
+    retrieval_text_check_retriever = TaxonomyRetriever(
+        list(taxonomy_by_tag.values()),
+        type_filter=retriever.type_filter,
+        label_coverage_weight=0.0,
+    )
     for example in examples:
         for gold in example.gold_tags:
             tag = normalize_tag(gold)
@@ -240,7 +281,7 @@ def run_tokenization_self_check(
             top_tag = normalize_tag(candidates[0]["tag"]) if candidates else None
             rank = first_gold_rank(candidate_ids(candidates), [tag])
             retrieval_text_candidates = compact_candidates(
-                retrieve_candidates(retriever, concept.retrieval_text, concept.entity_type, 1)
+                retrieve_candidates(retrieval_text_check_retriever, concept.retrieval_text, concept.entity_type, 1)
             )
             retrieval_text_top_tag = normalize_tag(retrieval_text_candidates[0]["tag"]) if retrieval_text_candidates else None
             retrieval_text_rank1_passed = retrieval_text_top_tag == tag
@@ -364,7 +405,7 @@ def build_retrievals(
     retriever: TaxonomyRetriever,
 ) -> list[dict[str, Any]]:
     output_path = args.output_dir / "retrievals.jsonl"
-    if args.resume and output_path.exists() and not args.overwrite:
+    if args.resume and output_path.exists() and not args.overwrite and not args.refresh_retrievals:
         return load_jsonl(output_path)
 
     records: list[dict[str, Any]] = []
@@ -426,7 +467,7 @@ def mean_pairwise_jaccard(candidate_lists: list[list[str]], depth: int) -> float
     return sum(values) / len(values) if values else None
 
 
-def build_fused_from_records(records: list[dict[str, Any]], top_k: int, rrf_kappa: float) -> list[dict[str, Any]]:
+def build_fused_from_records(records: list[dict[str, Any]], top_k: int | None, rrf_kappa: float) -> list[dict[str, Any]]:
     rounds = [
         {"round": idx + 1, "candidates": record.get("candidates", [])}
         for idx, record in enumerate(records)
@@ -606,6 +647,11 @@ def build_rendering_gate(args: argparse.Namespace, paired_rows: list[dict[str, A
         "status": status,
         "reason": reason,
         "adopted_rendering": "dual" if status in {"proceed_claim", "proceed_weak"} else None,
+        "adopted_rendering_by_modality": (
+            {"table": "dual", "text": "def", "pooled": "modality_conditional"}
+            if status in {"proceed_claim", "proceed_weak"}
+            else {}
+        ),
         "claim_allowed": status == "proceed_claim",
         "human_ack_required": status == "halt_requires_ack",
         "primary_gate": primary,
@@ -662,13 +708,61 @@ def aggregate_config_metrics(
     return rows
 
 
+def agreement_reason_layer(reason: Any) -> str:
+    text = normalize_space(reason)
+    if text in {"token_overlap", "no_comparable_tokens"}:
+        return "lexical"
+    return "exact"
+
+
+def agreement_component_scores(
+    candidates: list[dict[str, Any]],
+    hypothesis_dimensions: dict[str, Any],
+    top_m: int,
+    normalization_map: dict[str, Any],
+) -> dict[str, Any]:
+    selected = candidates[:top_m]
+    counts = {
+        "exact_support": 0,
+        "exact_evaluated": 0,
+        "lexical_support": 0,
+        "lexical_evaluated": 0,
+        "unresolved": 0,
+    }
+    for candidate in selected:
+        result = agree(candidate, hypothesis_dimensions, normalization_map)
+        for verdict in result.verdicts:
+            matched = verdict.get("matched")
+            if matched is None:
+                counts["unresolved"] += 1
+                continue
+            layer = agreement_reason_layer(verdict.get("reason"))
+            counts[f"{layer}_evaluated"] += 1
+            if matched is True:
+                counts[f"{layer}_support"] += 1
+    exact_score = counts["exact_support"] / counts["exact_evaluated"] if counts["exact_evaluated"] else 0.0
+    lexical_score = counts["lexical_support"] / counts["lexical_evaluated"] if counts["lexical_evaluated"] else 0.0
+    evaluated = counts["exact_evaluated"] + counts["lexical_evaluated"]
+    overall_score = (
+        (counts["exact_support"] + counts["lexical_support"]) / evaluated
+        if evaluated
+        else 0.0
+    )
+    return {
+        **counts,
+        "exact_score": round(exact_score, 6),
+        "lexical_score": round(lexical_score, 6),
+        "overall_score": round(overall_score, 6),
+    }
+
+
 def compute_a2_initialization(
     args: argparse.Namespace,
     hypotheses: list[dict[str, Any]],
     retrievals: list[dict[str, Any]],
     examples: list[Example],
     depths: list[int],
-    adopted_rendering: str,
+    rendering_policy: dict[str, str],
     normalization_map: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     examples_by_id = {example.example_idx: example for example in examples}
@@ -678,14 +772,16 @@ def compute_a2_initialization(
     for values in hyp_by_fact.values():
         values.sort(key=lambda item: int(item["hypothesis_idx"]))
 
-    render_records = retrievals_by_render_fact([record for record in retrievals if record["rendering"] == adopted_rendering])[adopted_rendering]
+    render_records = retrievals_by_render_fact(retrievals)
     per_fact: dict[str, dict[int, dict[int, dict[str, Any]]]] = defaultdict(dict)
     symbolic_choices: dict[int, int] = {}
+    symbolic_exact_choices: dict[int, int] = {}
+    symbolic_lexical_choices: dict[int, int] = {}
     rng = random.Random(args.random_init_seed)
 
     for example in examples:
         fact_id = example.example_idx
-        records = render_records[fact_id]
+        records = records_for_example(render_records, example, rendering_policy)
         hypotheses_for_fact = hyp_by_fact[fact_id]
         per_fact["j1_hyp0"][fact_id] = ranking_metrics_for_ids(records[0]["candidate_ids"], example, depths)
 
@@ -709,9 +805,32 @@ def compute_a2_initialization(
             mean_agreement(record["candidates"], hypotheses_for_fact[idx]["dimensions"], args.agreement_top_m, normalization_map)
             for idx, record in enumerate(records)
         ]
+        component_scores = [
+            agreement_component_scores(
+                record["candidates"],
+                hypotheses_for_fact[idx]["dimensions"],
+                args.agreement_top_m,
+                normalization_map,
+            )
+            for idx, record in enumerate(records)
+        ]
         symbolic_idx = max(range(len(scores)), key=lambda idx: (scores[idx], -idx))
+        symbolic_exact_idx = max(range(len(component_scores)), key=lambda idx: (component_scores[idx]["exact_score"], -idx))
+        symbolic_lexical_idx = max(range(len(component_scores)), key=lambda idx: (component_scores[idx]["lexical_score"], -idx))
         symbolic_choices[fact_id] = symbolic_idx
+        symbolic_exact_choices[fact_id] = symbolic_exact_idx
+        symbolic_lexical_choices[fact_id] = symbolic_lexical_idx
         per_fact["j3_symbolic_select"][fact_id] = ranking_metrics_for_ids(records[symbolic_idx]["candidate_ids"], example, depths)
+        per_fact["j3_symbolic_select_exact_only"][fact_id] = ranking_metrics_for_ids(
+            records[symbolic_exact_idx]["candidate_ids"],
+            example,
+            depths,
+        )
+        per_fact["j3_symbolic_select_lexical_only"][fact_id] = ranking_metrics_for_ids(
+            records[symbolic_lexical_idx]["candidate_ids"],
+            example,
+            depths,
+        )
 
         fused = build_fused_from_records(records, args.top_k, args.rrf_kappa)
         per_fact["j3_union_rrf"][fact_id] = ranking_metrics_for_ids(candidate_ids(fused), example, depths)
@@ -742,10 +861,122 @@ def compute_a2_initialization(
         "adopted_initialization": winner["config"],
         "selection_k": selection_k,
         "selection_basis": "highest pooled recall_at_k, mrr tie-break",
+        "rendering_policy": rendering_policy,
         "symbolic_select_vs_random": paired_values,
         "symbolic_choices": symbolic_choices,
+        "symbolic_exact_choices": symbolic_exact_choices,
+        "symbolic_lexical_choices": symbolic_lexical_choices,
     }
     return rows, recommendation
+
+
+def compute_agreement_decomposition(
+    args: argparse.Namespace,
+    hypotheses: list[dict[str, Any]],
+    retrievals: list[dict[str, Any]],
+    examples: list[Example],
+    rendering_policy: dict[str, str],
+    normalization_map: dict[str, Any],
+) -> list[dict[str, Any]]:
+    hyp_by_fact: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for hypothesis in hypotheses:
+        hyp_by_fact[int(hypothesis["fact_id"])].append(hypothesis)
+    for values in hyp_by_fact.values():
+        values.sort(key=lambda item: int(item["hypothesis_idx"]))
+    render_records = retrievals_by_render_fact(retrievals)
+
+    detail_rows: list[dict[str, Any]] = []
+    for example in examples:
+        records = records_for_example(render_records, example, rendering_policy)
+        hypotheses_for_fact = hyp_by_fact[example.example_idx]
+        scores = [
+            agreement_component_scores(
+                record["candidates"],
+                hypotheses_for_fact[idx]["dimensions"],
+                args.agreement_top_m,
+                normalization_map,
+            )
+            for idx, record in enumerate(records)
+        ]
+        overall_idx = max(range(len(scores)), key=lambda idx: (scores[idx]["overall_score"], -idx))
+        exact_idx = max(range(len(scores)), key=lambda idx: (scores[idx]["exact_score"], -idx))
+        lexical_idx = max(range(len(scores)), key=lambda idx: (scores[idx]["lexical_score"], -idx))
+        for idx, score in enumerate(scores):
+            exact_eval = int(score["exact_evaluated"])
+            lexical_eval = int(score["lexical_evaluated"])
+            evaluated = exact_eval + lexical_eval
+            detail_rows.append(
+                {
+                    "row_type": "hypothesis",
+                    "fact_id": example.example_idx,
+                    "context_id": example.context_id,
+                    "modality": example.input_type,
+                    "rendering": rendering_for_example(example, rendering_policy),
+                    "hypothesis_idx": idx,
+                    "selected_by_overall": idx == overall_idx,
+                    "selected_by_exact": idx == exact_idx,
+                    "selected_by_lexical": idx == lexical_idx,
+                    "overall_score": score["overall_score"],
+                    "exact_score": score["exact_score"],
+                    "lexical_score": score["lexical_score"],
+                    "exact_support": score["exact_support"],
+                    "exact_evaluated": exact_eval,
+                    "lexical_support": score["lexical_support"],
+                    "lexical_evaluated": lexical_eval,
+                    "unresolved": score["unresolved"],
+                    "lexical_evaluated_fraction": round(lexical_eval / evaluated, 6) if evaluated else 0.0,
+                }
+            )
+
+    summary_rows: list[dict[str, Any]] = []
+    for modality in MODALITIES:
+        rows = [
+            row for row in detail_rows
+            if row["row_type"] == "hypothesis" and (modality == "pooled" or row["modality"] == modality)
+        ]
+        selected = [row for row in rows if row["selected_by_overall"]]
+        exact_eval = sum(int(row["exact_evaluated"]) for row in rows)
+        lexical_eval = sum(int(row["lexical_evaluated"]) for row in rows)
+        evaluated = exact_eval + lexical_eval
+        exact_support = sum(int(row["exact_support"]) for row in rows)
+        lexical_support = sum(int(row["lexical_support"]) for row in rows)
+        summary_rows.append(
+            {
+                "row_type": "summary",
+                "modality": modality,
+                "rendering_policy": json.dumps(rendering_policy, ensure_ascii=False, sort_keys=True),
+                "hypothesis_rows": len(rows),
+                "fact_count": len({int(row["fact_id"]) for row in rows}),
+                "exact_support_fraction": round(exact_support / exact_eval, 6) if exact_eval else 0.0,
+                "lexical_support_fraction": round(lexical_support / lexical_eval, 6) if lexical_eval else 0.0,
+                "lexical_evaluated_fraction": round(lexical_eval / evaluated, 6) if evaluated else 0.0,
+                "exact_choice_matches_overall_fraction": round(
+                    sum(row["selected_by_exact"] for row in selected) / len(selected),
+                    6,
+                )
+                if selected
+                else 0.0,
+                "lexical_choice_matches_overall_fraction": round(
+                    sum(row["selected_by_lexical"] for row in selected) / len(selected),
+                    6,
+                )
+                if selected
+                else 0.0,
+                "overall_selected_mean_exact_score": round(
+                    sum(float(row["exact_score"]) for row in selected) / len(selected),
+                    6,
+                )
+                if selected
+                else 0.0,
+                "overall_selected_mean_lexical_score": round(
+                    sum(float(row["lexical_score"]) for row in selected) / len(selected),
+                    6,
+                )
+                if selected
+                else 0.0,
+            }
+        )
+    return summary_rows + detail_rows
 
 
 def minmax_scores(candidates: list[dict[str, Any]]) -> dict[str, float]:
@@ -799,23 +1030,47 @@ def rrf_consensus(
     beta: float,
     normalization_map: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    base = build_fused_from_records(records, top_k, rrf_kappa)
+    base = build_fused_from_records(records, None, rrf_kappa)
+    consensus_base = annotate_consensus(base, hypotheses, normalization_map)
+    return rerank_consensus_base(consensus_base, top_k, beta)
+
+
+def annotate_consensus(
+    candidates: list[dict[str, Any]],
+    hypotheses: list[dict[str, Any]],
+    normalization_map: dict[str, Any],
+) -> list[dict[str, Any]]:
     rescored = []
-    for candidate in base:
+    for candidate in candidates:
         consensus = consensus_agreement(candidate, hypotheses, normalization_map)
-        score = float(candidate.get("rrf_score", 0.0)) + beta * consensus
         updated = dict(candidate)
         updated["consensus_agreement"] = consensus
+        rescored.append(updated)
+    return rescored
+
+
+def rerank_consensus_base(candidates: list[dict[str, Any]], top_k: int, beta: float) -> list[dict[str, Any]]:
+    rescored = []
+    for candidate in candidates:
+        updated = dict(candidate)
+        score = float(updated.get("rrf_score", 0.0)) + beta * float(updated.get("consensus_agreement", 0.0))
         updated["consensus_beta"] = beta
         updated["rerank_score"] = round(score, 8)
         rescored.append(updated)
-    rescored.sort(key=lambda candidate: (-float(candidate.get("rerank_score", 0.0)), int(candidate.get("rank", 10**9)), candidate.get("tag", "")))
-    for rank, candidate in enumerate(rescored[:top_k], start=1):
+    rescored.sort(
+        key=lambda candidate: (
+            -float(candidate.get("rerank_score", 0.0)),
+            int(candidate.get("rank", 10**9)),
+            candidate.get("tag", ""),
+        )
+    )
+    output = rescored[:top_k]
+    for rank, candidate in enumerate(output, start=1):
         candidate["rank"] = rank
-    return rescored[:top_k]
+    return output
 
 
-def coverage_ceiling(records: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+def coverage_ceiling(records: list[dict[str, Any]], top_k: int | None = None) -> list[dict[str, Any]]:
     seen: set[str] = set()
     output = []
     for record in records:
@@ -826,9 +1081,28 @@ def coverage_ceiling(records: list[dict[str, Any]], top_k: int) -> list[dict[str
                 updated = dict(candidate)
                 updated["rank"] = len(output) + 1
                 output.append(updated)
-            if len(output) >= top_k:
+            if top_k is not None and top_k > 0 and len(output) >= top_k:
                 return output
     return output
+
+
+def union_coverage_metrics(records: list[dict[str, Any]], example: Example, depths: list[int]) -> dict[int, dict[str, Any]]:
+    union_tags = {
+        normalize_tag(candidate.get("tag", ""))
+        for record in records
+        for candidate in record.get("candidates", [])
+        if normalize_tag(candidate.get("tag", ""))
+    }
+    covered = bool(set(example.gold_tags) & union_tags)
+    return {
+        depth: {
+            "recall": covered,
+            "rank": 1 if covered else None,
+            "mrr": 1.0 if covered else 0.0,
+            "union_size": len(union_tags),
+        }
+        for depth in depths
+    }
 
 
 def compute_a3_consolidation(
@@ -837,7 +1111,7 @@ def compute_a3_consolidation(
     retrievals: list[dict[str, Any]],
     examples: list[Example],
     depths: list[int],
-    adopted_rendering: str,
+    rendering_policy: dict[str, str],
     normalization_map: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     hyp_by_fact: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -845,35 +1119,36 @@ def compute_a3_consolidation(
         hyp_by_fact[int(hypothesis["fact_id"])].append(hypothesis)
     for values in hyp_by_fact.values():
         values.sort(key=lambda item: int(item["hypothesis_idx"]))
-    render_records = retrievals_by_render_fact([record for record in retrievals if record["rendering"] == adopted_rendering])[adopted_rendering]
+    render_records = retrievals_by_render_fact(retrievals)
     betas = parse_float_list(args.consensus_betas)
     per_fact: dict[str, dict[int, dict[int, dict[str, Any]]]] = defaultdict(dict)
     detail_rows: list[dict[str, Any]] = []
     for example in examples:
         fact_id = example.example_idx
-        records = render_records[fact_id]
+        rendering = rendering_for_example(example, rendering_policy)
+        records = render_records[rendering][fact_id]
         hypotheses_for_fact = hyp_by_fact[fact_id]
+        plain_rrf = build_fused_from_records(records, args.top_k, args.rrf_kappa)
+        full_rrf_union = build_fused_from_records(records, None, args.rrf_kappa)
+        consensus_base = annotate_consensus(full_rrf_union, hypotheses_for_fact, normalization_map)
         variants = {
-            "plain_rrf": build_fused_from_records(records, args.top_k, args.rrf_kappa),
+            "plain_rrf": plain_rrf,
             "score_normalized_combsum": combsum(records, args.top_k),
-            "coverage_ceiling": coverage_ceiling(records, args.top_k),
+            "coverage_ceiling": coverage_ceiling(records),
         }
         for beta in betas:
-            variants[f"rrf_consensus_beta_{beta:g}"] = rrf_consensus(
-                records,
-                hypotheses_for_fact,
-                args.top_k,
-                args.rrf_kappa,
-                beta,
-                normalization_map,
-            )
+            variants[f"rrf_consensus_beta_{beta:g}"] = rerank_consensus_base(consensus_base, args.top_k, beta)
         for variant, ranking in variants.items():
-            per_fact[variant][fact_id] = ranking_metrics_for_ids(candidate_ids(ranking), example, depths)
+            if variant == "coverage_ceiling":
+                per_fact[variant][fact_id] = union_coverage_metrics(records, example, depths)
+            else:
+                per_fact[variant][fact_id] = ranking_metrics_for_ids(candidate_ids(ranking), example, depths)
             detail_rows.append(
                 {
                     "fact_id": fact_id,
                     "context_id": example.context_id,
                     "modality": example.input_type,
+                    "rendering": rendering,
                     "variant": variant,
                     "gold_rank": first_gold_rank(candidate_ids(ranking), example.gold_tags),
                     "candidate_ids": candidate_ids(ranking),
@@ -895,25 +1170,72 @@ def compute_a3_consolidation(
     return rows, detail_rows
 
 
+def recommend_consensus_beta(consolidation_rows: list[dict[str, Any]], selection_k: int) -> dict[str, Any]:
+    candidates = [
+        row for row in consolidation_rows
+        if row.get("stage") == "A3"
+        and row.get("modality") == "pooled"
+        and int(row.get("k", -1)) == selection_k
+        and str(row.get("config", "")).startswith("rrf_consensus_beta_")
+    ]
+    betas = [
+        float(str(row["config"]).replace("rrf_consensus_beta_", ""))
+        for row in candidates
+    ]
+    if not candidates:
+        return {
+            "adopted_consensus_beta": None,
+            "selection_k": selection_k,
+            "selection_basis": "missing A3 pooled consensus rows",
+            "candidate_betas": [],
+        }
+    winner = max(
+        candidates,
+        key=lambda row: (
+            float(row.get("recall_at_k", 0.0)),
+            float(row.get("mrr_at_k", 0.0)),
+            -float(str(row["config"]).replace("rrf_consensus_beta_", "")),
+        ),
+    )
+    adopted_beta = float(str(winner["config"]).replace("rrf_consensus_beta_", ""))
+    return {
+        "adopted_consensus_beta": adopted_beta,
+        "selection_k": selection_k,
+        "selection_basis": "highest corrected A3 pooled recall_at_k, mrr tie-break",
+        "candidate_betas": sorted(set(betas)),
+        "winner": winner,
+    }
+
+
 def write_agreement_debug(
     args: argparse.Namespace,
     hypotheses: list[dict[str, Any]],
     retrievals: list[dict[str, Any]],
-    adopted_rendering: str,
+    rendering_policy: dict[str, str],
     normalization_map: dict[str, Any],
 ) -> None:
     output_path = args.output_dir / "agreement_debug.jsonl"
-    if args.resume and output_path.exists() and not args.overwrite:
+    if args.resume and output_path.exists() and not args.overwrite and not args.refresh_agreement_debug and not args.refresh_retrievals:
         return
     rng = random.Random(args.agreement_debug_seed)
     fact_ids = sorted({int(record["fact_id"]) for record in retrievals})
     selected = set(rng.sample(fact_ids, min(args.agreement_debug_facts, len(fact_ids))))
+    examples_by_id = {}
+    for row in load_jsonl(args.sample_path):
+        example = row_to_example(row)
+        examples_by_id[example.example_idx] = example
     hyp_by_key = {(int(h["fact_id"]), int(h["hypothesis_idx"])): h for h in hypotheses}
     rows = []
     for record in retrievals:
-        if int(record["fact_id"]) not in selected or record["rendering"] != adopted_rendering:
+        fact_id = int(record["fact_id"])
+        example = examples_by_id.get(fact_id)
+        if (
+            fact_id not in selected
+            or example is None
+            or record["rendering"] != rendering_for_example(example, rendering_policy)
+        ):
             continue
-        hypothesis = hyp_by_key[(int(record["fact_id"]), int(record["hypothesis_idx"]))]
+        hypothesis = hyp_by_key[(fact_id, int(record["hypothesis_idx"]))]
         for candidate in record["candidates"][: args.agreement_top_m]:
             result = agree(candidate, hypothesis["dimensions"], normalization_map)
             rows.append(
@@ -922,7 +1244,8 @@ def write_agreement_debug(
                     "context_id": record["context_id"],
                     "modality": record["modality"],
                     "hypothesis_idx": record["hypothesis_idx"],
-                    "rendering": adopted_rendering,
+                    "rendering": record["rendering"],
+                    "rendering_policy": rendering_policy,
                     "candidate_rank": candidate.get("rank"),
                     "candidate_id": candidate.get("tag"),
                     "candidate_label": candidate.get("standard_label"),
@@ -946,6 +1269,8 @@ def write_metrics(
     initialization_rows: list[dict[str, Any]] | None = None,
     initialization_recommendation: dict[str, Any] | None = None,
     consolidation_rows: list[dict[str, Any]] | None = None,
+    consensus_beta_recommendation: dict[str, Any] | None = None,
+    agreement_decomposition_rows: list[dict[str, Any]] | None = None,
     aborted: bool = False,
     abort_stage: str | None = None,
 ) -> None:
@@ -958,6 +1283,7 @@ def write_metrics(
             "hypotheses": str(args.output_dir / "hypotheses.jsonl"),
             "retrievals": str(args.output_dir / "retrievals.jsonl"),
             "agreement_debug": str(args.output_dir / "agreement_debug.jsonl"),
+            "agreement_decomposition": str(args.output_dir / "agreement_decomposition.csv"),
             "report_table": str(args.output_dir / "report_table.csv"),
             "paired_differences": str(args.output_dir / "paired_differences.csv"),
             "initialization_table": str(args.output_dir / "initialization_table.csv"),
@@ -970,6 +1296,8 @@ def write_metrics(
         "hypothesis_temperature": args.hypothesis_temperature,
         "rrf_kappa": args.rrf_kappa,
         "dual_rrf_kappa": args.dual_rrf_kappa,
+        "label_coverage_weight": args.label_coverage_weight,
+        "label_coverage_pool_multiplier": args.label_coverage_pool_multiplier,
         "normalization_map": {
             "path": str(args.normalization_map),
             "version": map_version(args.normalization_map),
@@ -977,10 +1305,12 @@ def write_metrics(
         "tokenization_check": tokenization_check,
         "rendering_gate": rendering_gate,
         "initialization_recommendation": initialization_recommendation,
+        "consensus_beta_recommendation": consensus_beta_recommendation,
         "report_table": report_rows or [],
         "paired_differences": paired_rows or [],
         "initialization_table": initialization_rows or [],
         "consolidation_sweep": consolidation_rows or [],
+        "agreement_decomposition": agreement_decomposition_rows or [],
     }
     (args.output_dir / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -1027,7 +1357,12 @@ def main() -> None:
 
     taxonomy = load_taxonomy(args.taxonomy_jsonl)
     taxonomy_by_tag = {concept.tag: concept for concept in taxonomy}
-    retriever = TaxonomyRetriever(taxonomy, type_filter=args.type_filter)
+    retriever = TaxonomyRetriever(
+        taxonomy,
+        type_filter=args.type_filter,
+        label_coverage_weight=args.label_coverage_weight,
+        label_coverage_pool_multiplier=args.label_coverage_pool_multiplier,
+    )
     normalization_map = load_normalization_map(args.normalization_map)
 
     tokenization_check = run_tokenization_self_check(args, examples, retriever, taxonomy_by_tag)
@@ -1082,15 +1417,23 @@ def main() -> None:
         )
         raise SystemExit("A1 rendering gate is negative; explicit human acknowledgment is required before B.")
 
-    adopted_rendering = str(rendering_gate["adopted_rendering"])
-    write_agreement_debug(args, hypotheses, retrievals, adopted_rendering, normalization_map)
+    rendering_policy = adopted_rendering_policy(rendering_gate)
+    write_agreement_debug(args, hypotheses, retrievals, rendering_policy, normalization_map)
     initialization_rows, initialization_recommendation = compute_a2_initialization(
         args,
         hypotheses,
         retrievals,
         examples,
         depths,
-        adopted_rendering,
+        rendering_policy,
+        normalization_map,
+    )
+    agreement_decomposition_rows = compute_agreement_decomposition(
+        args,
+        hypotheses,
+        retrievals,
+        examples,
+        rendering_policy,
         normalization_map,
     )
     consolidation_rows, consolidation_detail_rows = compute_a3_consolidation(
@@ -1099,10 +1442,12 @@ def main() -> None:
         retrievals,
         examples,
         depths,
-        adopted_rendering,
+        rendering_policy,
         normalization_map,
     )
+    consensus_beta_recommendation = recommend_consensus_beta(consolidation_rows, args.init_selection_k)
     write_csv(args.output_dir / "initialization_table.csv", initialization_rows)
+    write_csv(args.output_dir / "agreement_decomposition.csv", agreement_decomposition_rows)
     write_csv(args.output_dir / "consolidation_sweep.csv", consolidation_rows)
     write_jsonl(args.output_dir / "consolidation_rankings.jsonl", consolidation_detail_rows)
     write_metrics(
@@ -1115,6 +1460,8 @@ def main() -> None:
         initialization_rows=initialization_rows,
         initialization_recommendation=initialization_recommendation,
         consolidation_rows=consolidation_rows,
+        consensus_beta_recommendation=consensus_beta_recommendation,
+        agreement_decomposition_rows=agreement_decomposition_rows,
     )
     print(json.dumps({"metrics_path": str(args.output_dir / "metrics.json"), "rendering_gate": rendering_gate}, indent=2))
 

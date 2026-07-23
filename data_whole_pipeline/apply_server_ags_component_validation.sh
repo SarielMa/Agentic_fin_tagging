@@ -62,6 +62,8 @@ export AGREEMENT_DEBUG_FACTS="${AGREEMENT_DEBUG_FACTS:-50}"
 export RANDOM_INIT_DRAWS="${RANDOM_INIT_DRAWS:-100}"
 export INIT_SELECTION_K="${INIT_SELECTION_K:-50}"
 export CONSENSUS_BETAS="${CONSENSUS_BETAS:-0.05,0.1,0.2,0.4}"
+export LABEL_COVERAGE_WEIGHT="${LABEL_COVERAGE_WEIGHT:-1.0}"
+export LABEL_COVERAGE_POOL_MULTIPLIER="${LABEL_COVERAGE_POOL_MULTIPLIER:-0}"
 export TYPE_FILTER="${TYPE_FILTER:-1}"
 export QUERY_GENERATION_MODEL="${QUERY_GENERATION_MODEL:-Qwen/Qwen3-32B}"
 export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
@@ -79,6 +81,8 @@ export ENFORCE_EAGER="${ENFORCE_EAGER:-0}"
 export MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-30000}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 export RESUME="${RESUME:-1}"
+export REFRESH_RETRIEVALS="${REFRESH_RETRIEVALS:-0}"
+export REFRESH_AGREEMENT_DEBUG="${REFRESH_AGREEMENT_DEBUG:-0}"
 export OVERWRITE="${OVERWRITE:-0}"
 export DRY_RUN_NO_LLM="${DRY_RUN_NO_LLM:-0}"
 export LOG_EVERY="${LOG_EVERY:-25}"
@@ -103,6 +107,8 @@ ARGS=(
   --random-init-draws "${RANDOM_INIT_DRAWS}"
   --init-selection-k "${INIT_SELECTION_K}"
   --consensus-betas "${CONSENSUS_BETAS}"
+  --label-coverage-weight "${LABEL_COVERAGE_WEIGHT}"
+  --label-coverage-pool-multiplier "${LABEL_COVERAGE_POOL_MULTIPLIER}"
   --query-generation-model "${QUERY_GENERATION_MODEL}"
   --query-generation-backend "${QUERY_GENERATION_BACKEND}"
   --query-context-max-chars "${QUERY_CONTEXT_MAX_CHARS}"
@@ -145,6 +151,14 @@ else
   ARGS+=(--no-resume)
 fi
 
+if [[ "${REFRESH_RETRIEVALS}" == "1" ]]; then
+  ARGS+=(--refresh-retrievals)
+fi
+
+if [[ "${REFRESH_AGREEMENT_DEBUG}" == "1" ]]; then
+  ARGS+=(--refresh-agreement-debug)
+fi
+
 if [[ "${OVERWRITE}" == "1" ]]; then
   ARGS+=(--overwrite)
 fi
@@ -167,7 +181,11 @@ echo "GATE_MIN_EFFECT            : ${GATE_MIN_EFFECT}"
 echo "QUERY_GENERATION_MODEL     : ${QUERY_GENERATION_MODEL}"
 echo "QUERY_GENERATION_BACKEND   : ${QUERY_GENERATION_BACKEND}"
 echo "BOOTSTRAP_SAMPLES          : ${BOOTSTRAP_SAMPLES}"
+echo "LABEL_COVERAGE_WEIGHT      : ${LABEL_COVERAGE_WEIGHT}"
+echo "LABEL_COVERAGE_POOL_MULT   : ${LABEL_COVERAGE_POOL_MULTIPLIER}"
 echo "RESUME                     : ${RESUME}"
+echo "REFRESH_RETRIEVALS         : ${REFRESH_RETRIEVALS}"
+echo "REFRESH_AGREEMENT_DEBUG    : ${REFRESH_AGREEMENT_DEBUG}"
 echo "OVERWRITE                  : ${OVERWRITE}"
 echo "DRY_RUN_NO_LLM             : ${DRY_RUN_NO_LLM}"
 echo "HF_HOME                    : ${HF_HOME}"
@@ -177,5 +195,7 @@ echo "============================================================"
 python -m py_compile \
   "${REPO_ROOT}/ags_symbolic_agreement.py" \
   "${REPO_ROOT}/run_ags_component_validation.py"
-python -m unittest "${REPO_ROOT}/test_ags_symbolic_agreement.py"
+python -m unittest \
+  "${REPO_ROOT}/test_ags_symbolic_agreement.py" \
+  "${REPO_ROOT}/test_label_coverage_retriever.py"
 python "${REPO_ROOT}/run_ags_component_validation.py" "${ARGS[@]}"

@@ -481,8 +481,16 @@ class BM25Index:
 
 
 class TaxonomyRetriever:
-    def __init__(self, concepts: list[Concept], type_filter: bool) -> None:
+    def __init__(
+        self,
+        concepts: list[Concept],
+        type_filter: bool,
+        label_coverage_weight: float = 0.0,
+        label_coverage_pool_multiplier: int = 10,
+    ) -> None:
         self.type_filter = type_filter
+        self.label_coverage_weight = label_coverage_weight
+        self.label_coverage_pool_multiplier = label_coverage_pool_multiplier
         self.all_index = BM25Index(concepts, include_type_in_text=True)
         self.by_type: dict[str, list[Concept]] = defaultdict(list)
         for concept in concepts:
@@ -492,12 +500,53 @@ class TaxonomyRetriever:
             for entity_type, type_concepts in self.by_type.items()
         }
 
-    def retrieve(self, query: str, entity_type: str, top_k: int) -> list[tuple[Concept, float]]:
+    def label_coverage(self, query_tokens: set[str], concept: Concept) -> float:
+        label_tokens = set(tokenize(concept.standard_label or concept.raw_tag))
+        if not label_tokens:
+            return 0.0
+        return len(query_tokens & label_tokens) / len(label_tokens)
+
+    def query_label_coverage(self, query_tokens: set[str], concept: Concept) -> float:
+        label_tokens = set(tokenize(concept.standard_label or concept.raw_tag))
+        if not query_tokens or not label_tokens:
+            return 0.0
+        return len(query_tokens & label_tokens) / len(query_tokens)
+
+    def retrieve(self, query: str, entity_type: str, top_k: int) -> list[tuple[Concept, float, float, float, float, float]]:
         if self.type_filter and entity_type in self.index_by_type:
             index = self.index_by_type[entity_type]
         else:
             index = self.all_index
-        return [(index.concepts[idx], score) for idx, score in index.rank(query, top_k)]
+        if self.label_coverage_weight <= 0.0:
+            return [(index.concepts[idx], score, 0.0, 0.0, score, score) for idx, score in index.rank(query, top_k)]
+
+        if self.label_coverage_pool_multiplier <= 0:
+            pool_k = len(index.concepts)
+        else:
+            pool_k = min(len(index.concepts), max(top_k, top_k * self.label_coverage_pool_multiplier))
+        query_tokens = set(tokenize(query))
+        ranked = index.rank(query, pool_k)
+        raw_scores = [score for _, score in ranked]
+        lo = min(raw_scores) if raw_scores else 0.0
+        hi = max(raw_scores) if raw_scores else 0.0
+        rescored = []
+        for idx, bm25_score in ranked:
+            concept = index.concepts[idx]
+            coverage = self.label_coverage(query_tokens, concept)
+            query_coverage = self.query_label_coverage(query_tokens, concept)
+            normalized_bm25 = (bm25_score - lo) / (hi - lo) if hi > lo else 1.0
+            retrieval_score = normalized_bm25 + self.label_coverage_weight * (coverage + query_coverage)
+            rescored.append((concept, bm25_score, coverage, query_coverage, normalized_bm25, retrieval_score))
+        rescored.sort(
+            key=lambda item: (
+                -item[5],
+                -item[2],
+                -item[3],
+                -item[1],
+                normalize_tag(item[0].tag),
+            )
+        )
+        return rescored[:top_k]
 
 
 def build_direct_query(example: Example) -> str:
@@ -544,7 +593,17 @@ def build_retrieval_query(
     return normalize_space(f"{example.entity} {example.entity_type} {description}"), description
 
 
-def concept_to_candidate(concept: Concept, rank: int, score: float) -> dict[str, Any]:
+def concept_to_candidate(
+    concept: Concept,
+    rank: int,
+    bm25_score: float,
+    label_coverage: float = 0.0,
+    query_label_coverage: float = 0.0,
+    bm25_normalized_score: float | None = None,
+    retrieval_score: float | None = None,
+) -> dict[str, Any]:
+    retrieval_score = bm25_score if retrieval_score is None else retrieval_score
+    bm25_normalized_score = bm25_score if bm25_normalized_score is None else bm25_normalized_score
     return {
         "rank": rank,
         "tag": concept.tag,
@@ -553,7 +612,11 @@ def concept_to_candidate(concept: Concept, rank: int, score: float) -> dict[str,
         "documentation": concept.documentation,
         "references": concept.references,
         "retrieval_text": concept.retrieval_text,
-        "bm25_score": round(score, 8),
+        "bm25_score": round(bm25_score, 8),
+        "bm25_normalized_score": round(bm25_normalized_score, 8),
+        "label_coverage": round(label_coverage, 8),
+        "query_label_coverage": round(query_label_coverage, 8),
+        "retrieval_score": round(retrieval_score, 8),
     }
 
 
@@ -602,8 +665,23 @@ def retrieve_candidates(
     top_k: int,
 ) -> list[dict[str, Any]]:
     return [
-        concept_to_candidate(concept, rank, score)
-        for rank, (concept, score) in enumerate(
+        concept_to_candidate(
+            concept,
+            rank,
+            bm25_score,
+            label_coverage,
+            query_label_coverage,
+            bm25_normalized_score,
+            retrieval_score,
+        )
+        for rank, (
+            concept,
+            bm25_score,
+            label_coverage,
+            query_label_coverage,
+            bm25_normalized_score,
+            retrieval_score,
+        ) in enumerate(
             retriever.retrieve(query, entity_type, top_k),
             start=1,
         )
@@ -612,7 +690,7 @@ def retrieve_candidates(
 
 def fuse_round_candidates(
     rounds: list[dict[str, Any]],
-    top_k: int,
+    top_k: int | None,
     rrf_kappa: float,
 ) -> list[dict[str, Any]]:
     scores: dict[str, float] = defaultdict(float)
@@ -639,13 +717,19 @@ def fuse_round_candidates(
                     "round": round_idx,
                     "rank": rank,
                     "bm25_score": candidate.get("bm25_score"),
+                    "bm25_normalized_score": candidate.get("bm25_normalized_score"),
+                    "label_coverage": candidate.get("label_coverage"),
+                    "query_label_coverage": candidate.get("query_label_coverage"),
+                    "retrieval_score": candidate.get("retrieval_score"),
                 }
             )
 
     ranked_tags = sorted(
         scores,
         key=lambda tag: (-scores[tag], first_round.get(tag, 10**9), best_rank.get(tag, 10**9), tag),
-    )[:top_k]
+    )
+    if top_k is not None and top_k > 0:
+        ranked_tags = ranked_tags[:top_k]
 
     fused: list[dict[str, Any]] = []
     for final_rank, tag in enumerate(ranked_tags, start=1):

@@ -61,6 +61,10 @@ export POSTERIOR_ALPHA="${POSTERIOR_ALPHA:-0.75}"
 export POSTERIOR_RIDGE="${POSTERIOR_RIDGE:-1.0}"
 export INFORMATIVE_DELTA="${INFORMATIVE_DELTA:-0.01}"
 export NOVELTY_THRESHOLD="${NOVELTY_THRESHOLD:-0.02}"
+export LIVE_CONSENSUS_BETA="${LIVE_CONSENSUS_BETA:-}"
+export DIAGNOSTIC_CONSENSUS_BETAS="${DIAGNOSTIC_CONSENSUS_BETAS:-}"
+export LABEL_COVERAGE_WEIGHT="${LABEL_COVERAGE_WEIGHT:-1.0}"
+export LABEL_COVERAGE_POOL_MULTIPLIER="${LABEL_COVERAGE_POOL_MULTIPLIER:-0}"
 export SEED="${SEED:-20260727}"
 export TYPE_FILTER="${TYPE_FILTER:-1}"
 export ACKNOWLEDGE_NEGATIVE_RENDERING_GATE="${ACKNOWLEDGE_NEGATIVE_RENDERING_GATE:-0}"
@@ -105,6 +109,8 @@ ARGS=(
   --posterior-ridge "${POSTERIOR_RIDGE}"
   --informative-delta "${INFORMATIVE_DELTA}"
   --novelty-threshold "${NOVELTY_THRESHOLD}"
+  --label-coverage-weight "${LABEL_COVERAGE_WEIGHT}"
+  --label-coverage-pool-multiplier "${LABEL_COVERAGE_POOL_MULTIPLIER}"
   --seed "${SEED}"
   --query-generation-model "${QUERY_GENERATION_MODEL}"
   --query-generation-backend "${QUERY_GENERATION_BACKEND}"
@@ -121,6 +127,14 @@ ARGS=(
   --max-new-tokens "${MAX_NEW_TOKENS}"
   --log-every "${LOG_EVERY}"
 )
+
+if [[ -n "${LIVE_CONSENSUS_BETA}" ]]; then
+  ARGS+=(--live-consensus-beta "${LIVE_CONSENSUS_BETA}")
+fi
+
+if [[ -n "${DIAGNOSTIC_CONSENSUS_BETAS}" ]]; then
+  ARGS+=(--diagnostic-consensus-betas "${DIAGNOSTIC_CONSENSUS_BETAS}")
+fi
 
 if [[ "${TYPE_FILTER}" == "1" ]]; then
   ARGS+=(--type-filter)
@@ -172,6 +186,10 @@ echo "ROUNDS                         : ${ROUNDS}"
 echo "TOP_K                          : ${TOP_K}"
 echo "POSTERIOR_SNAPSHOT_EVERY       : ${POSTERIOR_SNAPSHOT_EVERY}"
 echo "ACKNOWLEDGE_NEGATIVE_GATE      : ${ACKNOWLEDGE_NEGATIVE_RENDERING_GATE}"
+echo "LIVE_CONSENSUS_BETA            : ${LIVE_CONSENSUS_BETA:-<A3 recommendation>}"
+echo "DIAGNOSTIC_CONSENSUS_BETAS     : ${DIAGNOSTIC_CONSENSUS_BETAS:-<A3 candidates>}"
+echo "LABEL_COVERAGE_WEIGHT          : ${LABEL_COVERAGE_WEIGHT}"
+echo "LABEL_COVERAGE_POOL_MULTIPLIER : ${LABEL_COVERAGE_POOL_MULTIPLIER}"
 echo "QUERY_GENERATION_MODEL         : ${QUERY_GENERATION_MODEL}"
 echo "QUERY_GENERATION_BACKEND       : ${QUERY_GENERATION_BACKEND}"
 echo "RESUME                         : ${RESUME}"
@@ -184,5 +202,7 @@ echo "============================================================"
 python -m py_compile \
   "${REPO_ROOT}/ags_symbolic_agreement.py" \
   "${REPO_ROOT}/run_ags_reward_diagnostic.py"
-python -m unittest "${REPO_ROOT}/test_ags_symbolic_agreement.py"
+python -m unittest \
+  "${REPO_ROOT}/test_ags_symbolic_agreement.py" \
+  "${REPO_ROOT}/test_label_coverage_retriever.py"
 python "${REPO_ROOT}/run_ags_reward_diagnostic.py" "${ARGS[@]}"
