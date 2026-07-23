@@ -25,6 +25,7 @@ import argparse
 import gc
 import json
 import math
+import random
 import re
 import time
 from collections import Counter, defaultdict
@@ -66,17 +67,26 @@ QUERY_MODE_ALIASES = {
     "operator_refinement": "operator_refinement",
     "parallel": "parallel_sampling",
     "parallel_sampling": "parallel_sampling",
+    "parallel_diversity": "parallel_sampling_diversity",
+    "parallel_sampling_diversity": "parallel_sampling_diversity",
     "retrieval_feedback": "retrieval_feedback_refinement",
     "retrieval_feedback_refinement": "retrieval_feedback_refinement",
     "self_refinement": "intrinsic_self_refinement",
+    "bandit_freeform": "bandit_freeform",
+    "bandit_guided_freeform": "bandit_freeform",
+    "bandit_freeform_10arm": "bandit_freeform_10arm",
+    "bandit_guided_freeform_10arm": "bandit_freeform_10arm",
 }
 MULTI_ROUND_QUERY_MODES = {
     "intrinsic_self_refinement",
     "retrieval_feedback_refinement",
     "parallel_sampling",
+    "parallel_sampling_diversity",
     "decomposed_retrieval",
     "operator_refinement",
     "memory_guided_refinement",
+    "bandit_freeform",
+    "bandit_freeform_10arm",
 }
 LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
 STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
@@ -91,6 +101,52 @@ OPERATOR_LIBRARY = (
     "rate",
     "schedule",
 )
+FREEFORM_REWRITE_ARMS = (
+    "paraphrase",
+    "expand",
+    "simplify",
+    "decompose",
+    "alternative",
+    "freeform_revise",
+)
+FREEFORM_REWRITE_ARMS_10 = FREEFORM_REWRITE_ARMS + (
+    "sharpen",
+    "broaden_scope",
+    "shift_temporal_framing",
+    "restate_as_definition",
+)
+FREEFORM_REWRITE_INSTRUCTIONS = {
+    "paraphrase": "Restate the interpretation in different wording without changing its meaning.",
+    "expand": "Add detail or context that the evidence supports but the current grounding omits.",
+    "simplify": "Remove specifics and state the interpretation more generally.",
+    "decompose": "Split the interpretation into its constituent parts and ground the core part.",
+    "alternative": "Propose a different plausible reading of the same evidence.",
+    "freeform_revise": "Revise however the retrieved candidates suggest is best.",
+    "sharpen": "Make the interpretation more specific while staying supported by the evidence.",
+    "broaden_scope": "State the interpretation at a broader scope or less granular level.",
+    "shift_temporal_framing": "Try a different plausible temporal framing of the same evidence.",
+    "restate_as_definition": "Rewrite the interpretation as a taxonomy-definition-style sentence.",
+}
+Q_LAB_FORMATTING_INSTRUCTION = (
+    "For q_lab, emit compact label-form content words only, no function words, "
+    "in canonical-label word order. Use space-separated lowercase words."
+)
+FREEFORM_FEATURE_NAMES = [
+    "bias",
+    "is_table",
+    "is_text",
+    "is_monetary",
+    "is_shares",
+    "token_count_lt_12",
+    "token_count_gt_30",
+    "has_temporal_cue",
+    "has_aggregation_cue",
+    "has_scope_cue",
+    "critique_mismatch_flag",
+    "neighborhood_novelty",
+    "round_idx",
+    "prior_arm_count",
+]
 STOPWORDS = {
     "a",
     "an",
@@ -909,6 +965,90 @@ def parse_query_description(raw_output: str, fallback: str) -> tuple[str, bool]:
         if first_line:
             return first_line, False
     return fallback, False
+
+
+def compact_label_query(text: str) -> str:
+    return normalize_space(" ".join(tokenize(text)))
+
+
+def parse_grounding_surfaces(raw_output: str, fallback: str) -> tuple[dict[str, str], bool]:
+    parsed, parse_ok = parse_json_object(raw_output)
+    grounding = ""
+    q_lab = ""
+    q_def = ""
+    if parse_ok:
+        grounding = scalar_text(
+            parsed.get("grounding")
+            or parsed.get("query")
+            or parsed.get("retrieval_query")
+            or parsed.get("semantic_description")
+            or parsed.get("description")
+        )
+        q_lab = scalar_text(parsed.get("q_lab") or parsed.get("label_query"))
+        q_def = scalar_text(parsed.get("q_def") or parsed.get("definition_query"))
+
+    if not grounding:
+        grounding, parse_ok = parse_query_description(raw_output, fallback)
+    grounding = grounding or fallback
+    q_def = q_def or grounding
+    q_lab = q_lab or compact_label_query(grounding)
+    return {
+        "grounding": normalize_space(grounding),
+        "q_lab": normalize_space(q_lab),
+        "q_def": normalize_space(q_def),
+    }, bool(parse_ok and grounding)
+
+
+def build_dual_grounding_messages(
+    example: Example,
+    context_max_chars: int,
+    extra_instructions: str = "",
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    user = f"""Generate a semantic interpretation of financial evidence for retrieving the correct US-GAAP XBRL taxonomy concept.
+
+Return JSON only with this schema:
+{{"grounding": "free-text interpretation of the evidence", "q_lab": "compact label-form query", "q_def": "definition-style retrieval sentence"}}
+
+Formatting:
+- grounding should describe what the evidence expresses.
+- {Q_LAB_FORMATTING_INSTRUCTION}
+- q_def should be one definition-style sentence expressing the same interpretation.
+
+Evidence:
+{evidence}
+{extra_instructions}
+
+Rules:
+- Do not name a specific US-GAAP tag unless it is explicitly present in the source context.
+- Do not include explanations or markdown."""
+    return [
+        {"role": "system", "content": "You create US-GAAP grounding interpretations and retrieval query surfaces."},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_parallel_diversity_messages(
+    example: Example,
+    prior_interpretations: list[str],
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    if prior_interpretations:
+        prior_text = "\n".join(f"- {item}" for item in prior_interpretations)
+        diversity_block = f"""
+You have already produced the following interpretations of this evidence:
+{prior_text}
+
+Produce a new interpretation that differs from all of them in substance, not only in wording. A different interpretation resolves the evidence's ambiguity differently: for example a different reading of what the row and column jointly denote, a different temporal framing, a different aggregation level, or a different measurement basis.
+
+Constraints:
+- Do not contradict anything the evidence states explicitly.
+- Do not invent attribute values the evidence gives no support for; if a dimension is genuinely unsupported, leave it out of the interpretation rather than guessing.
+- The new interpretation must be one you consider plausible, not merely different."""
+    else:
+        diversity_block = """
+This is the first interpretation. Produce the most plausible retrieval interpretation supported by the evidence."""
+    return build_dual_grounding_messages(example, context_max_chars, extra_instructions=diversity_block)
 
 
 def load_existing_query_descriptions(path: Path) -> dict[int, dict[str, Any]]:
@@ -1856,6 +1996,70 @@ def make_round_record(
     return record
 
 
+def retrieve_dual_observation(
+    retriever: TaxonomyRetriever,
+    example: Example,
+    surfaces: dict[str, str],
+    round_idx: int,
+    top_k: int,
+    rrf_kappa: float,
+    llm_calls: list[dict[str, Any]] | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    q_lab = normalize_space(surfaces.get("q_lab"))
+    q_def = normalize_space(surfaces.get("q_def"))
+    grounding = normalize_space(surfaces.get("grounding") or q_def or q_lab)
+    query_lab = retrieval_query_from_grounding(example, q_lab or grounding)
+    query_def = retrieval_query_from_grounding(example, q_def or grounding)
+    candidates_lab = retrieve_candidates(retriever, query_lab, example.entity_type, top_k)
+    candidates_def = retrieve_candidates(retriever, query_def, example.entity_type, top_k)
+    fused = fuse_round_candidates(
+        [
+            {"round": 1, "candidates": candidates_lab},
+            {"round": 2, "candidates": candidates_def},
+        ],
+        top_k,
+        rrf_kappa,
+    )
+    record: dict[str, Any] = {
+        "round": round_idx,
+        "grounding": grounding,
+        "q_lab": q_lab,
+        "q_def": q_def,
+        "query": normalize_space(f"{query_lab} || {query_def}"),
+        "query_lab": query_lab,
+        "query_def": query_def,
+        "candidates_q_lab": candidates_lab,
+        "candidates_q_def": candidates_def,
+        "candidates_fused": fused,
+        "candidates": fused,
+        "retrieval_calls": 2,
+        "fusion": "per_hypothesis_dual_rrf",
+    }
+    if llm_calls:
+        record["llm_calls"] = llm_calls
+    if extra_fields:
+        record.update(extra_fields)
+    return record
+
+
+def mean_top_score(candidates: list[dict[str, Any]], top_m: int) -> float:
+    selected = candidates[:top_m]
+    if not selected:
+        return 0.0
+    scores = [
+        float(
+            candidate.get("rrf_score")
+            if candidate.get("rrf_score") is not None
+            else candidate.get("bm25_score")
+            if candidate.get("bm25_score") is not None
+            else 0.0
+        )
+        for candidate in selected
+    ]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 def sum_llm_usage(rounds: list[dict[str, Any]]) -> tuple[int, int, int]:
     calls = [
         call
@@ -2075,6 +2279,686 @@ def build_freeform_method_record(
 def candidate_reward(candidates: list[dict[str, Any]], gold_tags: list[str]) -> float:
     rank = first_gold_rank([candidate["tag"] for candidate in candidates], gold_tags)
     return 0.0 if rank is None else 1.0 / rank
+
+
+def log_discount_reward(candidates: list[dict[str, Any]], gold_tags: list[str]) -> float:
+    rank = first_gold_rank([candidate["tag"] for candidate in candidates], gold_tags)
+    return 0.0 if rank is None else 1.0 / math.log2(rank + 1.0)
+
+
+def pairwise_candidate_overlap(rounds: list[dict[str, Any]], top_k: int) -> float | None:
+    if len(rounds) < 2:
+        return None
+    values = []
+    for left_idx in range(len(rounds)):
+        left = {candidate["tag"] for candidate in rounds[left_idx].get("candidates", [])[:top_k]}
+        for right_idx in range(left_idx + 1, len(rounds)):
+            right = {candidate["tag"] for candidate in rounds[right_idx].get("candidates", [])[:top_k]}
+            union = left | right
+            values.append(len(left & right) / len(union) if union else 0.0)
+    return round(sum(values) / len(values), 6) if values else None
+
+
+def coverage_after_rounds(rounds: list[dict[str, Any]], gold_tags: list[str]) -> dict[str, bool]:
+    seen: set[str] = set()
+    curve: dict[str, bool] = {}
+    for idx, round_record in enumerate(rounds, start=1):
+        seen.update(candidate["tag"] for candidate in round_record.get("candidates", []))
+        curve[str(idx)] = any(tag in set(gold_tags) for tag in seen)
+    return curve
+
+
+def build_freeform_feedback_messages(
+    example: Example,
+    grounding: str,
+    candidates: list[dict[str, Any]],
+    context_max_chars: int,
+    doc_max_chars: int,
+    feedback_candidate_count: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    candidate_text = format_feedback_candidates(candidates, example.entity_type, feedback_candidate_count, doc_max_chars)
+    user = f"""Critique a free-text grounding interpretation using the retrieved taxonomy neighborhood.
+
+Return concise free text. Do not identify a gold concept. Explain what semantic direction looks supported, what looks mismatched, and what the next rewrite should attend to.
+
+Evidence:
+{evidence}
+
+Current grounding:
+{grounding}
+
+Retrieved concepts:
+{candidate_text}"""
+    return [
+        {"role": "system", "content": "You critique US-GAAP grounding interpretations using retrieved-neighborhood feedback."},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_freeform_revision_messages(
+    example: Example,
+    grounding: str,
+    feedback_text: str,
+    arm: str,
+    previous_groundings: list[str],
+    memories: list[dict[str, Any]],
+    context_max_chars: int,
+) -> list[dict[str, str]]:
+    evidence = serialize_evidence(example, context_max_chars)
+    previous = "\n".join(f"- {item}" for item in previous_groundings) or "None."
+    memory_text = json.dumps(
+        [
+            {
+                "arm": memory.get("arm"),
+                "feedback": memory.get("feedback_text"),
+                "semantic_difference": memory.get("semantic_difference"),
+                "delta_reward": memory.get("delta_reward"),
+            }
+            for memory in memories
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    user = f"""Revise a free-text grounding interpretation for retrieving the correct US-GAAP XBRL taxonomy concept.
+
+Selected rewrite strategy: {arm}
+Strategy instruction: {FREEFORM_REWRITE_INSTRUCTIONS.get(arm, FREEFORM_REWRITE_INSTRUCTIONS["freeform_revise"])}
+
+Return JSON only with this schema:
+{{"grounding": "revised free-text interpretation", "q_lab": "compact label-form query", "q_def": "definition-style retrieval sentence", "semantic_difference": "how this differs from the previous grounding"}}
+
+Formatting:
+- {Q_LAB_FORMATTING_INSTRUCTION}
+- q_def should be one definition-style sentence expressing the same interpretation.
+
+Evidence:
+{evidence}
+
+Current grounding:
+{grounding}
+
+Critique:
+{feedback_text}
+
+Previously tested groundings:
+{previous}
+
+Relevant contrastive memories:
+{memory_text}
+
+Rules:
+- Apply the selected rewrite strategy.
+- State how the new grounding differs from previously tested groundings.
+- Do not name a specific US-GAAP tag unless it is explicitly present in the source context.
+- Do not include markdown."""
+    return [
+        {"role": "system", "content": "You revise US-GAAP grounding interpretations with generic rewrite strategies."},
+        {"role": "user", "content": user},
+    ]
+
+
+def freeform_surface_features(example: Example, grounding: str, feedback_text: str, novelty: float, round_idx: int, prior_arms: list[str]) -> dict[str, float]:
+    grounding_tokens = tokenize(grounding)
+    feedback_tokens = set(tokenize(feedback_text))
+    text = grounding.lower()
+    aggregation_cues = {"total", "subtotal", "aggregate", "net", "gross", "average", "consolidated"}
+    temporal_cues = {"current", "noncurrent", "year", "month", "quarter", "annual", "duration", "instant", "ended"}
+    scope_cues = {"segment", "geography", "plan", "class", "subsidiary", "member"}
+    return {
+        "bias": 1.0,
+        "is_table": 1.0 if example.input_type == "table" else 0.0,
+        "is_text": 1.0 if example.input_type == "text" else 0.0,
+        "is_monetary": 1.0 if "monetary" in example.entity_type.lower() else 0.0,
+        "is_shares": 1.0 if "share" in example.entity_type.lower() else 0.0,
+        "token_count_lt_12": 1.0 if len(grounding_tokens) < 12 else 0.0,
+        "token_count_gt_30": 1.0 if len(grounding_tokens) > 30 else 0.0,
+        "has_temporal_cue": 1.0 if any(cue in text for cue in temporal_cues) else 0.0,
+        "has_aggregation_cue": 1.0 if any(cue in text for cue in aggregation_cues) else 0.0,
+        "has_scope_cue": 1.0 if any(cue in text for cue in scope_cues) else 0.0,
+        "critique_mismatch_flag": 1.0 if feedback_tokens & {"wrong", "mismatch", "mismatched", "different", "irrelevant"} else 0.0,
+        "neighborhood_novelty": float(novelty),
+        "round_idx": float(round_idx),
+        "prior_arm_count": float(len(prior_arms)),
+    }
+
+
+class DiagonalLinTS:
+    def __init__(self, arms: tuple[str, ...], feature_names: list[str], ridge: float, alpha: float, seed: int) -> None:
+        self.arms = arms
+        self.feature_names = feature_names
+        self.ridge = ridge
+        self.alpha = alpha
+        self.rng = random.Random(seed)
+        self.a = {arm: [ridge for _ in feature_names] for arm in arms}
+        self.b = {arm: [0.0 for _ in feature_names] for arm in arms}
+        self.n_updates = Counter()
+
+    def vectorize(self, features: dict[str, float]) -> list[float]:
+        return [float(features.get(name, 0.0)) for name in self.feature_names]
+
+    def sample_score(self, arm: str, x: list[float]) -> float:
+        score = 0.0
+        for idx, value in enumerate(x):
+            mean = self.b[arm][idx] / self.a[arm][idx]
+            stdev = self.alpha / math.sqrt(self.a[arm][idx])
+            score += self.rng.gauss(mean, stdev) * value
+        return score
+
+    def mean_score(self, arm: str, x: list[float]) -> float:
+        return sum((self.b[arm][idx] / self.a[arm][idx]) * value for idx, value in enumerate(x))
+
+    def update(self, arm: str, x: list[float], reward: float) -> None:
+        for idx, value in enumerate(x):
+            self.a[arm][idx] += value * value
+            self.b[arm][idx] += reward * value
+        self.n_updates[arm] += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            arm: {
+                "mu": [round(self.b[arm][idx] / self.a[arm][idx], 8) for idx in range(len(self.feature_names))],
+                "sigma_diag": [round(1.0 / self.a[arm][idx], 8) for idx in range(len(self.feature_names))],
+                "n_updates": int(self.n_updates[arm]),
+            }
+            for arm in self.arms
+        }
+
+
+def memory_similarity(query_text: str, memory: dict[str, Any]) -> float:
+    left = set(tokenize(query_text))
+    right = set(tokenize(memory.get("search_text", "")))
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def retrieve_freeform_memories(
+    memory_store: list[dict[str, Any]],
+    example: Example,
+    grounding: str,
+    feedback_text: str,
+    arm: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    current = normalize_space(f"{serialize_evidence(example, 1200)} {grounding} {feedback_text} {arm}")
+    compatible = [
+        memory
+        for memory in memory_store
+        if memory.get("input_type") == example.input_type
+        and memory.get("type") == example.entity_type
+        and memory.get("source_sample_idx") != example.source_sample_idx
+        and memory.get("arm") == arm
+    ]
+    if not compatible:
+        compatible = [
+            memory
+            for memory in memory_store
+            if memory.get("input_type") == example.input_type
+            and memory.get("source_sample_idx") != example.source_sample_idx
+        ]
+    compatible.sort(key=lambda memory: memory_similarity(current, memory), reverse=True)
+    positives = [memory for memory in compatible if float(memory.get("delta_reward", 0.0)) > 0.0]
+    negatives = [memory for memory in compatible if float(memory.get("delta_reward", 0.0)) <= 0.0]
+    return (positives[:top_k] + negatives[:top_k])[: 2 * top_k]
+
+
+def surface_overlap(left: dict[str, str], right: dict[str, str]) -> float:
+    left_tokens = set(tokenize(f"{left.get('q_lab', '')} {left.get('q_def', '')}"))
+    right_tokens = set(tokenize(f"{right.get('q_lab', '')} {right.get('q_def', '')}"))
+    union = left_tokens | right_tokens
+    return len(left_tokens & right_tokens) / len(union) if union else 0.0
+
+
+def build_parallel_diversity_method_record(
+    args: argparse.Namespace,
+    generator: QueryGenerator,
+    retriever: TaxonomyRetriever,
+    example: Example,
+) -> dict[str, Any]:
+    start_time = time.monotonic()
+    rounds: list[dict[str, Any]] = []
+    prior_interpretations: list[str] = []
+    fallback = build_direct_query(example)
+
+    for round_idx in range(1, args.retrieval_rounds + 1):
+        prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+            generator.tokenizer,
+            lambda ctx_chars, prior=list(prior_interpretations): build_parallel_diversity_messages(
+                example,
+                prior,
+                ctx_chars,
+            ),
+            context_max_chars=args.query_context_max_chars,
+            max_input_tokens=args.query_max_input_tokens,
+        )
+        raw_output = generator.generate_one(prompt)
+        surfaces, parse_ok = parse_grounding_surfaces(raw_output, fallback)
+        call = llm_call_record(
+            "parallel_sampling_diversity",
+            raw_output=raw_output,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=generator.count_text_tokens(raw_output),
+            parse_ok=parse_ok,
+            backend=generator.backend,
+            model_name=generator.model_name,
+            extra_fields={
+                "used_context_max_chars": used_context_chars,
+                "temperature": args.query_temperature,
+                "prompt_id": "sequential_exclusion_v1",
+                "prior_interpretations": list(prior_interpretations),
+            },
+        )
+        round_record = retrieve_dual_observation(
+            retriever,
+            example,
+            surfaces,
+            round_idx,
+            args.top_k,
+            args.rrf_kappa,
+            [call],
+            extra_fields={
+                "hypothesis_index": round_idx,
+                "prior_interpretations": list(prior_interpretations),
+                "temperature": args.query_temperature,
+                "prompt_id": "sequential_exclusion_v1",
+            },
+        )
+        rounds.append(round_record)
+        prior_interpretations.append(surfaces["grounding"])
+
+    total_llm_calls, total_prompt_tokens, total_completion_tokens = sum_llm_usage(rounds)
+    return finalize_candidate_record(
+        example,
+        query_mode="parallel_sampling_diversity",
+        rounds=rounds,
+        top_k=args.top_k,
+        rrf_kappa=args.rrf_kappa,
+        total_llm_calls=total_llm_calls,
+        total_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        wall_time=time.monotonic() - start_time,
+        extra_fields={
+            "rrf_kappa": args.rrf_kappa,
+            "fusion_mode": "per_hypothesis_then_across",
+            "generation_design": "sequential_exclusion_B_calls",
+            "mean_pairwise_neighborhood_overlap_at_200": pairwise_candidate_overlap(rounds, args.top_k),
+            "coverage_after_hypothesis": coverage_after_rounds(rounds, example.gold_tags),
+            "temperature_source": "QUERY_TEMPERATURE; should match stochastic parallel sampling config",
+        },
+    )
+
+
+def build_freeform_initial_surfaces(
+    args: argparse.Namespace,
+    generator: QueryGenerator,
+    example: Example,
+    initial_idx: int,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    fallback = build_direct_query(example)
+    prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+        generator.tokenizer,
+        lambda ctx_chars: build_dual_grounding_messages(
+            example,
+            ctx_chars,
+            extra_instructions=f"\nThis is stochastic initial grounding {initial_idx}. Produce one plausible interpretation.",
+        ),
+        context_max_chars=args.query_context_max_chars,
+        max_input_tokens=args.query_max_input_tokens,
+    )
+    raw_output = generator.generate_one(prompt)
+    surfaces, parse_ok = parse_grounding_surfaces(raw_output, fallback)
+    call = llm_call_record(
+        "bandit_freeform_initial",
+        raw_output=raw_output,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=generator.count_text_tokens(raw_output),
+        parse_ok=parse_ok,
+        backend=generator.backend,
+        model_name=generator.model_name,
+        extra_fields={"used_context_max_chars": used_context_chars, "initial_idx": initial_idx},
+    )
+    return surfaces, call
+
+
+def build_freeform_feedback(
+    args: argparse.Namespace,
+    generator: QueryGenerator,
+    example: Example,
+    grounding: str,
+    candidates: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    prompt, prompt_tokens, used_context_chars, used_doc_chars = build_feedback_prompt_under_query_budget(
+        generator.tokenizer,
+        lambda ctx_chars, doc_chars: build_freeform_feedback_messages(
+            example,
+            grounding,
+            candidates,
+            ctx_chars,
+            doc_chars,
+            args.feedback_candidate_count,
+        ),
+        context_max_chars=args.query_context_max_chars,
+        doc_max_chars=args.candidate_doc_max_chars,
+        max_input_tokens=args.query_max_input_tokens,
+    )
+    raw_output = generator.generate_one(prompt)
+    feedback_text = clean_model_text(raw_output)
+    call = llm_call_record(
+        "bandit_freeform_feedback",
+        raw_output=raw_output,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=generator.count_text_tokens(raw_output),
+        parse_ok=bool(feedback_text),
+        backend=generator.backend,
+        model_name=generator.model_name,
+        extra_fields={
+            "used_context_max_chars": used_context_chars,
+            "used_candidate_doc_max_chars": used_doc_chars,
+        },
+    )
+    return feedback_text, call
+
+
+def build_freeform_revision(
+    args: argparse.Namespace,
+    generator: QueryGenerator,
+    example: Example,
+    grounding: str,
+    feedback_text: str,
+    arm: str,
+    previous_groundings: list[str],
+    memories: list[dict[str, Any]],
+) -> tuple[dict[str, str], str, dict[str, Any]]:
+    fallback = grounding or build_direct_query(example)
+    prompt, prompt_tokens, used_context_chars = build_prompt_under_query_budget(
+        generator.tokenizer,
+        lambda ctx_chars: build_freeform_revision_messages(
+            example,
+            grounding,
+            feedback_text,
+            arm,
+            previous_groundings,
+            memories,
+            ctx_chars,
+        ),
+        context_max_chars=args.query_context_max_chars,
+        max_input_tokens=args.query_max_input_tokens,
+    )
+    raw_output = generator.generate_one(prompt)
+    surfaces, parse_ok = parse_grounding_surfaces(raw_output, fallback)
+    parsed, _ = parse_json_object(raw_output)
+    semantic_difference = scalar_text(parsed.get("semantic_difference")) if parsed else ""
+    call = llm_call_record(
+        "bandit_freeform_revision",
+        raw_output=raw_output,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=generator.count_text_tokens(raw_output),
+        parse_ok=parse_ok,
+        backend=generator.backend,
+        model_name=generator.model_name,
+        extra_fields={"used_context_max_chars": used_context_chars, "arm": arm},
+    )
+    return surfaces, semantic_difference, call
+
+
+def build_bandit_freeform_method_record(
+    args: argparse.Namespace,
+    query_mode: str,
+    generator: QueryGenerator,
+    retriever: TaxonomyRetriever,
+    example: Example,
+    memory_store: list[dict[str, Any]],
+    posterior: DiagonalLinTS,
+) -> dict[str, Any]:
+    start_time = time.monotonic()
+    arms = FREEFORM_REWRITE_ARMS_10 if query_mode == "bandit_freeform_10arm" else FREEFORM_REWRITE_ARMS
+    rounds: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    previous_groundings: list[str] = []
+    executed_surfaces: list[dict[str, str]] = []
+
+    for initial_idx in range(1, args.bandit_initial_groundings + 1):
+        surfaces, call = build_freeform_initial_surfaces(args, generator, example, initial_idx)
+        round_record = retrieve_dual_observation(
+            retriever,
+            example,
+            surfaces,
+            initial_idx,
+            args.top_k,
+            args.rrf_kappa,
+            [call],
+            extra_fields={"initial_grounding_idx": initial_idx, "phase": "initial"},
+        )
+        rounds.append(round_record)
+        previous_groundings.append(surfaces["grounding"])
+        executed_surfaces.append(surfaces)
+
+    initial_scores = [mean_top_score(round_record["candidates"], args.feedback_candidate_count) for round_record in rounds]
+    carried_idx = max(range(len(rounds)), key=lambda idx: (initial_scores[idx], -idx))
+    current_surfaces = {
+        "grounding": rounds[carried_idx]["grounding"],
+        "q_lab": rounds[carried_idx]["q_lab"],
+        "q_def": rounds[carried_idx]["q_def"],
+    }
+    prior_arms: list[str] = []
+
+    for step_idx in range(1, args.retrieval_rounds):
+        latest_union = fuse_round_candidates(
+            [{"round": idx + 1, "candidates": round_record["candidates"]} for idx, round_record in enumerate(rounds)],
+            args.top_k,
+            args.rrf_kappa,
+        )
+        feedback_text, feedback_call = build_freeform_feedback(
+            args,
+            generator,
+            example,
+            current_surfaces["grounding"],
+            latest_union,
+        )
+        novelty = neighborhood_novelty(latest_union, rounds)
+        features = freeform_surface_features(
+            example,
+            current_surfaces["grounding"],
+            feedback_text,
+            novelty,
+            step_idx,
+            prior_arms,
+        )
+        x = posterior.vectorize(features)
+        scores = {arm: posterior.sample_score(arm, x) for arm in arms}
+        ranked_arms = sorted(arms, key=lambda arm: scores[arm], reverse=True)
+        selected_arm = ranked_arms[0]
+        runner_up_arm = ranked_arms[1] if len(ranked_arms) > 1 else None
+        gate_rejections = 0
+        selected_surfaces: dict[str, str] | None = None
+        semantic_difference = ""
+        revision_call: dict[str, Any] | None = None
+        selected_round: dict[str, Any] | None = None
+
+        for arm in ranked_arms[: max(args.bandit_max_gate_rejections + 1, 1)]:
+            memories = retrieve_freeform_memories(
+                memory_store,
+                example,
+                current_surfaces["grounding"],
+                feedback_text,
+                arm,
+                args.memory_top_k,
+            )
+            candidate_surfaces, candidate_difference, candidate_call = build_freeform_revision(
+                args,
+                generator,
+                example,
+                current_surfaces["grounding"],
+                feedback_text,
+                arm,
+                previous_groundings,
+                memories,
+            )
+            overlap = max((surface_overlap(candidate_surfaces, seen) for seen in executed_surfaces), default=0.0)
+            if overlap <= args.bandit_query_overlap_threshold:
+                selected_arm = arm
+                selected_surfaces = candidate_surfaces
+                semantic_difference = candidate_difference
+                revision_call = candidate_call
+                break
+            gate_rejections += 1
+
+        if selected_surfaces is None or revision_call is None:
+            break
+
+        selected_round = retrieve_dual_observation(
+            retriever,
+            example,
+            selected_surfaces,
+            len(rounds) + 1,
+            args.top_k,
+            args.rrf_kappa,
+            [feedback_call, revision_call],
+            extra_fields={
+                "phase": "bandit_revision",
+                "step_idx": step_idx,
+                "psi": features,
+                "psi_feature_names": posterior.feature_names,
+                "slate": list(arms),
+                "arm_selected": selected_arm,
+                "arm_runner_up": runner_up_arm,
+                "selection_scores": {arm: round(scores[arm], 8) for arm in arms},
+                "gate_rejections": gate_rejections,
+                "novelty_n": novelty,
+                "critique_text": feedback_text,
+                "semantic_difference": semantic_difference,
+                "reward_temporal": None,
+                "reward_replay": None,
+                "reward_final": None,
+            },
+        )
+        before_reward = log_discount_reward(latest_union, example.gold_tags)
+        after_union = fuse_round_candidates(
+            [{"round": idx + 1, "candidates": round_record["candidates"]} for idx, round_record in enumerate(rounds + [selected_round])],
+            args.top_k,
+            args.rrf_kappa,
+        )
+        after_reward = log_discount_reward(after_union, example.gold_tags)
+        delta_reward = after_reward - before_reward
+        replay_delta = 0.0
+        replay_round: dict[str, Any] | None = None
+        if runner_up_arm and args.bandit_replay:
+            memories = retrieve_freeform_memories(
+                memory_store,
+                example,
+                current_surfaces["grounding"],
+                feedback_text,
+                runner_up_arm,
+                args.memory_top_k,
+            )
+            replay_surfaces, replay_difference, replay_call = build_freeform_revision(
+                args,
+                generator,
+                example,
+                current_surfaces["grounding"],
+                feedback_text,
+                runner_up_arm,
+                previous_groundings,
+                memories,
+            )
+            replay_round = retrieve_dual_observation(
+                retriever,
+                example,
+                replay_surfaces,
+                len(rounds) + 1,
+                args.top_k,
+                args.rrf_kappa,
+                [replay_call],
+                extra_fields={
+                    "phase": "counterfactual_replay",
+                    "arm_runner_up": runner_up_arm,
+                    "semantic_difference": replay_difference,
+                },
+            )
+            replay_union = fuse_round_candidates(
+                [{"round": idx + 1, "candidates": round_record["candidates"]} for idx, round_record in enumerate(rounds + [replay_round])],
+                args.top_k,
+                args.rrf_kappa,
+            )
+            replay_delta = log_discount_reward(replay_union, example.gold_tags) - before_reward
+
+        reward_final = args.bandit_reward_alpha * delta_reward + (1.0 - args.bandit_reward_alpha) * (delta_reward - replay_delta)
+        selected_round["reward_temporal"] = round(delta_reward, 8)
+        selected_round["reward_replay"] = round(delta_reward - replay_delta, 8)
+        selected_round["reward_final"] = round(reward_final, 8)
+        if replay_round is not None:
+            selected_round["counterfactual_replay_round"] = replay_round
+        posterior.update(selected_arm, x, reward_final)
+        transitions.append(
+            {
+                "round": selected_round["round"],
+                "arm": selected_arm,
+                "runner_up_arm": runner_up_arm,
+                "psi": features,
+                "feedback_text": feedback_text,
+                "grounding_before": current_surfaces["grounding"],
+                "grounding_after": selected_surfaces["grounding"],
+                "semantic_difference": semantic_difference,
+                "reward_before": round(before_reward, 8),
+                "reward_after": round(after_reward, 8),
+                "delta_reward": round(delta_reward, 8),
+                "reward_final": round(reward_final, 8),
+            }
+        )
+        memory_store.append(
+            {
+                "input_type": example.input_type,
+                "type": example.entity_type,
+                "source_sample_idx": example.source_sample_idx,
+                "arm": selected_arm,
+                "feedback_text": feedback_text,
+                "semantic_difference": semantic_difference,
+                "delta_reward": round(delta_reward, 8),
+                "search_text": normalize_space(
+                    f"{evidence_profile(example)} {current_surfaces['grounding']} {feedback_text} {selected_arm} {semantic_difference}"
+                ),
+            }
+        )
+        rounds.append(selected_round)
+        previous_groundings.append(selected_surfaces["grounding"])
+        executed_surfaces.append(selected_surfaces)
+        current_surfaces = selected_surfaces
+        prior_arms.append(selected_arm)
+
+    total_llm_calls, total_prompt_tokens, total_completion_tokens = sum_llm_usage(rounds)
+    return finalize_candidate_record(
+        example,
+        query_mode=query_mode,
+        rounds=rounds,
+        top_k=args.top_k,
+        rrf_kappa=args.rrf_kappa,
+        total_llm_calls=total_llm_calls,
+        total_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        wall_time=time.monotonic() - start_time,
+        extra_fields={
+            "rrf_kappa": args.rrf_kappa,
+            "bandit_freeform_manifest": {
+                "arms": list(arms),
+                "n_arms": len(arms),
+                "initial_groundings": args.bandit_initial_groundings,
+                "round_budget": args.retrieval_rounds,
+                "renderer": "model_emitted_dual",
+                "beta": 0.0,
+                "use_memory": True,
+                "use_replay": bool(args.bandit_replay),
+                "use_admissibility": False,
+                "use_factorized_state": False,
+                "carry_forward_rule": "argmax mean top-10 fused score",
+                "psi_feature_names": posterior.feature_names,
+                "psi_dimensionality": len(posterior.feature_names),
+            },
+            "operator_transitions": transitions,
+            "posterior_snapshot": posterior.snapshot(),
+            "mean_pairwise_neighborhood_overlap_at_200": pairwise_candidate_overlap(rounds, args.top_k),
+            "coverage_after_round": coverage_after_rounds(rounds, example.gold_tags),
+        },
+    )
 
 
 def neighborhood_novelty(
@@ -2390,6 +3274,15 @@ def build_comparison_candidate_records(
     generator: QueryGenerator | None = None
     handle = None
     memory_store: list[dict[str, Any]] = []
+    bandit_memory_store: list[dict[str, Any]] = []
+    bandit_arms = FREEFORM_REWRITE_ARMS_10 if query_mode == "bandit_freeform_10arm" else FREEFORM_REWRITE_ARMS
+    bandit_posterior = DiagonalLinTS(
+        bandit_arms,
+        FREEFORM_FEATURE_NAMES,
+        ridge=args.bandit_posterior_ridge,
+        alpha=args.bandit_posterior_alpha,
+        seed=args.bandit_seed,
+    )
     try:
         if missing_examples:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2403,6 +3296,30 @@ def build_comparison_candidate_records(
                 records[example.example_idx] = record
                 if query_mode == "memory_guided_refinement":
                     append_memories_from_record(record, memory_store)
+                if query_mode in {"bandit_freeform", "bandit_freeform_10arm"}:
+                    for transition in record.get("operator_transitions", []):
+                        arm = transition.get("arm")
+                        if arm in bandit_arms:
+                            features = transition.get("psi", {})
+                            bandit_posterior.update(
+                                arm,
+                                bandit_posterior.vectorize(features if isinstance(features, dict) else {}),
+                                float(transition.get("reward_final", transition.get("delta_reward", 0.0)) or 0.0),
+                            )
+                            bandit_memory_store.append(
+                                {
+                                    "input_type": record.get("input_type"),
+                                    "type": record.get("type"),
+                                    "source_sample_idx": record.get("source_sample_idx"),
+                                    "arm": arm,
+                                    "feedback_text": transition.get("feedback_text", ""),
+                                    "semantic_difference": transition.get("semantic_difference", ""),
+                                    "delta_reward": transition.get("delta_reward", 0.0),
+                                    "search_text": normalize_space(
+                                        f"{record.get('input_type')} {record.get('type')} {transition.get('grounding_before', '')} {transition.get('feedback_text', '')} {arm}"
+                                    ),
+                                }
+                            )
                 continue
 
             if generator is None or handle is None:
@@ -2410,6 +3327,18 @@ def build_comparison_candidate_records(
 
             if query_mode in {"intrinsic_self_refinement", "retrieval_feedback_refinement", "parallel_sampling", "decomposed_retrieval"}:
                 record = build_freeform_method_record(args, query_mode, generator, retriever, example)
+            elif query_mode == "parallel_sampling_diversity":
+                record = build_parallel_diversity_method_record(args, generator, retriever, example)
+            elif query_mode in {"bandit_freeform", "bandit_freeform_10arm"}:
+                record = build_bandit_freeform_method_record(
+                    args,
+                    query_mode,
+                    generator,
+                    retriever,
+                    example,
+                    bandit_memory_store,
+                    bandit_posterior,
+                )
             elif query_mode in STRUCTURED_QUERY_MODES:
                 record = build_structured_method_record(
                     args,
@@ -2777,6 +3706,14 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Positive and negative operator memories shown for memory-guided refinement.",
     )
+    parser.add_argument("--bandit-initial-groundings", type=int, default=3)
+    parser.add_argument("--bandit-posterior-ridge", type=float, default=1.0)
+    parser.add_argument("--bandit-posterior-alpha", type=float, default=0.75)
+    parser.add_argument("--bandit-seed", type=int, default=20260728)
+    parser.add_argument("--bandit-query-overlap-threshold", type=float, default=0.85)
+    parser.add_argument("--bandit-max-gate-rejections", type=int, default=2)
+    parser.add_argument("--bandit-replay", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bandit-reward-alpha", type=float, default=0.5)
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test row limit.")
     parser.add_argument(
         "--query-mode",
@@ -2785,7 +3722,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Retrieval method. Public names include direct_retrieval, one_pass_grounding, "
             "intrinsic_self_refinement, retrieval_feedback_refinement, parallel_sampling, "
-            "decomposed_retrieval, operator_refinement, and memory_guided_refinement."
+            "parallel_sampling_diversity, decomposed_retrieval, operator_refinement, "
+            "memory_guided_refinement, bandit_freeform, and bandit_freeform_10arm."
         ),
     )
     parser.add_argument(

@@ -223,6 +223,7 @@ def run_tokenization_self_check(
 ) -> dict[str, Any]:
     records = []
     failures = []
+    label_rank1_failures = []
     seen: set[tuple[str, str]] = set()
     for example in examples:
         for gold in example.gold_tags:
@@ -242,7 +243,8 @@ def run_tokenization_self_check(
                 retrieve_candidates(retriever, concept.retrieval_text, concept.entity_type, 1)
             )
             retrieval_text_top_tag = normalize_tag(retrieval_text_candidates[0]["tag"]) if retrieval_text_candidates else None
-            passed = rank == 1
+            retrieval_text_rank1_passed = retrieval_text_top_tag == tag
+            label_rank1_passed = rank == 1
             record = {
                 "gold_concept_id": tag,
                 "entity_type": concept.entity_type,
@@ -251,20 +253,25 @@ def run_tokenization_self_check(
                 "top_tag": top_tag,
                 "gold_rank": rank,
                 "retrieval_text_top_tag": retrieval_text_top_tag,
-                "retrieval_text_rank1_passed": retrieval_text_top_tag == tag,
-                "passed": passed,
+                "retrieval_text_rank1_passed": retrieval_text_rank1_passed,
+                "label_rank1_passed": label_rank1_passed,
+                "passed": retrieval_text_rank1_passed,
             }
             records.append(record)
-            if not passed:
+            if not retrieval_text_rank1_passed:
                 failures.append(record)
+            if not label_rank1_passed:
+                label_rank1_failures.append(record)
     return {
         "passed": not failures,
-        "check": "gold_label_query_retrieves_self_at_rank_1",
-        "label_query_mode": "space_lower_tokenized",
+        "check": "taxonomy_retrieval_text_retrieves_self_at_rank_1",
+        "label_query_mode": "raw_tag_bm25_diagnostic",
         "fact_count": len(examples),
         "unique_gold_type_pairs": len(records),
         "failure_count": len(failures),
         "failures": failures[:100],
+        "label_rank1_failure_count": len(label_rank1_failures),
+        "label_rank1_failures": label_rank1_failures[:100],
         "records": records,
     }
 
