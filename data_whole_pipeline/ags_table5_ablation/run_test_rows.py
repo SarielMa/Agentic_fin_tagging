@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 _PARENT = Path(__file__).resolve().parent.parent
 if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
@@ -205,7 +207,10 @@ def main() -> None:
 
     def run_variant(name: str, config: AblationConfig) -> list[dict[str, Any]]:
         reset_consensus_cache()
-        return [evaluate(fact, config, normalization_map) for fact in facts_list]
+        return [
+            evaluate(fact, config, normalization_map)
+            for fact in tqdm(facts_list, desc=name, unit="fact")
+        ]
 
     variants: dict[str, list[dict[str, Any]]] = {}
     configs: dict[str, AblationConfig] = {}
@@ -278,7 +283,7 @@ def main() -> None:
     reset_consensus_cache()
     consensus_off_raw = [
         evaluate(fact, AblationConfig(name="beta0_raw_check", beta=0.0, scaling="raw"), normalization_map)
-        for fact in facts_list
+        for fact in tqdm(facts_list, desc="beta0_raw_check", unit="fact")
     ]
     beta0_raw_eq_range = all(
         a["candidate_tags"] == b["candidate_tags"]
