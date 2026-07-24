@@ -126,6 +126,12 @@ case "${QUERY_MODE}" in
   ags|frozen_ags|frozen_ags_grounding)
     DEFAULT_METHOD_DIR="qwen3_32b_frozen_ags"
     ;;
+  ags_seq|ags_sequential)
+    DEFAULT_METHOD_DIR="qwen3_32b_ags_seq"
+    ;;
+  ags_seq_random|ags_sequential_random)
+    DEFAULT_METHOD_DIR="qwen3_32b_ags_seq_random"
+    ;;
   *)
     DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
     ;;

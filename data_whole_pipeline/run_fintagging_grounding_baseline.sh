@@ -44,6 +44,12 @@ case "${QUERY_MODE}" in
   ags|frozen_ags|frozen_ags_grounding)
     DEFAULT_METHOD_DIR="qwen3_32b_frozen_ags"
     ;;
+  ags_seq|ags_sequential)
+    DEFAULT_METHOD_DIR="qwen3_32b_ags_seq"
+    ;;
+  ags_seq_random|ags_sequential_random)
+    DEFAULT_METHOD_DIR="qwen3_32b_ags_seq_random"
+    ;;
   *)
     DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
     ;;
@@ -98,6 +104,18 @@ LIMIT="${LIMIT:-}"
 NORMALIZATION_MAP="${NORMALIZATION_MAP:-}"
 LABEL_COVERAGE_POOL_MULTIPLIER="${LABEL_COVERAGE_POOL_MULTIPLIER:-0}"
 FROZEN_AGS_TOP_P="${FROZEN_AGS_TOP_P:-1.0}"
+AGS_SEQ_MAX_ROUNDS="${AGS_SEQ_MAX_ROUNDS:-4}"
+AGS_SEQ_SLATE_LIMIT="${AGS_SEQ_SLATE_LIMIT:-6}"
+AGS_SEQ_FEEDBACK_TOP_M="${AGS_SEQ_FEEDBACK_TOP_M:-10}"
+# Spec section 3: the gate stays off so the sequential arm reaches its full B=4 budget.
+AGS_SEQ_NOVELTY_GATE="${AGS_SEQ_NOVELTY_GATE:-0}"
+AGS_SEQ_NOVELTY_THRESHOLD="${AGS_SEQ_NOVELTY_THRESHOLD:-0.02}"
+AGS_SEQ_REWARD_ALPHA="${AGS_SEQ_REWARD_ALPHA:-0.5}"
+AGS_SEQ_POSTERIOR_RIDGE="${AGS_SEQ_POSTERIOR_RIDGE:-1.0}"
+AGS_SEQ_POSTERIOR_SIGMA="${AGS_SEQ_POSTERIOR_SIGMA:-1.0}"
+AGS_SEQ_POSTERIOR_NU="${AGS_SEQ_POSTERIOR_NU:-0.75}"
+AGS_SEQ_POSTERIOR_FORGETTING="${AGS_SEQ_POSTERIOR_FORGETTING:-0.995}"
+AGS_SEQ_SEED="${AGS_SEQ_SEED:-20260724}"
 
 # frozen_ags produces its own final ranking deterministically (fuse + agree rerank), but the
 # downstream listwise rerank still runs so the method is comparable to every other query mode
@@ -105,7 +123,7 @@ FROZEN_AGS_TOP_P="${FROZEN_AGS_TOP_P:-1.0}"
 # retrieval-only variant (those wrappers export RUN_RERANK unconditionally per MODE).
 # Structured hypotheses need more than the 128-token query default; bump it if unset.
 case "${QUERY_MODE}" in
-  ags|frozen_ags|frozen_ags_grounding)
+  ags|frozen_ags|frozen_ags_grounding|ags_seq|ags_sequential|ags_seq_random|ags_sequential_random)
     if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" ]]; then
       QUERY_MAX_NEW_TOKENS=512
     fi
@@ -165,8 +183,24 @@ ARGS=(
   --top-p "${TOP_P}"
   --label-coverage-pool-multiplier "${LABEL_COVERAGE_POOL_MULTIPLIER}"
   --frozen-ags-top-p "${FROZEN_AGS_TOP_P}"
+  --ags-seq-max-rounds "${AGS_SEQ_MAX_ROUNDS}"
+  --ags-seq-slate-limit "${AGS_SEQ_SLATE_LIMIT}"
+  --ags-seq-feedback-top-m "${AGS_SEQ_FEEDBACK_TOP_M}"
+  --ags-seq-novelty-threshold "${AGS_SEQ_NOVELTY_THRESHOLD}"
+  --ags-seq-reward-alpha "${AGS_SEQ_REWARD_ALPHA}"
+  --ags-seq-posterior-ridge "${AGS_SEQ_POSTERIOR_RIDGE}"
+  --ags-seq-posterior-sigma "${AGS_SEQ_POSTERIOR_SIGMA}"
+  --ags-seq-posterior-nu "${AGS_SEQ_POSTERIOR_NU}"
+  --ags-seq-posterior-forgetting "${AGS_SEQ_POSTERIOR_FORGETTING}"
+  --ags-seq-seed "${AGS_SEQ_SEED}"
   --log-every "${LOG_EVERY}"
 )
+
+if [[ "${AGS_SEQ_NOVELTY_GATE}" == "1" ]]; then
+  ARGS+=(--ags-seq-novelty-gate)
+else
+  ARGS+=(--no-ags-seq-novelty-gate)
+fi
 
 if [[ -n "${NORMALIZATION_MAP}" ]]; then
   ARGS+=(--normalization-map "${NORMALIZATION_MAP}")
@@ -237,6 +271,9 @@ echo "BANDIT_POSTERIOR_ALPHA: ${BANDIT_POSTERIOR_ALPHA}"
 echo "BANDIT_QUERY_OVERLAP_THRESHOLD: ${BANDIT_QUERY_OVERLAP_THRESHOLD}"
 echo "BANDIT_REPLAY        : ${BANDIT_REPLAY}"
 echo "QUERY_MODE           : ${QUERY_MODE}"
+echo "AGS_SEQ_MAX_ROUNDS   : ${AGS_SEQ_MAX_ROUNDS}"
+echo "AGS_SEQ_NOVELTY_GATE : ${AGS_SEQ_NOVELTY_GATE}"
+echo "AGS_SEQ_SEED         : ${AGS_SEQ_SEED}"
 echo "REUSE_CANDIDATES     : ${REUSE_CANDIDATES}"
 echo "TYPE_FILTER          : ${TYPE_FILTER}"
 echo "RUN_RERANK           : ${RUN_RERANK}"

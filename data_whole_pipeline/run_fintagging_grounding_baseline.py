@@ -79,6 +79,10 @@ QUERY_MODE_ALIASES = {
     "ags": "frozen_ags",
     "frozen_ags": "frozen_ags",
     "frozen_ags_grounding": "frozen_ags",
+    "ags_seq": "ags_seq",
+    "ags_sequential": "ags_seq",
+    "ags_seq_random": "ags_seq_random",
+    "ags_sequential_random": "ags_seq_random",
 }
 MULTI_ROUND_QUERY_MODES = {
     "intrinsic_self_refinement",
@@ -91,12 +95,17 @@ MULTI_ROUND_QUERY_MODES = {
     "bandit_freeform",
     "bandit_freeform_10arm",
     "frozen_ags",
+    "ags_seq",
+    "ags_seq_random",
 }
 LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
 STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
 # frozen_ags samples J structured hypotheses but runs no refinement loop; it produces its
 # own final ranking via deterministic fuse + rerank (see ags_frozen_grounding).
 FROZEN_AGS_QUERY_MODES = {"frozen_ags"}
+# The two sequential negative-control arms start from frozen_ags's round one and differ
+# from each other only in directive selection (see ags_sequential_arms).
+AGS_SEQ_QUERY_MODES = {"ags_seq", "ags_seq_random"}
 DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
 OPERATOR_LIBRARY = (
     "direct_label",
@@ -3363,6 +3372,47 @@ def build_comparison_candidate_records(
     # spec's startup assertions before any example is processed.
     frozen_ags_config = None
     frozen_ags_normalization_map = None
+    ags_seq_config = None
+    ags_seq_bank = None
+    build_ags_seq_method_record = None
+    if query_mode in AGS_SEQ_QUERY_MODES:
+        # The sequential arms reuse frozen_ags's retrieval scaling and startup gate, then
+        # add the controller loop on top; the posterior bank spans the whole stream.
+        from ags_frozen_grounding import FrozenAgsConfig, frozen_ags_startup_assertions
+        from ags_sequential_arms import (
+            OPERATORS,
+            AgsSeqConfig,
+            SequentialPosteriorBank,
+            build_ags_seq_method_record,
+        )
+        from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map
+
+        frozen_ags_config = FrozenAgsConfig()
+        retriever.label_coverage_weight = frozen_ags_config.label_coverage_weight
+        retriever.label_coverage_pool_multiplier = args.label_coverage_pool_multiplier
+        frozen_ags_normalization_map = load_normalization_map(
+            args.normalization_map or DEFAULT_NORMALIZATION_MAP
+        )
+        assertion_report = frozen_ags_startup_assertions(
+            retriever, taxonomy, frozen_ags_normalization_map, frozen_ags_config
+        )
+        print(f"{query_mode} startup assertions passed: {json.dumps(assertion_report)}", flush=True)
+        ags_seq_config = AgsSeqConfig(
+            frozen=frozen_ags_config,
+            max_rounds=args.ags_seq_max_rounds,
+            slate_limit=args.ags_seq_slate_limit,
+            feedback_top_m=args.ags_seq_feedback_top_m,
+            novelty_gate=args.ags_seq_novelty_gate,
+            novelty_threshold=args.ags_seq_novelty_threshold,
+            reward_alpha=args.ags_seq_reward_alpha,
+            posterior_ridge=args.ags_seq_posterior_ridge,
+            posterior_sigma=args.ags_seq_posterior_sigma,
+            posterior_nu=args.ags_seq_posterior_nu,
+            posterior_forgetting=args.ags_seq_posterior_forgetting,
+            seed=args.ags_seq_seed,
+        )
+        ags_seq_bank = SequentialPosteriorBank(OPERATORS, ags_seq_config)
+
     if query_mode in FROZEN_AGS_QUERY_MODES:
         from ags_frozen_grounding import (
             FrozenAgsConfig,
@@ -3411,6 +3461,9 @@ def build_comparison_candidate_records(
                 records[example.example_idx] = record
                 if query_mode == "memory_guided_refinement":
                     append_memories_from_record(record, memory_store)
+                if ags_seq_bank is not None:
+                    # Replay the stored credits so a resumed run rebuilds the same bank.
+                    ags_seq_bank.ingest_record(record)
                 if query_mode in {"bandit_freeform", "bandit_freeform_10arm"}:
                     for transition in record.get("operator_transitions", []):
                         arm = transition.get("arm")
@@ -3463,6 +3516,17 @@ def build_comparison_candidate_records(
                     example,
                     memory_store=memory_store,
                 )
+            elif query_mode in AGS_SEQ_QUERY_MODES:
+                record = build_ags_seq_method_record(
+                    args,
+                    query_mode,
+                    generator,
+                    retriever,
+                    example,
+                    frozen_ags_normalization_map,
+                    ags_seq_bank,
+                    cfg=ags_seq_config,
+                )
             elif query_mode in FROZEN_AGS_QUERY_MODES:
                 record = build_frozen_ags_method_record(
                     args,
@@ -3487,6 +3551,13 @@ def build_comparison_candidate_records(
             handle.close()
         if generator is not None:
             generator.close()
+
+    if ags_seq_bank is not None:
+        snapshot_path = trace_path.parent / f"{query_mode}_posteriors.json"
+        snapshot_path.write_text(
+            json.dumps(ags_seq_bank.snapshot(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(f"Wrote {query_mode} posterior snapshot: {snapshot_path}", flush=True)
 
     return [records[example.example_idx] for example in examples if example.example_idx in records]
 
@@ -3857,6 +3928,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bandit-max-gate-rejections", type=int, default=2)
     parser.add_argument("--bandit-replay", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bandit-reward-alpha", type=float, default=0.5)
+    # Sequential control arms (ags_seq / ags_seq_random); see ags_seq_arms_spec.md.
+    parser.add_argument("--ags-seq-max-rounds", type=int, default=4, help="B, counting AGS's round one.")
+    parser.add_argument("--ags-seq-slate-limit", type=int, default=6, help="L, directives per round.")
+    parser.add_argument("--ags-seq-feedback-top-m", type=int, default=10)
+    parser.add_argument(
+        "--ags-seq-novelty-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pre-retrieval token-Jaccard gate. Off by default (spec section 3): with it on "
+        "the arm terminates early and never spends its own budget.",
+    )
+    parser.add_argument("--ags-seq-novelty-threshold", type=float, default=0.02)
+    parser.add_argument("--ags-seq-reward-alpha", type=float, default=0.5)
+    parser.add_argument("--ags-seq-posterior-ridge", type=float, default=1.0)
+    parser.add_argument("--ags-seq-posterior-sigma", type=float, default=1.0)
+    parser.add_argument("--ags-seq-posterior-nu", type=float, default=0.75)
+    parser.add_argument("--ags-seq-posterior-forgetting", type=float, default=0.995)
+    parser.add_argument("--ags-seq-seed", type=int, default=20260724)
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test row limit.")
     parser.add_argument(
         "--query-mode",
@@ -3866,7 +3955,8 @@ def parse_args() -> argparse.Namespace:
             "Retrieval method. Public names include direct_retrieval, one_pass_grounding, "
             "intrinsic_self_refinement, retrieval_feedback_refinement, parallel_sampling, "
             "parallel_sampling_diversity, decomposed_retrieval, operator_refinement, "
-            "memory_guided_refinement, bandit_freeform, and bandit_freeform_10arm."
+            "memory_guided_refinement, bandit_freeform, bandit_freeform_10arm, frozen_ags, "
+            "ags_seq, and ags_seq_random."
         ),
     )
     parser.add_argument(
