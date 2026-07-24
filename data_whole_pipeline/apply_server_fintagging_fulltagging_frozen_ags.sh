@@ -1,0 +1,33 @@
+#!/bin/bash
+#SBATCH --job-name=fintag_full_frozen_ags
+#SBATCH --mail-type=ALL
+#SBATCH --time=12:00:00
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus=b200:2
+#SBATCH --mem=256G
+#SBATCH --partition=gpu_b200
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline/%j_fintag_fulltagging_frozen_ags_qwen3_b200.txt
+#SBATCH --mail-user=linhai.ma@yale.edu
+
+set -euo pipefail
+
+# FullTagging frozen_ags grounding:
+#   extractor predictions first, then the frozen AGS single-pass grounding method
+#   (J=2 structured hypotheses -> def/lab render -> coverage retrieval -> sum-RRF ->
+#    range-normalize -> agree rerank). No listwise rerank after generation.
+
+REPO_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline"
+export SCRATCH_ROOT="${SCRATCH_ROOT:-/nfs/roberts/scratch/pi_sjf37/lm2445}"
+export RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs_fintagging_fulltagging}"
+export EXTRACTOR_TAG="${EXTRACTOR_TAG:-qwen2.5_14b_extractors}"
+export QUERY_MODE="${QUERY_MODE:-frozen_ags}"
+export OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/${EXTRACTOR_TAG}/qwen3_32b_frozen_ags}"
+export QUERY_GENERATION_MODEL="${QUERY_GENERATION_MODEL:-Qwen/Qwen3-32B}"
+export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
+# frozen_ags makes no LLM call after hypothesis generation; the listwise rerank is off.
+export RUN_RERANK="${RUN_RERANK:-0}"
+export REUSE_CANDIDATES="${REUSE_CANDIDATES:-1}"
+export RESUME="${RESUME:-1}"
+
+bash "${REPO_ROOT}/apply_server_fintagging_fulltagging_direct_retrieval.sh"

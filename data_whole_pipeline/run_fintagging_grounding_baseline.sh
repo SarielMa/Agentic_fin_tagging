@@ -41,6 +41,9 @@ case "${QUERY_MODE}" in
   memory|memory_guided_refinement)
     DEFAULT_METHOD_DIR="qwen3_32b_memory_guided_refinement"
     ;;
+  ags|frozen_ags|frozen_ags_grounding)
+    DEFAULT_METHOD_DIR="qwen3_32b_frozen_ags"
+    ;;
   *)
     DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
     ;;
@@ -92,6 +95,21 @@ TOP_P="${TOP_P:-1.0}"
 RESUME="${RESUME:-1}"
 LOG_EVERY="${LOG_EVERY:-25}"
 LIMIT="${LIMIT:-}"
+NORMALIZATION_MAP="${NORMALIZATION_MAP:-}"
+LABEL_COVERAGE_POOL_MULTIPLIER="${LABEL_COVERAGE_POOL_MULTIPLIER:-0}"
+FROZEN_AGS_TOP_P="${FROZEN_AGS_TOP_P:-1.0}"
+
+# frozen_ags produces its own final ranking deterministically (fuse + agree rerank) and
+# makes no LLM call after hypothesis generation, so the downstream listwise rerank is off.
+# Structured hypotheses need more than the 128-token query default; bump it if unset.
+case "${QUERY_MODE}" in
+  ags|frozen_ags|frozen_ags_grounding)
+    RUN_RERANK=0
+    if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" ]]; then
+      QUERY_MAX_NEW_TOKENS=512
+    fi
+    ;;
+esac
 
 require_path () {
   local path="$1"
@@ -144,8 +162,14 @@ ARGS=(
   --max-new-tokens "${MAX_NEW_TOKENS}"
   --temperature "${TEMPERATURE}"
   --top-p "${TOP_P}"
+  --label-coverage-pool-multiplier "${LABEL_COVERAGE_POOL_MULTIPLIER}"
+  --frozen-ags-top-p "${FROZEN_AGS_TOP_P}"
   --log-every "${LOG_EVERY}"
 )
+
+if [[ -n "${NORMALIZATION_MAP}" ]]; then
+  ARGS+=(--normalization-map "${NORMALIZATION_MAP}")
+fi
 
 if [[ "${REUSE_CANDIDATES}" == "1" ]]; then
   ARGS+=(--reuse-candidates)

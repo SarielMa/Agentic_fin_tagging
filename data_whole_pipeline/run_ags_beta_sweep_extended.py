@@ -5,7 +5,8 @@ Offline over the Experiment A logs. No generation, no retrieval, no GPU.
 
 `run_ags_beta_sweep.py` swept beta in {0, 0.05, 0.1, 0.2, 0.4} under both scalings and
 found the range-normalized curve still rising at the top of its grid. This run extends
-that grid to beta in {0.5, 0.6, 0.8, 1.0, 1.5} under range_normalized scoring only,
+that grid to beta in {0.5, 0.6, 0.8, 1.0, 1.5} under range_normalized scoring only, plus
+{2, 3, 4} because two text recall_at_10 curves had still not turned over at 1.5,
 
     score = minmax(S_wRRF) + beta * agree(c)
 
@@ -21,7 +22,9 @@ Under raw scoring that is beta * range(agree) / range(S_wRRF). Under range-norma
 scoring the retrieval range is 1 by construction and the raw-equivalent beta is
 beta * range(S_wRRF), so the same ratio reduces to beta * range(agree) -- the two
 parameterizations land on one axis. The run recomputes the deployed raw J=3 beta=0.05
-cell on this axis as a check.
+cell on this axis as a check; it lands at 0.61, not the 0.47 the prior docstring's quoted
+spans imply, because those spans are near-bounds rather than observed means. See
+metrics.json rerank_share.deployed_raw_anchor for the decomposition.
 """
 
 from __future__ import annotations
@@ -60,7 +63,7 @@ DEFAULT_SAMPLE_PATH = SCRIPT_DIR / "runs_ags_coverage_pilot" / "qwen3_32b" / "sa
 DEFAULT_COMPONENT_DIR = SCRIPT_DIR / "runs_ags_component_validation" / "qwen3_32b"
 DEFAULT_PRIOR_SWEEP = SCRIPT_DIR / "runs_ags_beta_sweep" / "qwen3_32b" / "beta_sweep.csv"
 
-BETAS = (0.5, 0.6, 0.8, 1.0, 1.5)
+BETAS = (0.5, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0)
 J_VALUES = (1, 2, 3)
 SCALING = "range_normalized"
 
@@ -449,6 +452,58 @@ def main() -> None:
         for metric, entry in per_metric.items():
             entry["excludes_zero"] = bool(entry["ci_low"] > 0.0 or entry["ci_high"] < 0.0)
 
+    # Cells statistically indistinguishable from the argmax on table R@10, so the
+    # recommendation is reported as a plateau rather than a spuriously precise argmax.
+    plateau = []
+    for row in sorted(table_r10, key=lambda item: (-item["value"], item["rerank_beta"])):
+        delta, low, high = bootstrap.paired(
+            values[row["config"]]["recall_at_10"], values[best_key]["recall_at_10"], "table"
+        )
+        if low <= 0.0 <= high:
+            mrr_row = next(
+                item
+                for item in rows
+                if item["config"] == row["config"] and item["modality"] == "table" and item["metric"] == "mrr"
+            )
+            plateau.append(
+                {
+                    "config": row["config"],
+                    "hypotheses_used": row["hypotheses_used"],
+                    "rerank_beta": row["rerank_beta"],
+                    "recall_at_10": row["value"],
+                    "mrr": mrr_row["value"],
+                    "rerank_share": row["rerank_share"],
+                    "delta_vs_argmax_r10": round(delta, 6),
+                    "ci_low": round(low, 6),
+                    "ci_high": round(high, 6),
+                }
+            )
+
+    selection = {
+        "selected": {
+            "hypotheses_used": best_row["hypotheses_used"],
+            "rerank_beta": best_row["rerank_beta"],
+            "score_scaling": SCALING,
+            "score_variant": args.score_variant,
+            "config": best_key,
+        },
+        "rule": (
+            "maximize table recall_at_10 (566 of 661 facts), ties broken by the lower beta; "
+            "table is reported as the primary subset and text separately"
+        ),
+        "justification": (
+            "Selected on the table subset, where every beta curve turns over inside the grid. "
+            "The argmax is not uniquely identified: the plateau below lists every cell whose "
+            "paired difference from the argmax has a CI spanning zero, and it is wide, so beta "
+            "should be read as a region rather than a point. The selected cell matches the "
+            "deployed raw pipeline on table recall_at_10 exactly and is nominally ahead on MRR "
+            "with a CI spanning zero, while giving up recall_at_50 significantly -- so this is "
+            "not a demonstrated improvement over the deployed configuration, only a "
+            "reparameterization that reaches the same top-10 accuracy at one fewer hypothesis."
+        ),
+        "indistinguishable_plateau_table_recall_at_10": plateau,
+    }
+
     baseline_share = {
         modality: mean_or_none(shares[(BASELINE_J, BASELINE_BETA, BASELINE_SCALING)][modality])
         for modality in MODALITIES
@@ -556,6 +611,7 @@ def main() -> None:
                 for j in J_VALUES
             },
         },
+        "selection": selection,
         "peaks": peaks,
         "j3_minus_j1_same_beta": j3_minus_j1,
         "versus_deployed_baseline": versus_baseline,

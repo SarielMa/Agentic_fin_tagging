@@ -45,6 +45,9 @@ case "${QUERY_MODE}" in
   memory|memory_guided_refinement)
     DEFAULT_METHOD_DIR="qwen3_32b_memory_guided_refinement"
     ;;
+  ags|frozen_ags|frozen_ags_grounding)
+    DEFAULT_METHOD_DIR="qwen3_32b_frozen_ags"
+    ;;
   *)
     DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
     ;;

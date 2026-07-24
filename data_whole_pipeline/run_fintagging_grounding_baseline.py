@@ -76,6 +76,9 @@ QUERY_MODE_ALIASES = {
     "bandit_guided_freeform": "bandit_freeform",
     "bandit_freeform_10arm": "bandit_freeform_10arm",
     "bandit_guided_freeform_10arm": "bandit_freeform_10arm",
+    "ags": "frozen_ags",
+    "frozen_ags": "frozen_ags",
+    "frozen_ags_grounding": "frozen_ags",
 }
 MULTI_ROUND_QUERY_MODES = {
     "intrinsic_self_refinement",
@@ -87,9 +90,13 @@ MULTI_ROUND_QUERY_MODES = {
     "memory_guided_refinement",
     "bandit_freeform",
     "bandit_freeform_10arm",
+    "frozen_ags",
 }
 LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
 STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
+# frozen_ags samples J structured hypotheses but runs no refinement loop; it produces its
+# own final ranking via deterministic fuse + rerank (see ags_frozen_grounding).
+FROZEN_AGS_QUERY_MODES = {"frozen_ags"}
 DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
 OPERATOR_LIBRARY = (
     "direct_label",
@@ -3351,6 +3358,30 @@ def build_comparison_candidate_records(
 ) -> list[dict[str, Any]]:
     query_mode = canonical_query_mode(args.query_mode)
     retriever = TaxonomyRetriever(taxonomy, type_filter=args.type_filter)
+
+    # frozen_ags scores retrieval with label coverage active (w_cov=1.0) and gates on the
+    # spec's startup assertions before any example is processed.
+    frozen_ags_config = None
+    frozen_ags_normalization_map = None
+    if query_mode in FROZEN_AGS_QUERY_MODES:
+        from ags_frozen_grounding import (
+            FrozenAgsConfig,
+            build_frozen_ags_method_record,
+            frozen_ags_startup_assertions,
+        )
+        from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map
+
+        frozen_ags_config = FrozenAgsConfig()
+        retriever.label_coverage_weight = frozen_ags_config.label_coverage_weight
+        retriever.label_coverage_pool_multiplier = args.label_coverage_pool_multiplier
+        frozen_ags_normalization_map = load_normalization_map(
+            args.normalization_map or DEFAULT_NORMALIZATION_MAP
+        )
+        assertion_report = frozen_ags_startup_assertions(
+            retriever, taxonomy, frozen_ags_normalization_map, frozen_ags_config
+        )
+        print(f"frozen_ags startup assertions passed: {json.dumps(assertion_report)}", flush=True)
+
     existing = load_existing_method_records(trace_path, query_mode) if args.resume else {}
     records: dict[int, dict[str, Any]] = {}
     missing_examples = [example for example in examples if example.example_idx not in existing]
@@ -3431,6 +3462,15 @@ def build_comparison_candidate_records(
                     retriever,
                     example,
                     memory_store=memory_store,
+                )
+            elif query_mode in FROZEN_AGS_QUERY_MODES:
+                record = build_frozen_ags_method_record(
+                    args,
+                    generator,
+                    retriever,
+                    example,
+                    frozen_ags_normalization_map,
+                    cfg=frozen_ags_config,
                 )
             else:
                 raise ValueError(f"Unsupported comparison query_mode={query_mode}")
@@ -3766,6 +3806,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taxonomy-jsonl", type=Path, default=DEFAULT_TAXONOMY_JSONL)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--top-k", type=int, default=200)
+    parser.add_argument(
+        "--normalization-map",
+        type=Path,
+        default=None,
+        help="Symbolic dimension vocabulary for frozen_ags agreement scoring "
+        "(defaults to ags_symbolic_agreement.DEFAULT_NORMALIZATION_MAP).",
+    )
+    parser.add_argument(
+        "--label-coverage-pool-multiplier",
+        type=int,
+        default=0,
+        help="frozen_ags coverage rescoring pool; <=0 scores the full type-filtered pool.",
+    )
+    parser.add_argument(
+        "--frozen-ags-top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling top-p for frozen_ags hypothesis generation.",
+    )
     parser.add_argument(
         "--retrieval-rounds",
         type=int,
