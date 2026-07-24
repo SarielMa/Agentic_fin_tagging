@@ -36,6 +36,7 @@ from run_fintagging_grounding_baseline import Example, first_gold_rank, normaliz
 
 AGGREGATIONS = ("none", "rrf", "selection", "selection_union", "oracle")
 SCORE_VARIANTS = ("sum", "mean")
+SCORE_SCALINGS = ("raw", "range_normalized")
 RENDERINGS = ("def", "lab", "dual")
 
 
@@ -165,14 +166,36 @@ def apply_rerank(
     beta: float,
     top_k: int,
     score_variant: str,
+    score_scaling: str = "raw",
 ) -> list[str]:
-    """Rerank by rrf_score + beta * consensus_agreement, mirroring rerank_consensus_base."""
-    rescored: list[tuple[float, int, str]] = []
+    """Rerank by retrieval score + beta * consensus_agreement.
+
+    `raw` mirrors rerank_consensus_base as the pipeline implements it: beta is added to an
+    unnormalized RRF score whose scale grows with the number of fused lists, so beta's
+    effective strength depends on J. `range_normalized` min-max scales the retrieval score
+    to [0, 1] over the fact's own candidate pool first, so beta is expressed in units of
+    the observed retrieval-score range and means the same thing at every J.
+    """
+    if score_scaling not in SCORE_SCALINGS:
+        raise ValueError(f"Unsupported score_scaling={score_scaling}")
+
+    retrieval: list[float] = []
     for rank, tag in enumerate(order, start=1):
         score = scores[tag] if scores is not None else 1.0 / (kappa + rank)
         if score_variant == "mean":
             score /= lists_fused
-        rescored.append((score + beta * consensus.get(tag, 0.0), rank, tag))
+        retrieval.append(score)
+
+    if score_scaling == "range_normalized" and retrieval:
+        low = min(retrieval)
+        high = max(retrieval)
+        span = high - low
+        retrieval = [(value - low) / span if span > 0 else 1.0 for value in retrieval]
+
+    rescored = [
+        (score + beta * consensus.get(tag, 0.0), rank, tag)
+        for rank, (tag, score) in enumerate(zip(order, retrieval, strict=True), start=1)
+    ]
     rescored.sort(key=lambda item: (-item[0], item[1], item[2]))
     return [tag for _, _, tag in rescored[:top_k]]
 
@@ -186,6 +209,7 @@ def score_configuration(
     rerank_beta: float,
     rrf_kappa: float,
     top_k: int,
+    score_scaling: str = "raw",
 ) -> ConfigurationResult:
     if aggregation not in AGGREGATIONS:
         raise ValueError(f"Unsupported aggregation={aggregation}")
@@ -236,5 +260,6 @@ def score_configuration(
         rerank_beta,
         top_k,
         score_variant,
+        score_scaling,
     )
     return ConfigurationResult(first_gold_rank(reranked, gold), before, selected_idx, lists_fused)
