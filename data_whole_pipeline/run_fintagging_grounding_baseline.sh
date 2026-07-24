@@ -99,12 +99,13 @@ NORMALIZATION_MAP="${NORMALIZATION_MAP:-}"
 LABEL_COVERAGE_POOL_MULTIPLIER="${LABEL_COVERAGE_POOL_MULTIPLIER:-0}"
 FROZEN_AGS_TOP_P="${FROZEN_AGS_TOP_P:-1.0}"
 
-# frozen_ags produces its own final ranking deterministically (fuse + agree rerank) and
-# makes no LLM call after hypothesis generation, so the downstream listwise rerank is off.
+# frozen_ags produces its own final ranking deterministically (fuse + agree rerank), but the
+# downstream listwise rerank still runs so the method is comparable to every other query mode
+# at the same evaluation stage. Use MODE=retrieval on the apply_server_* wrapper for the
+# retrieval-only variant (those wrappers export RUN_RERANK unconditionally per MODE).
 # Structured hypotheses need more than the 128-token query default; bump it if unset.
 case "${QUERY_MODE}" in
   ags|frozen_ags|frozen_ags_grounding)
-    RUN_RERANK=0
     if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" ]]; then
       QUERY_MAX_NEW_TOKENS=512
     fi
