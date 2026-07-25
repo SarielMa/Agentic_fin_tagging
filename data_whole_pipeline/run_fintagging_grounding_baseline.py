@@ -83,6 +83,9 @@ QUERY_MODE_ALIASES = {
     "ags_sequential": "ags_seq",
     "ags_seq_random": "ags_seq_random",
     "ags_sequential_random": "ags_seq_random",
+    "ags_j1": "one_pass_structured",
+    "one_pass_structured": "one_pass_structured",
+    "one_pass_grounding_structured": "one_pass_structured",
 }
 MULTI_ROUND_QUERY_MODES = {
     "intrinsic_self_refinement",
@@ -97,12 +100,20 @@ MULTI_ROUND_QUERY_MODES = {
     "frozen_ags",
     "ags_seq",
     "ags_seq_random",
+    "one_pass_structured",
 }
 LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
 STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
 # frozen_ags samples J structured hypotheses but runs no refinement loop; it produces its
 # own final ranking via deterministic fuse + rerank (see ags_frozen_grounding).
 FROZEN_AGS_QUERY_MODES = {"frozen_ags"}
+# "One-pass grounding (structured)" = AGS with J=1: the identical frozen code path with one
+# greedy hypothesis and beta=0, so the consensus term drops out and the ranking is the
+# range-normalized sum-RRF score alone. Shares frozen_ags's startup assertions and record
+# builder; only the config constants differ (ags_frozen_grounding._FROZEN_VARIANTS).
+ONE_PASS_STRUCTURED_QUERY_MODES = {"one_pass_structured"}
+# Everything that runs through ags_frozen_grounding.build_frozen_ags_method_record.
+FROZEN_AGS_FAMILY_QUERY_MODES = FROZEN_AGS_QUERY_MODES | ONE_PASS_STRUCTURED_QUERY_MODES
 # The two sequential negative-control arms start from frozen_ags's round one and differ
 # from each other only in directive selection (see ags_sequential_arms).
 AGS_SEQ_QUERY_MODES = {"ags_seq", "ags_seq_random"}
@@ -3413,15 +3424,23 @@ def build_comparison_candidate_records(
         )
         ags_seq_bank = SequentialPosteriorBank(OPERATORS, ags_seq_config)
 
-    if query_mode in FROZEN_AGS_QUERY_MODES:
+    if query_mode in FROZEN_AGS_FAMILY_QUERY_MODES:
         from ags_frozen_grounding import (
             FrozenAgsConfig,
             build_frozen_ags_method_record,
             frozen_ags_startup_assertions,
+            one_pass_structured_config,
         )
         from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map
 
-        frozen_ags_config = FrozenAgsConfig()
+        # Same startup assertions for both: the one-pass baseline must prove the retriever,
+        # taxonomy and vocabulary are in exactly the state AGS requires, or the "identical
+        # except J=1" claim is unverified.
+        frozen_ags_config = (
+            one_pass_structured_config()
+            if query_mode in ONE_PASS_STRUCTURED_QUERY_MODES
+            else FrozenAgsConfig()
+        )
         retriever.label_coverage_weight = frozen_ags_config.label_coverage_weight
         retriever.label_coverage_pool_multiplier = args.label_coverage_pool_multiplier
         frozen_ags_normalization_map = load_normalization_map(
@@ -3430,7 +3449,10 @@ def build_comparison_candidate_records(
         assertion_report = frozen_ags_startup_assertions(
             retriever, taxonomy, frozen_ags_normalization_map, frozen_ags_config
         )
-        print(f"frozen_ags startup assertions passed: {json.dumps(assertion_report)}", flush=True)
+        print(
+            f"{frozen_ags_config.variant} startup assertions passed: {json.dumps(assertion_report)}",
+            flush=True,
+        )
 
     existing = load_existing_method_records(trace_path, query_mode) if args.resume else {}
     records: dict[int, dict[str, Any]] = {}
@@ -3527,7 +3549,9 @@ def build_comparison_candidate_records(
                     ags_seq_bank,
                     cfg=ags_seq_config,
                 )
-            elif query_mode in FROZEN_AGS_QUERY_MODES:
+            elif query_mode in FROZEN_AGS_FAMILY_QUERY_MODES:
+                # one_pass_structured takes this exact branch with J=1/beta=0 -- reusing the
+                # AGS record builder is what makes "AGS with J=1" true by construction.
                 record = build_frozen_ags_method_record(
                     args,
                     generator,
@@ -3956,7 +3980,7 @@ def parse_args() -> argparse.Namespace:
             "intrinsic_self_refinement, retrieval_feedback_refinement, parallel_sampling, "
             "parallel_sampling_diversity, decomposed_retrieval, operator_refinement, "
             "memory_guided_refinement, bandit_freeform, bandit_freeform_10arm, frozen_ags, "
-            "ags_seq, and ags_seq_random."
+            "one_pass_structured (= AGS with J=1; alias ags_j1), ags_seq, and ags_seq_random."
         ),
     )
     parser.add_argument(

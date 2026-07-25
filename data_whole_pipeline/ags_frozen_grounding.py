@@ -54,6 +54,16 @@ from run_fintagging_grounding_baseline import (
 
 
 FROZEN_AGS_QUERY_MODE = "frozen_ags"
+# "One-pass grounding (structured)": AGS with J=1. Same generator prompt and schema, same
+# renderer, same index/filter/K/kappa/w_cov -- the ONLY differences are that one hypothesis is
+# drawn instead of two and, because a single hypothesis has nothing to reach consensus with,
+# beta=0 so the rerank term vanishes and the output is ranked purely by the range-normalized
+# fused score. It isolates the structured representation from the ensemble machinery.
+#
+# Decoding is greedy (temperature 0). frozen_ags samples at 0.8 precisely because it needs J
+# *independent* draws; with J=1 there is nothing to decorrelate, so sampling noise would only
+# add variance to a baseline whose whole job is to be a clean reference point.
+ONE_PASS_STRUCTURED_QUERY_MODE = "one_pass_structured"
 
 # Concepts whose own label must self-retrieve at rank 1 only when the coverage term is
 # active and correctly scaled (spec 9.2, assertion 2). Short generic labels that lose to
@@ -70,7 +80,13 @@ COVERAGE_REGRESSION_LABELS = (
 
 @dataclass(frozen=True)
 class FrozenAgsConfig:
-    """The frozen configuration. These values are asserted at startup, not tuned."""
+    """The frozen configuration. These values are asserted at startup, not tuned.
+
+    `variant` selects WHICH frozen configuration is being asserted. Both variants share this
+    class, and therefore share every code path below, because the one-pass-structured baseline
+    is defined as "AGS with J=1" -- reusing the class is what makes that literally true rather
+    than a claim about two similar implementations.
+    """
 
     hypotheses: int = 2  # J
     top_k: int = 200  # K
@@ -80,21 +96,59 @@ class FrozenAgsConfig:
     temperature: float = 0.8
     agreement_top_m: int = 10
     dual_rendering_modalities: tuple[str, ...] = ("table",)  # text uses def only
+    variant: str = FROZEN_AGS_QUERY_MODE
+
+
+# Each variant is frozen just as hard as the original; they differ only in the constants the
+# assertion demands. Adding a variant here must never loosen an existing one.
+_FROZEN_VARIANTS: dict[str, dict[str, Any]] = {
+    FROZEN_AGS_QUERY_MODE: {
+        "hypotheses": 2,
+        "rerank_beta": 0.6,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 1.0,
+        "top_k": 200,
+    },
+    ONE_PASS_STRUCTURED_QUERY_MODE: {
+        "hypotheses": 1,
+        "rerank_beta": 0.0,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 1.0,
+        "top_k": 200,
+    },
+}
+
+
+def one_pass_structured_config() -> FrozenAgsConfig:
+    """AGS with J=1: one greedy hypothesis, no consensus rerank, everything else identical."""
+    return FrozenAgsConfig(
+        hypotheses=1,
+        rerank_beta=0.0,
+        temperature=0.0,  # greedy, single sample
+        variant=ONE_PASS_STRUCTURED_QUERY_MODE,
+    )
 
 
 def _assert_frozen(cfg: FrozenAgsConfig) -> None:
     """Spec 9.2 assertion 4: config frozen."""
-    expected = FrozenAgsConfig()
-    if (
-        cfg.hypotheses != expected.hypotheses
-        or cfg.rerank_beta != expected.rerank_beta
-        or cfg.rrf_kappa != expected.rrf_kappa
-        or cfg.label_coverage_weight != expected.label_coverage_weight
-    ):
+    expected = _FROZEN_VARIANTS.get(cfg.variant)
+    if expected is None:
         raise AssertionError(
-            "frozen_ags config drifted from J=2, beta=0.6, kappa=60, w_cov=1.0: "
-            f"got J={cfg.hypotheses}, beta={cfg.rerank_beta}, kappa={cfg.rrf_kappa}, "
-            f"w_cov={cfg.label_coverage_weight}"
+            f"unknown frozen config variant {cfg.variant!r}; expected one of "
+            f"{sorted(_FROZEN_VARIANTS)}"
+        )
+    drifted = {
+        field: (getattr(cfg, field), value)
+        for field, value in expected.items()
+        if getattr(cfg, field) != value
+    }
+    if drifted:
+        detail = ", ".join(f"{field}={got!r} (expected {want!r})" for field, (got, want) in sorted(drifted.items()))
+        raise AssertionError(f"{cfg.variant} config drifted: {detail}")
+    if cfg.variant == ONE_PASS_STRUCTURED_QUERY_MODE and cfg.temperature != 0.0:
+        raise AssertionError(
+            "one_pass_structured decodes greedily (temperature 0); got "
+            f"temperature={cfg.temperature}"
         )
 
 
@@ -239,7 +293,9 @@ def sample_hypotheses(
     original_temperature = generator.args.query_temperature
     original_top_p = generator.args.query_top_p
     generator.args.query_temperature = cfg.temperature
-    generator.args.query_top_p = getattr(args, "frozen_ags_top_p", 1.0)
+    # At temperature 0 the decode is greedy and a nucleus cutoff is meaningless; pin top_p to
+    # 1.0 so a stray --frozen-ags-top-p on the command line cannot make "greedy" ambiguous.
+    generator.args.query_top_p = 1.0 if cfg.temperature == 0.0 else getattr(args, "frozen_ags_top_p", 1.0)
     try:
         for sample_idx in range(cfg.hypotheses):
             raw_output = generator.generate_one(prompt)
@@ -250,7 +306,7 @@ def sample_hypotheses(
                 hypothesis, parse_ok = parse_hypothesis(raw_output, fallback)
             calls.append(
                 llm_call_record(
-                    "frozen_ags_hypothesis",
+                    f"{cfg.variant}_hypothesis",
                     raw_output=raw_output,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=generator.count_text_tokens(raw_output),
@@ -423,9 +479,13 @@ def build_frozen_ags_method_record(
 
     # finalize_candidate_record re-fuses `rounds` with a plain sum-RRF; for frozen_ags the
     # authoritative ranking is the reranked pool, so overwrite the ranking-derived fields.
+    # The extra_fields keys stay `frozen_ags_*` for BOTH variants on purpose: every downstream
+    # reader (the T28 replay, the Table 5 ablation loaders, compute_ags_*) keys off those names,
+    # and a one-pass-structured trace is meant to be readable by all of them unchanged. The
+    # `variant` entry below is what distinguishes the two, and record["query_mode"] carries it too.
     record = finalize_candidate_record(
         example,
-        query_mode=FROZEN_AGS_QUERY_MODE,
+        query_mode=cfg.variant,
         rounds=rounds,
         top_k=cfg.top_k,
         rrf_kappa=cfg.rrf_kappa,
@@ -435,6 +495,7 @@ def build_frozen_ags_method_record(
         wall_time=time.monotonic() - start_time,
         extra_fields={
             "frozen_ags_config": {
+                "variant": cfg.variant,
                 "hypotheses": cfg.hypotheses,
                 "top_k": cfg.top_k,
                 "rrf_kappa": cfg.rrf_kappa,

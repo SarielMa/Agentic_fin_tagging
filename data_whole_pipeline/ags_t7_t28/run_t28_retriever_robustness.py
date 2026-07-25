@@ -87,7 +87,11 @@ DEFAULT_ONEPASS_TRACE = (
     _PARENT / "runs_fintagging_grounding_baseline" / "qwen3_32b_one_pass_grounding" / "bm25_candidates.jsonl"
 )
 TOP_K = 200
-METRICS = ("recall_at_10", "recall_at_50", "recall_at_200", "mrr")
+# top1_accuracy is rank-1 on each row's own retrieval ranking. T28 runs no listwise reranker
+# (the only "rerank" in this module is AGS's internal consensus rerank), so this column is the
+# retrieval-stage quantity -- the same basis as Table 5's Acc., NOT the end-to-end accuracy the
+# deployed pipeline reports after its Qwen listwise stage. Label it as such wherever it lands.
+METRICS = ("recall_at_10", "recall_at_50", "recall_at_200", "mrr", "top1_accuracy")
 MODALITIES = ("table", "text", "pooled")
 
 # (retriever, method, w_cov). Dense/hybrid default to coverage OFF because the term is a

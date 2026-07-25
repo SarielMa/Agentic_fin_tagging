@@ -17,11 +17,13 @@ from types import SimpleNamespace
 
 from ags_frozen_grounding import (
     FROZEN_AGS_QUERY_MODE,
+    ONE_PASS_STRUCTURED_QUERY_MODE,
     FrozenAgsConfig,
     build_frozen_ags_method_record,
     frozen_ags_rankings,
     frozen_ags_rerank,
     frozen_ags_startup_assertions,
+    one_pass_structured_config,
     range_normalize,
     sample_hypotheses,
 )
@@ -90,6 +92,8 @@ class FakeGenerator:
         self.args = SimpleNamespace(query_temperature=0.0, query_top_p=1.0)
         self._outputs = list(outputs)
         self._i = 0
+        self.seen_temperature: list[float] = []
+        self.seen_top_p: list[float] = []
 
     @property
     def backend(self) -> str:
@@ -103,6 +107,10 @@ class FakeGenerator:
         return len(text.split())
 
     def generate_one(self, prompt: str) -> str:
+        # Record the decoding params in force at each call, so a test can prove greedy really
+        # was greedy rather than trusting the config that was passed in.
+        self.seen_temperature.append(self.args.query_temperature)
+        self.seen_top_p.append(self.args.query_top_p)
         out = self._outputs[self._i % len(self._outputs)]
         self._i += 1
         return out
@@ -274,6 +282,109 @@ def test_sample_hypotheses_fallback(retriever_cov, taxonomy, nmap) -> None:
     check("fallback yields one hypothesis", len(hyps) == 1)
 
 
+# --- one-pass grounding (structured) = AGS with J=1 ----------------------------------
+def test_one_pass_structured_config() -> None:
+    cfg = one_pass_structured_config()
+    check("J=1", cfg.hypotheses == 1)
+    check("beta=0 (nothing to reach consensus over)", cfg.rerank_beta == 0.0)
+    check("greedy decoding", cfg.temperature == 0.0)
+    # The whole point of the baseline: everything else must be bit-identical to AGS.
+    frozen = FrozenAgsConfig()
+    for field in ("top_k", "rrf_kappa", "label_coverage_weight", "agreement_top_m",
+                  "dual_rendering_modalities"):
+        check(f"{field} identical to AGS", getattr(cfg, field) == getattr(frozen, field),
+              f"{getattr(cfg, field)!r} vs {getattr(frozen, field)!r}")
+
+
+def test_one_pass_structured_frozen_guard(retriever_cov, taxonomy, nmap) -> None:
+    # The J=1 variant is frozen just as hard as AGS, on its own constants.
+    for bad, label in (
+        (FrozenAgsConfig(hypotheses=2, rerank_beta=0.0, temperature=0.0,
+                         variant=ONE_PASS_STRUCTURED_QUERY_MODE), "J drift"),
+        (FrozenAgsConfig(hypotheses=1, rerank_beta=0.6, temperature=0.0,
+                         variant=ONE_PASS_STRUCTURED_QUERY_MODE), "beta drift"),
+        (FrozenAgsConfig(hypotheses=1, rerank_beta=0.0, temperature=0.8,
+                         variant=ONE_PASS_STRUCTURED_QUERY_MODE), "temperature drift"),
+    ):
+        raised = False
+        try:
+            frozen_ags_startup_assertions(retriever_cov, taxonomy, nmap, bad)
+        except AssertionError:
+            raised = True
+        check(f"one_pass_structured guard trips on {label}", raised)
+    # And an unknown variant must not silently pass.
+    raised = False
+    try:
+        frozen_ags_startup_assertions(retriever_cov, taxonomy, nmap,
+                                      FrozenAgsConfig(variant="not_a_variant"))
+    except AssertionError:
+        raised = True
+    check("unknown variant rejected", raised)
+
+
+def test_one_pass_structured_beta_zero_is_pure_fused_rank(retriever_cov, taxonomy, nmap) -> None:
+    """With beta=0 the consensus term drops out, so the ranking must be exactly the
+    range-normalized sum-RRF order. This is the spec's "NO consensus rerank" clause."""
+    example = make_example(
+        11, "1,234", "monetaryItemType", "table",
+        taxonomy_first_current_asset(taxonomy),
+        "Balance sheet. Cash and cash equivalents, current, as of December 31, 2024.",
+    )
+    hypotheses = [hyp(family="Cash", role="carrying value", qualifier="current",
+                      temporal="as of", retrieval_query="cash and cash equivalents current")]
+    cfg = one_pass_structured_config()
+    rounds = frozen_ags_rankings(retriever_cov, example, hypotheses, cfg)
+    check("J=1 table fact yields def+lab only", len(rounds) == 2, f"got {len(rounds)}")
+
+    reranked, _ = frozen_ags_rerank(rounds, example, hypotheses, nmap, cfg)
+    check("beta=0 still returns a pool", len(reranked) > 0)
+    # final == normalized fused score, exactly.
+    check(
+        "final score equals the normalized fused score",
+        all(abs(c["frozen_ags_final_score"] - c["frozen_ags_rrf_normalized"]) < 1e-9
+            for c in reranked),
+    )
+    # ...and the order is that score's order (ties broken by tag, as fuse does).
+    expected = sorted(reranked, key=lambda c: (-c["frozen_ags_rrf_normalized"], c["tag"]))
+    check("order is the normalized fused order",
+          [c["tag"] for c in reranked] == [c["tag"] for c in expected])
+
+    # Non-zero consensus is what beta would have multiplied; proving it is present but
+    # ignored is stronger than proving it is absent.
+    check("consensus was computed and then zeroed out by beta",
+          any(c["frozen_ags_agree_consensus"] > 0 for c in reranked))
+
+
+def test_one_pass_structured_record(retriever_cov, taxonomy, nmap) -> None:
+    gold = taxonomy_first_current_asset(taxonomy)
+    example = make_example(12, "1,234", "monetaryItemType", "table", gold,
+                           "Cash and cash equivalents, current, as of December 31, 2024.")
+    canned = json.dumps({
+        "dimensions": {"FAMILY": "Cash", "ROLE": "carrying value", "EVENT": "UNRESOLVED",
+                       "QUALIFIER": "current", "SCOPE": "UNRESOLVED", "TEMPORAL": "as of"},
+        "operators": ["direct_label"],
+        "retrieval_query": "cash and cash equivalents current",
+    })
+    generator = FakeGenerator([canned])
+    args = SimpleNamespace(query_context_max_chars=12000, query_max_input_tokens=16000,
+                           frozen_ags_top_p=0.9)
+    cfg = one_pass_structured_config()
+    record = build_frozen_ags_method_record(args, generator, retriever_cov, example, nmap, cfg=cfg)
+    check("record query_mode is one_pass_structured",
+          record["query_mode"] == ONE_PASS_STRUCTURED_QUERY_MODE)
+    check("exactly one hypothesis", len(record["frozen_ags_hypotheses"]) == 1)
+    check("exactly one LLM call", len(record["frozen_ags_llm_calls"]) == 1)
+    check("two retrieval calls (table dual, J=1)", record["total_retrieval_calls"] == 2)
+    check("config block records the variant",
+          record["frozen_ags_config"]["variant"] == ONE_PASS_STRUCTURED_QUERY_MODE)
+    check("config block records beta=0", record["frozen_ags_config"]["rerank_beta"] == 0.0)
+    # Greedy must not be silently nucleus-sampled by a stray --frozen-ags-top-p.
+    check("greedy pins top_p to 1.0", generator.seen_top_p == [1.0], str(generator.seen_top_p))
+    # Downstream readers (T28 replay, Table 5 loaders) key off these names.
+    for key in ("frozen_ags_hypotheses", "frozen_ags_config", "rounds"):
+        check(f"trace still carries {key} for downstream readers", key in record)
+
+
 def taxonomy_first_current_asset(taxonomy) -> str:
     for concept in taxonomy:
         if "Current" in (concept.raw_tag or "") and concept.entity_type == "monetaryItemType":
@@ -303,6 +414,12 @@ def main() -> None:
     test_ground_end_to_end(retriever_cov, taxonomy, nmap)
     test_build_record_with_stub_generator(retriever_cov, taxonomy, nmap)
     test_sample_hypotheses_fallback(retriever_cov, taxonomy, nmap)
+
+    print("\n[one-pass grounding (structured) = AGS with J=1]")
+    test_one_pass_structured_config()
+    test_one_pass_structured_frozen_guard(retriever_cov, taxonomy, nmap)
+    test_one_pass_structured_beta_zero_is_pure_fused_rank(retriever_cov, taxonomy, nmap)
+    test_one_pass_structured_record(retriever_cov, taxonomy, nmap)
 
     print(f"\nALL {PASSED} CHECKS PASSED")
 
