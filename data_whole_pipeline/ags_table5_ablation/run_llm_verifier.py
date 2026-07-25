@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -72,7 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-generation-backend", choices=["vllm", "transformers"], default="vllm")
     parser.add_argument("--query-context-max-chars", type=int, default=12000)
     parser.add_argument("--query-max-input-tokens", type=int, default=16000)
-    parser.add_argument("--query-max-new-tokens", type=int, default=512)
+    # THIS is the cap that bounds the verdict JSON: QueryGenerator.generate_many passes
+    # query_max_new_tokens as vLLM's max_tokens (run_fintagging_grounding_baseline.py:1331).
+    # One verdict entry is ~110-130 tokens (tag + 3 dimensions + confidence + punctuation), so
+    # top_m=10 needs ~1,100-1,300 plus the wrapper. The original 512 truncated EVERY response
+    # mid-array: a full 2,369-call run produced a 100% parse failure rate and zero verdicts.
+    # Sized at 1536 to leave headroom; raise it alongside --top-m if that is ever increased.
+    parser.add_argument("--query-max-new-tokens", type=int, default=1536)
     # load_vllm_engine (run_fintagging_grounding_baseline.py) sizes max_model_len off the
     # plain (non-query-prefixed) max_input_tokens/max_new_tokens as well; both are read even
     # though this script only ever calls generate_one on the query_* generation path.
@@ -92,6 +99,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=100)
+    # Fail-fast. The truncation bug ran 4h34m across 2,369 calls at a 0% parse rate before
+    # anyone looked at the output; a zero firing rate is also the *expected* result of genuine
+    # abstention, so nothing downstream flags it. Check early and abort loudly instead.
+    parser.add_argument("--abort-check-after", type=int, default=25, help="0 disables the guard.")
+    parser.add_argument("--abort-if-parse-rate-below", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -135,33 +147,119 @@ Return JSON only, one entry per candidate tag, with this schema:
     ]
 
 
-def parse_verifier_output(raw_output: str, candidate_tags: list[str]) -> tuple[dict[str, dict[str, Any]], bool]:
-    parsed, parse_ok = parse_json_object(raw_output)
+def salvage_verdict_entries(raw_output: str) -> list[dict[str, Any]]:
+    """Recover the complete objects from a truncated `{"verdicts": [ {...}, {...}, {...`.
+
+    A verdict list is independent per candidate, so a response cut off mid-array still carries
+    usable judgements for every candidate that finished. Whole-document json.loads throws all
+    of them away because the array never closes. This scans the array and keeps each balanced
+    `{...}`, stopping at the point of truncation.
+
+    Defence in depth, not the primary fix -- --query-max-new-tokens is now sized so responses
+    complete. Any salvage is counted and reported so silent partial coverage stays visible.
+    """
+    text = re.sub(r"<think>.*?</think>", "", raw_output, flags=re.DOTALL | re.IGNORECASE)
+    anchor = text.find('"verdicts"')
+    start = text.find("[", anchor if anchor >= 0 else 0)
+    if start < 0:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    depth = 0
+    in_string = False
+    escape = False
+    entry_start = -1
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            if depth == 0:
+                entry_start = index
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and entry_start >= 0:
+                try:
+                    parsed = json.loads(text[entry_start : index + 1])
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(parsed, dict):
+                        entries.append(parsed)
+                entry_start = -1
+        elif char == "]" and depth == 0:
+            break
+    return entries
+
+
+def parse_verifier_output(
+    raw_output: str, candidate_tags: list[str]
+) -> tuple[dict[str, dict[str, Any]], bool, str]:
+    """Returns (verdicts_by_tag, parse_ok, parse_mode).
+
+    parse_mode is "clean" (whole document parsed), "salvaged" (recovered from a truncated
+    array) or "failed" (nothing usable), so a run can be audited for silent truncation rather
+    than only for total failure.
+    """
+    parsed, whole_ok = parse_json_object(raw_output)
+    entries = parsed.get("verdicts") if isinstance(parsed, dict) else None
+    mode = "clean"
+    if not isinstance(entries, list) or not entries:
+        entries = salvage_verdict_entries(raw_output)
+        mode = "salvaged" if entries else "failed"
+
     verdicts_by_tag: dict[str, dict[str, Any]] = {}
-    entries = parsed.get("verdicts")
-    if isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            tag = normalize_tag(entry.get("tag", ""))
-            if tag not in candidate_tags:
-                continue
-            verdict = {}
-            for dimension in VERIFIER_DIMENSIONS:
-                raw_verdict = str(entry.get(dimension, "")).strip().lower()
-                verdict[dimension] = VERDICT_TO_MATCHED.get(raw_verdict, None)
-            verdict["confidence"] = float(entry.get("confidence", 0.0) or 0.0)
-            verdicts_by_tag[tag] = verdict
-    return verdicts_by_tag, bool(parse_ok and verdicts_by_tag)
+    allowed = set(candidate_tags)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        tag = normalize_tag(entry.get("tag", ""))
+        if tag not in allowed:
+            continue
+        verdict: dict[str, Any] = {}
+        for dimension in VERIFIER_DIMENSIONS:
+            raw_verdict = str(entry.get(dimension, "")).strip().lower()
+            verdict[dimension] = VERDICT_TO_MATCHED.get(raw_verdict, None)
+        verdict["confidence"] = float(entry.get("confidence", 0.0) or 0.0)
+        verdicts_by_tag[tag] = verdict
+
+    if not verdicts_by_tag:
+        return {}, False, "failed"
+    if mode == "clean" and not whole_ok:
+        mode = "salvaged"
+    return verdicts_by_tag, True, mode
 
 
-def load_existing(path: Path) -> dict[tuple[int, int], dict[str, Any]]:
+def load_existing(path: Path) -> tuple[dict[tuple[int, int], dict[str, Any]], int]:
+    """Reusable rows only: a row is reusable if it actually carries verdicts.
+
+    Resuming must NOT treat a failed call as done. The truncation bug produced 2,369 rows with
+    parse_ok=false and empty verdicts_by_tag; keying resume purely on (fact_id, hypothesis_idx)
+    would skip every one of them forever and silently bake the failure into the final table.
+    Failed rows are counted and reported, then regenerated.
+    """
     existing: dict[tuple[int, int], dict[str, Any]] = {}
+    skipped = 0
     if not path.exists():
-        return existing
+        return existing, skipped
     for row in stream_jsonl(path):
-        existing[(int(row["fact_id"]), int(row["hypothesis_idx"]))] = row
-    return existing
+        key = (int(row["fact_id"]), int(row["hypothesis_idx"]))
+        if row.get("parse_ok") and row.get("verdicts_by_tag"):
+            existing[key] = row
+        else:
+            skipped += 1
+            existing.pop(key, None)
+    return existing, skipped
 
 
 def main() -> None:
@@ -171,9 +269,17 @@ def main() -> None:
     raw_calls_path = args.output_dir / "llm_verifier_calls.jsonl"
     verdicts_path = args.output_dir / "llm_verifier_verdicts.json"
 
-    existing = load_existing(raw_calls_path) if args.resume else {}
+    existing, unusable_existing = load_existing(raw_calls_path) if args.resume else ({}, 0)
+    if args.resume:
+        print(
+            f"Resume: {len(existing)} reusable calls, {unusable_existing} previous calls had no "
+            "verdicts and will be regenerated.",
+            flush=True,
+        )
     firing_counts = Counter()
     opportunity_counts = Counter()
+    parse_modes = Counter()
+    generated = 0
     all_verdicts: list[dict[str, Any]] = []
     generator: QueryGenerator | None = None
 
@@ -204,16 +310,27 @@ def main() -> None:
                         max_input_tokens=args.query_max_input_tokens,
                     )
                     raw_output = generator.generate_one(prompt)
-                    verdicts_by_tag, parse_ok = parse_verifier_output(raw_output, candidate_tags)
+                    verdicts_by_tag, parse_ok, parse_mode = parse_verifier_output(
+                        raw_output, candidate_tags
+                    )
+                    completion_tokens = generator.count_text_tokens(raw_output)
+                    generated += 1
+                    parse_modes[parse_mode] += 1
                     call = llm_call_record(
                         "table5_llm_verifier",
                         raw_output=raw_output,
                         prompt_tokens=prompt_tokens,
-                        completion_tokens=generator.count_text_tokens(raw_output),
+                        completion_tokens=completion_tokens,
                         parse_ok=parse_ok,
                         backend=generator.backend,
                         model_name=generator.model_name,
-                        extra_fields={"used_context_max_chars": used_context_chars},
+                        extra_fields={
+                            "used_context_max_chars": used_context_chars,
+                            "parse_mode": parse_mode,
+                            # True when the response used the entire budget, i.e. it was almost
+                            # certainly cut off rather than finishing on its own.
+                            "hit_token_cap": completion_tokens >= args.query_max_new_tokens,
+                        },
                     )
                     row = {
                         "fact_id": fact_id,
@@ -221,10 +338,29 @@ def main() -> None:
                         "candidate_tags": candidate_tags,
                         "verdicts_by_tag": verdicts_by_tag,
                         "parse_ok": parse_ok,
+                        "parse_mode": parse_mode,
                         "call": call,
                     }
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                     handle.flush()
+
+                    if args.abort_check_after and generated == args.abort_check_after:
+                        rate = (generated - parse_modes["failed"]) / generated
+                        if rate < args.abort_if_parse_rate_below:
+                            raise SystemExit(
+                                f"\nABORTING after {generated} calls: only {rate:.0%} produced "
+                                f"verdicts (threshold {args.abort_if_parse_rate_below:.0%}).\n"
+                                f"parse modes: {dict(parse_modes)}\n"
+                                f"Most likely cause is truncation -- check whether raw outputs "
+                                f"end mid-JSON and raise --query-max-new-tokens (currently "
+                                f"{args.query_max_new_tokens}). Inspect {raw_calls_path}.\n"
+                                f"Re-run with --abort-check-after 0 to override."
+                            )
+                        print(
+                            f"Parse-rate guard passed: {rate:.0%} of the first {generated} calls "
+                            f"produced verdicts ({dict(parse_modes)}).",
+                            flush=True,
+                        )
 
                 for tag in row["candidate_tags"]:
                     verdict = row["verdicts_by_tag"].get(tag, {})
@@ -253,17 +389,30 @@ def main() -> None:
         for dimension in VERIFIER_DIMENSIONS
     }
     verdicts_path.write_text(json.dumps(all_verdicts, ensure_ascii=False) + "\n", encoding="utf-8")
+    calls_with_verdicts = generated - parse_modes["failed"]
+    parse_rate = round(calls_with_verdicts / generated, 6) if generated else None
     summary = {
         "verdicts_path": str(verdicts_path),
         "raw_calls_path": str(raw_calls_path),
         "top_m": args.top_m,
+        "query_max_new_tokens": args.query_max_new_tokens,
         "firing_counts": dict(firing_counts),
         "opportunity_counts": dict(opportunity_counts),
         "firing_rate_per_dimension": firing_rate,
+        # Read this BEFORE interpreting firing_rate. A parse failure and a genuine abstention
+        # both drive the firing rate to zero, and they mean opposite things.
+        "calls_generated": generated,
+        "parse_modes": dict(parse_modes),
+        "parse_rate": parse_rate,
+        "resume_regenerated_unusable": unusable_existing,
         "note": (
             "A near-zero firing rate here (Appendix H found 5/1,160 FAMILY opportunities) "
             "means row 3.9 will show little difference from AGS full for a real reason -- "
-            "abstention, not disagreement -- and that is the finding, not a bug."
+            "abstention, not disagreement -- and that is the finding, not a bug. "
+            "That reading is ONLY valid when parse_rate is high: a truncated or unparseable "
+            "response also yields a zero firing rate, and that IS a bug. Check parse_rate and "
+            "parse_modes first; if parse_modes['salvaged'] is large, responses are being cut "
+            "off and --query-max-new-tokens needs raising."
         ),
     }
     (args.output_dir / "llm_verifier_summary.json").write_text(
