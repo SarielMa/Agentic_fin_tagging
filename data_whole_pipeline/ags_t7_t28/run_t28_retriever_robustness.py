@@ -59,7 +59,12 @@ if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
 
 from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map  # noqa: E402
-from ags_t7_t28.dense_index import DEFAULT_DENSE_MODEL, DEFAULT_RRF_KAPPA, build_retriever  # noqa: E402
+from ags_t7_t28.dense_index import (  # noqa: E402
+    DEFAULT_DENSE_MODEL,
+    DEFAULT_EMBEDDING_CACHE_NAME,
+    DEFAULT_RRF_KAPPA,
+    build_retriever,
+)
 from ags_table5_ablation.core import (  # noqa: E402
     AblationConfig,
     FactRecord,
@@ -116,6 +121,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-seed", type=int, default=20260724)
     parser.add_argument("--skip-bm25", action="store_true", help="Only run the dense/hybrid rows.")
     parser.add_argument("--limit", type=int, default=None, help="Facts per method, for smoke tests.")
+    parser.add_argument(
+        "--embedding-cache",
+        type=Path,
+        default=None,
+        help=(
+            "Where concept/query embeddings are cached. Built if absent, loaded if present. "
+            "With a populated cache the run needs no GPU and no sentence-transformers at all."
+        ),
+    )
+    parser.add_argument(
+        "--build-cache-only",
+        action="store_true",
+        help="Embed the taxonomy and the replayed queries, write --embedding-cache, then exit.",
+    )
     return parser.parse_args()
 
 
@@ -316,16 +335,15 @@ def main() -> None:
     print(f"AGS facts: {len(ags_facts)}   one-pass facts: {len(onepass_facts)}", flush=True)
 
     grid = [entry for entry in GRID if not (args.skip_bm25 and entry[0] == "bm25")]
-    needs_dense = any(entry[0] in ("dense", "hybrid") for entry in grid)
+    needs_dense = any(entry[0] in ("dense", "hybrid") for entry in grid) or args.build_cache_only
 
-    # Both indexes are built once and reused across every grid row that needs them: tokenizing
-    # 17k BM25 documents and embedding 17k passages each cost far more than the replay itself.
-    needs_bm25 = any(entry[0] in ("bm25", "hybrid") for entry in grid)
-    bm25 = None
-    if needs_bm25:
-        print("Building BM25 index ...", flush=True)
-        bm25 = build_retriever("bm25", taxonomy, label_coverage_weight=0.0)
+    cache_path = args.embedding_cache
+    if cache_path is None and args.build_cache_only:
+        cache_path = args.output_dir / DEFAULT_EMBEDDING_CACHE_NAME
 
+    # Embedding is the only GPU step here and it is ~30 seconds of a multi-hour run; everything
+    # downstream (BM25 scoring, the Eq. 10 coverage rescore, core.evaluate, the bootstrap) is
+    # CPU-bound. --build-cache-only splits those apart so the long half can run GPU-free.
     dense = None
     if needs_dense:
         all_queries = [fact["query"] for fact in onepass_facts]
@@ -340,10 +358,25 @@ def main() -> None:
             batch_size=args.embed_batch_size,
             device=args.device,
             query_instruction=args.query_instruction,
+            cache_path=cache_path,
         )
         # Queries are all known up front (they are reused verbatim), so encode them in one
         # batched pass instead of one at a time inside the retrieval loop.
         dense.prime_query_cache(all_queries)
+        if cache_path is not None:
+            dense.save_cache()
+
+    if args.build_cache_only:
+        print(f"\nEmbedding cache ready at {cache_path}; exiting before the CPU replay.", flush=True)
+        return
+
+    # Both indexes are built once and reused across every grid row that needs them: tokenizing
+    # 17k BM25 documents and embedding 17k passages each cost far more than the replay itself.
+    needs_bm25 = any(entry[0] in ("bm25", "hybrid") for entry in grid)
+    bm25 = None
+    if needs_bm25:
+        print("Building BM25 index ...", flush=True)
+        bm25 = build_retriever("bm25", taxonomy, label_coverage_weight=0.0)
 
     per_variant_rows: dict[tuple[str, str, float], list[dict[str, Any]]] = {}
     summary_rows: list[dict[str, Any]] = []
@@ -363,6 +396,7 @@ def main() -> None:
             batch_size=args.embed_batch_size,
             device=args.device,
             query_instruction=args.query_instruction,
+            cache_path=cache_path,
         )
         if method == "one_pass":
             rows = run_onepass(retriever, onepass_facts, label)
@@ -477,6 +511,7 @@ def main() -> None:
             "Concept.retrieval_text -- '{tag}. {standard_label}. {documentation}', the identical "
             "string BM25 tokenizes. Only the retrieval model changes."
         ),
+        "embedding_cache": str(cache_path) if cache_path is not None else None,
         "queries_reused_no_regeneration": True,
         "query_sources": {
             "AGS": f"{args.ags_trace} rounds[].query per (hypothesis_idx, rendering), "

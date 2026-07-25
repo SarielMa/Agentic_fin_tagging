@@ -115,6 +115,46 @@ def main():
     ondemand = [c["tag"] for c in retrieve_candidates(dense, "total assets of the company", "monetaryItemType", 3)]
     check("primed cache matches on-demand encoding", primed == ondemand, f"{primed} vs {ondemand}")
 
+    # 8. embedding cache round-trip: the CPU replay stage depends on a cache-loaded retriever
+    #    being indistinguishable from a freshly embedded one, and on it never touching the
+    #    sentence-transformer at all (stage B has no GPU and should not pay to load one).
+    import tempfile
+
+    queries = ["total assets of the company", "goodwill impairment", "number of shares"]
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_file = Path(tmp) / "dense_embeddings.pt"
+        writer = DenseRetriever(concepts, model_name=MODEL, device="cpu", show_progress=False,
+                                cache_path=cache_file)
+        writer.prime_query_cache(queries, show_progress=False)
+        writer.save_cache()
+        check("save_cache writes the cache file", cache_file.exists())
+
+        reader = DenseRetriever(concepts, model_name=MODEL, device="cpu", show_progress=False,
+                                cache_path=cache_file)
+        check("cache-loaded retriever never loads the model", reader._model is None)
+        check(
+            "cache round-trips the concept embeddings bit-exactly",
+            bool(reader.embeddings.equal(writer.embeddings)),
+        )
+        for query in queries:
+            hit_a = [c["tag"] for c in retrieve_candidates(writer, query, "monetaryItemType", 4)]
+            hit_b = [c["tag"] for c in retrieve_candidates(reader, query, "monetaryItemType", 4)]
+            check(f"cached retrieval identical for {query!r}", hit_a == hit_b, f"{hit_a} vs {hit_b}")
+        reader.label_coverage_weight = 1.0
+        writer.label_coverage_weight = 1.0
+        cov_a = [c["retrieval_score"] for c in retrieve_candidates(writer, "goodwill", "monetaryItemType", 3)]
+        cov_b = [c["retrieval_score"] for c in retrieve_candidates(reader, "goodwill", "monetaryItemType", 3)]
+        check("cached +cov scores identical", cov_a == cov_b, f"{cov_a} vs {cov_b}")
+        reader.label_coverage_weight = 0.0
+        writer.label_coverage_weight = 0.0
+
+        # A cache built for a different model or a different taxonomy must be refused, not
+        # silently reused -- that would produce plausible, wrong numbers.
+        other = DenseRetriever(concepts[:-1], model_name=MODEL, device="cpu",
+                               show_progress=False, cache_path=cache_file)
+        check("cache rejected when the taxonomy differs", other._model is not None)
+        check("rejected cache still yields a working index", other.embeddings.shape[0] == len(concepts) - 1)
+
     print()
     if failures:
         print(f"{len(failures)} FAILURE(S): {failures}")

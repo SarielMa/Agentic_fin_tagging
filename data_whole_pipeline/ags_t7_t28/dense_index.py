@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+DEFAULT_EMBEDDING_CACHE_NAME = "dense_embeddings.pt"
+
 _PARENT = Path(__file__).resolve().parent.parent
 if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
@@ -145,9 +147,9 @@ class DenseRetriever(_CoverageMixin):
         query_instruction: str | None = None,
         passage_prefix: str | None = None,
         show_progress: bool = True,
+        cache_path: Any = None,
     ) -> None:
         import torch
-        from sentence_transformers import SentenceTransformer
 
         self.concepts = concepts
         self.model_name = model_name
@@ -161,23 +163,40 @@ class DenseRetriever(_CoverageMixin):
         )
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._torch = torch
-        self.model = SentenceTransformer(model_name, device=self.device)
         self.batch_size = batch_size
+        self.show_progress = show_progress
+        self.cache_path = Path(cache_path) if cache_path is not None else None
+        self._model: Any = None
+        self._query_cache: dict[str, Any] = {}
+        self._cache_dirty = False
 
-        # The identical text representation BM25 indexes (module docstring).
-        passages = [f"{self.passage_prefix}{concept.retrieval_text}" for concept in concepts]
-        print(
-            f"Embedding {len(passages)} concepts with {model_name} on {self.device} ...",
-            flush=True,
-        )
-        embeddings = self.model.encode(
-            passages,
-            batch_size=batch_size,
-            convert_to_tensor=True,
-            normalize_embeddings=True,  # cosine == dot product once both sides are unit norm
-            show_progress_bar=show_progress,
-        )
-        self.embeddings = embeddings.to(self.device)
+        payload = self._load_cache()
+        if payload is not None:
+            self.embeddings = payload["concept_embeddings"].to(self.device)
+            query_vectors = payload["query_embeddings"].to(self.device)
+            for offset, text in enumerate(payload["query_texts"]):
+                self._query_cache[text] = query_vectors[offset]
+            print(
+                f"Loaded {self.embeddings.shape[0]} concept and {len(self._query_cache)} query "
+                f"embeddings from {self.cache_path} (no GPU needed)",
+                flush=True,
+            )
+        else:
+            # The identical text representation BM25 indexes (module docstring).
+            passages = [f"{self.passage_prefix}{concept.retrieval_text}" for concept in concepts]
+            print(
+                f"Embedding {len(passages)} concepts with {model_name} on {self.device} ...",
+                flush=True,
+            )
+            embeddings = self.model.encode(
+                passages,
+                batch_size=batch_size,
+                convert_to_tensor=True,
+                normalize_embeddings=True,  # cosine == dot product once both sides are unit norm
+                show_progress_bar=show_progress,
+            )
+            self.embeddings = embeddings.to(self.device)
+            self._cache_dirty = True
 
         self.type_indices: dict[str, Any] = {}
         for index, concept in enumerate(concepts):
@@ -186,7 +205,99 @@ class DenseRetriever(_CoverageMixin):
             entity_type: torch.tensor(indices, dtype=torch.long, device=self.device)
             for entity_type, indices in self.type_indices.items()
         }
-        self._query_cache: dict[str, Any] = {}
+        # `retrieve` used to `index_select` the type subset on every single call. On a GPU that
+        # copy is free next to the matmul; on a CPU it is several times the matmul's cost, and
+        # this replay issues ~11.7k queries per grid row. The embeddings never change, so slice
+        # once here -- the submatrices together are one permutation of `embeddings`, so this
+        # costs one extra copy of the matrix (~70MB at 17k x 1024 fp32), not one per type.
+        self._type_matrices = {
+            entity_type: self.embeddings.index_select(0, indices).contiguous()
+            for entity_type, indices in self.type_indices.items()
+        }
+
+    @property
+    def model(self) -> Any:
+        """Loaded on first use only.
+
+        With a populated cache nothing here ever encodes anything, so the CPU replay job must
+        not pay to load (or even import) a 335M-parameter sentence-transformer it will not call.
+        """
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            print(f"Loading {self.model_name} on {self.device} ...", flush=True)
+            self._model = SentenceTransformer(self.model_name, device=self.device)
+        return self._model
+
+    # -- embedding cache ----------------------------------------------------------------
+    # Embedding the taxonomy is the only step in T28 that needs a GPU, and it is ~30 seconds
+    # of the multi-hour run. Persisting it lets the GPU stage and the CPU replay stage be
+    # separate jobs, so the replay never sits on an idle accelerator.
+
+    def _cache_signature(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "query_instruction": self.query_instruction,
+            "passage_prefix": self.passage_prefix,
+            "concept_tags": [concept.tag for concept in self.concepts],
+        }
+
+    def _load_cache(self) -> dict[str, Any] | None:
+        if self.cache_path is None or not self.cache_path.exists():
+            return None
+        torch = self._torch
+        try:
+            payload = torch.load(self.cache_path, map_location="cpu", weights_only=True)
+        except Exception as error:  # corrupt/truncated cache must not be silently trusted
+            print(f"Ignoring unreadable embedding cache {self.cache_path}: {error}", flush=True)
+            return None
+        signature = self._cache_signature()
+        for key in ("model_name", "query_instruction", "passage_prefix"):
+            if payload.get(key) != signature[key]:
+                print(
+                    f"Ignoring embedding cache {self.cache_path}: {key} was "
+                    f"{payload.get(key)!r}, this run wants {signature[key]!r}",
+                    flush=True,
+                )
+                return None
+        if list(payload.get("concept_tags", [])) != signature["concept_tags"]:
+            print(
+                f"Ignoring embedding cache {self.cache_path}: it was built over a different "
+                "taxonomy (concept tags or their order changed)",
+                flush=True,
+            )
+            return None
+        return payload
+
+    def save_cache(self, path: Any = None) -> None:
+        """Write concept and query embeddings so a later run needs no GPU at all."""
+        target = Path(path) if path is not None else self.cache_path
+        if target is None:
+            return
+        if target.exists() and not self._cache_dirty:
+            return
+        torch = self._torch
+        query_texts = sorted(self._query_cache)
+        payload = dict(self._cache_signature())
+        payload["concept_embeddings"] = self.embeddings.detach().to("cpu")
+        payload["query_texts"] = query_texts
+        payload["query_embeddings"] = (
+            torch.stack([self._query_cache[text] for text in query_texts]).detach().to("cpu")
+            if query_texts
+            else torch.empty((0, self.embeddings.shape[1]), dtype=self.embeddings.dtype)
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Write-then-rename: a job killed mid-write must not leave a half-file that the next
+        # run would load as if it were complete.
+        staging = target.with_suffix(target.suffix + ".tmp")
+        torch.save(payload, staging)
+        staging.replace(target)
+        self._cache_dirty = False
+        print(
+            f"Wrote {payload['concept_embeddings'].shape[0]} concept and {len(query_texts)} "
+            f"query embeddings to {target}",
+            flush=True,
+        )
 
     def prime_query_cache(self, queries: Sequence[str], show_progress: bool = True) -> None:
         """Batch-encode every query the run will issue.
@@ -208,6 +319,7 @@ class DenseRetriever(_CoverageMixin):
         ).to(self.device)
         for offset, query in enumerate(pending):
             self._query_cache[query] = vectors[offset]
+        self._cache_dirty = True
 
     def encode_query(self, query: str) -> Any:
         cached = self._query_cache.get(query)
@@ -220,6 +332,7 @@ class DenseRetriever(_CoverageMixin):
             show_progress_bar=False,
         ).to(self.device)
         self._query_cache[query] = vector
+        self._cache_dirty = True
         return vector
 
     def retrieve(
@@ -231,7 +344,7 @@ class DenseRetriever(_CoverageMixin):
             matrix = self.embeddings
             row_ids = None
         else:
-            matrix = self.embeddings.index_select(0, subset)
+            matrix = self._type_matrices[entity_type]  # sliced once in __init__, not per call
             row_ids = subset
 
         # The coverage term rescores a pool, so it needs more than top_k to work with. The
@@ -350,6 +463,7 @@ def build_retriever(
     batch_size: int = 256,
     device: str | None = None,
     query_instruction: str | None = None,
+    cache_path: Any = None,
 ) -> Any:
     """`kind` in {"bm25", "dense", "hybrid"}.
 
@@ -381,6 +495,7 @@ def build_retriever(
             batch_size=batch_size,
             device=device,
             query_instruction=query_instruction,
+            cache_path=cache_path,
         )
     if kind == "hybrid":
         base = dense or DenseRetriever(
@@ -391,6 +506,7 @@ def build_retriever(
             batch_size=batch_size,
             device=device,
             query_instruction=query_instruction,
+            cache_path=cache_path,
         )
         return HybridRetriever(
             concepts,
@@ -406,6 +522,7 @@ def build_retriever(
 __all__ = [
     "BM25Index",
     "DEFAULT_DENSE_MODEL",
+    "DEFAULT_EMBEDDING_CACHE_NAME",
     "DEFAULT_RRF_KAPPA",
     "DenseRetriever",
     "HybridRetriever",

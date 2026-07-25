@@ -23,6 +23,7 @@ from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization
 from ags_table5_ablation.core import (  # noqa: E402
     AblationConfig,
     FactRecord,
+    aggregate,
     evaluate,
     fuse,
     hybrid_agree_score,
@@ -118,6 +119,33 @@ def test_range_normalize() -> None:
     check("range_normalize min -> 0", abs(out["a"]) < 1e-9)
     check("range_normalize max -> 1", abs(out["c"] - 1.0) < 1e-9)
     check("range_normalize all-tied -> zeros", range_normalize({"a": 2.0, "b": 2.0}) == {"a": 0.0, "b": 0.0})
+
+
+# --- aggregate: means the metrics, does not truth-test them --------------------------------
+def test_aggregate_averages_fractional_rows() -> None:
+    """Regression: section 3.2's `-ensemble` row averages the idx0/idx1 per-fact rows BEFORE
+    aggregating, so its recall is 0.0/0.5/1.0. aggregate() used bool(), and bool(0.5) is True,
+    which promoted every split decision to a full hit -- collapsing that row onto the oracle
+    best-single row (3.11) and making -ensemble look better than AGS full while its own
+    paired-bootstrap delta said it was worse."""
+    split = [
+        {"mrr": 0.0, "top1_accuracy": 0.5, "recall_at_10": 0.5, "recall_at_50": 0.5, "recall_at_200": 1.0},
+        {"mrr": 0.0, "top1_accuracy": 0.0, "recall_at_10": 0.0, "recall_at_50": 0.5, "recall_at_200": 1.0},
+    ]
+    agg = aggregate(split)
+    check("aggregate averages a split (0.5) decision, not round it up", agg["recall_at_10"] == 0.25)
+    check("aggregate averages fractional top1_accuracy", agg["top1_accuracy"] == 0.25)
+    check("aggregate keeps a unanimous fractional hit at 1.0", agg["recall_at_200"] == 1.0)
+
+    booleans = [
+        {"mrr": 0.5, "top1_accuracy": True, "recall_at_10": True, "recall_at_50": True, "recall_at_200": True},
+        {"mrr": 0.0, "top1_accuracy": False, "recall_at_10": False, "recall_at_50": True, "recall_at_200": True},
+    ]
+    agg_bool = aggregate(booleans)
+    check(
+        "aggregate is unchanged on genuine boolean rows",
+        agg_bool["recall_at_10"] == 0.5 and agg_bool["recall_at_50"] == 1.0 and agg_bool["top1_accuracy"] == 0.5,
+    )
 
 
 # --- metric_row: top1_accuracy is rank==1 on the ranking itself, no selector ---------------
@@ -281,6 +309,7 @@ def main() -> None:
 
     print("\n[shared primitives]")
     test_range_normalize()
+    test_aggregate_averages_fractional_rows()
     test_metric_row()
     test_rerank_share()
 

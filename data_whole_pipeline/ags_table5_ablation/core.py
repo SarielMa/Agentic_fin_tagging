@@ -452,14 +452,26 @@ def _evaluate_oracle(fact: FactRecord, config: AblationConfig, normalization_map
 
 
 def aggregate(rows: list[dict[str, Any]], top_ks: tuple[int, ...] = TOP_KS) -> dict[str, Any]:
+    """Mean of each metric over `rows`.
+
+    float(), NOT bool(). For a row produced by evaluate() the two are identical -- the metrics
+    really are booleans and float(True) == 1.0. They diverge only when a caller has already
+    averaged two per-fact rows together, which section 3.2's `-ensemble` row does: it reports
+    the mean over WHICH hypothesis is kept, so its per-fact recall is 0.0, 0.5 or 1.0.
+    bool(0.5) is True, which silently promoted every split decision to a full hit and turned
+    that row into "either hypothesis hit" -- the union, i.e. exactly the oracle best-single
+    row (3.11). The two rows came out numerically identical, and -ensemble appeared to BEAT
+    AGS full while its own paired-bootstrap delta (computed from the same floats, correctly)
+    said it was worse. mrr never showed the bug because it was already summed as float.
+    """
     n = len(rows)
     if n == 0:
         return {"n": 0}
     out: dict[str, Any] = {
         "n": n,
         "mrr": round(sum(float(row["mrr"]) for row in rows) / n, 6),
-        "top1_accuracy": round(sum(bool(row["top1_accuracy"]) for row in rows) / n, 6),
+        "top1_accuracy": round(sum(float(row["top1_accuracy"]) for row in rows) / n, 6),
     }
     for k in top_ks:
-        out[f"recall_at_{k}"] = round(sum(bool(row[f"recall_at_{k}"]) for row in rows) / n, 6)
+        out[f"recall_at_{k}"] = round(sum(float(row[f"recall_at_{k}"]) for row in rows) / n, 6)
     return out
