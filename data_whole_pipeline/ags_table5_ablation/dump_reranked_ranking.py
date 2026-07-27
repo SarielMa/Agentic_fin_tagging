@@ -35,13 +35,20 @@ if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
 
 from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map  # noqa: E402
-from ags_table5_ablation.core import AblationConfig, evaluate, reset_consensus_cache  # noqa: E402
+from ags_table5_ablation.core import (  # noqa: E402
+    VERIFIER_MODES,
+    AblationConfig,
+    evaluate,
+    reset_consensus_cache,
+)
 from ags_table5_ablation.data_prep import DEFAULT_TEST_TRACE, load_test_facts, stream_jsonl  # noqa: E402
 from ags_table5_ablation.run_test_rows import load_llm_verifier_verdicts  # noqa: E402
+from run_ags_verifier_ablation import load_call_windows, restrict_verdicts  # noqa: E402
 from run_fintagging_grounding_baseline import normalize_tag  # noqa: E402
 
 
 DEFAULT_VERDICTS = _PARENT / "runs_ags_table5_ablation" / "qwen3_32b" / "llm_verifier_verdicts.json"
+DEFAULT_CALLS = _PARENT / "runs_ags_table5_ablation" / "qwen3_32b" / "llm_verifier_calls.jsonl"
 DEFAULT_OUTPUT = (
     _PARENT / "runs_ags_verifier_bridge" / "qwen3_32b" / "candidate_level_reranked_candidates.jsonl"
 )
@@ -57,6 +64,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=200)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=250)
+    parser.add_argument(
+        "--verifier-mode",
+        choices=VERIFIER_MODES,
+        default="auto",
+        help="Which verifier supplies the rerank term. 'auto' keeps the original behaviour "
+        "(hybrid, since verdicts are always loaded here). Use --beta 0 for the no-verifier arm.",
+    )
+    parser.add_argument(
+        "--top-m",
+        type=int,
+        default=None,
+        help="Restrict the LLM verdicts to the first M candidates of each logged call window. "
+        "Defaults to the window the verdicts were generated at. Cannot exceed it.",
+    )
+    parser.add_argument("--calls", type=Path, default=DEFAULT_CALLS, help="Call log, needed only for --top-m.")
+    parser.add_argument(
+        "--no-truncate",
+        action="store_true",
+        help="Rerank the whole fused pool and truncate afterwards. This is NOT the deployed "
+        "order and inflates Recall@200 by 0.0128; kept only to reproduce the original bridge run.",
+    )
+    parser.add_argument(
+        "--summary",
+        type=Path,
+        default=None,
+        help="Where to write the run summary. Defaults to candidate_level_reranked_summary.json "
+        "beside the output, which is the name the original single-arm run used.",
+    )
     return parser.parse_args()
 
 
@@ -93,8 +128,29 @@ def main() -> None:
     facts = load_test_facts(args.test_trace, limit=args.limit)
     print(f"test facts: {len(facts)}", flush=True)
 
+    generated_top_m = None
+    if args.top_m is not None:
+        windows, call_cost = load_call_windows(args.calls)
+        generated_top_m = call_cost["generated_top_m"]
+        if args.top_m > generated_top_m:
+            raise SystemExit(
+                f"--top-m {args.top_m} exceeds the window these verdicts were generated at "
+                f"({generated_top_m}); a larger window needs its own generation run."
+            )
+        verdicts = restrict_verdicts(verdicts, windows, args.top_m)
+        print(f"verdicts restricted to M={args.top_m}: {len(verdicts)}", flush=True)
+
+    uses_llm = args.verifier_mode != "deterministic"
     config = AblationConfig(
-        name="+ candidate-level LLM reranking", beta=args.beta, llm_verifier_verdicts=verdicts
+        name=f"verifier_mode={args.verifier_mode} beta={args.beta}",
+        beta=args.beta,
+        verifier_mode=args.verifier_mode,
+        # Deployed truncation order: cut the fused pool to top_k before reranking. Under this
+        # setting the deterministic arm reproduces the deployed retrieval stage to 0.000000,
+        # so the ranking handed to the listwise reranker is the one the pipeline would build.
+        truncate_pool_to_top_k=not args.no_truncate,
+        llm_verifier_top_m=args.top_m or generated_top_m or 10,
+        llm_verifier_verdicts=verdicts if uses_llm else None,
     )
     reset_consensus_cache()
     ranking_by_fact: dict[int, list[str]] = {}
@@ -150,12 +206,17 @@ def main() -> None:
         "unresolved_tags_dropped": unresolved_total,
         "beta": args.beta,
         "top_k": args.top_k,
+        "verifier_mode": args.verifier_mode,
+        "top_m": args.top_m or generated_top_m,
+        "llm_verdicts_used": len(verdicts) if uses_llm else 0,
         "note": (
             "Candidate objects are copied verbatim from the trace; only order and rank change. "
             "Feed to run_fintagging_grounding_baseline.py with --reuse-candidates."
         ),
     }
-    (args.output.parent / "candidate_level_reranked_summary.json").write_text(
+    summary_path = args.summary or (args.output.parent / "candidate_level_reranked_summary.json")
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2), flush=True)

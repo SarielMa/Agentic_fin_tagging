@@ -27,10 +27,12 @@ from ags_table5_ablation.core import (  # noqa: E402
     evaluate,
     fuse,
     hybrid_agree_score,
+    llm_only_agree_score,
     metric_row,
     range_normalize,
     rerank_share,
     reset_consensus_cache,
+    resolve_verifier_mode,
 )
 
 
@@ -132,7 +134,8 @@ def test_aggregate_averages_fractional_rows() -> None:
         {"mrr": 0.0, "top1_accuracy": 0.5, "recall_at_10": 0.5, "recall_at_50": 0.5, "recall_at_200": 1.0},
         {"mrr": 0.0, "top1_accuracy": 0.0, "recall_at_10": 0.0, "recall_at_50": 0.5, "recall_at_200": 1.0},
     ]
-    agg = aggregate(split)
+    # Explicit depths: this test is about averaging semantics, not about which depths exist.
+    agg = aggregate(split, top_ks=(10, 50, 200))
     check("aggregate averages a split (0.5) decision, not round it up", agg["recall_at_10"] == 0.25)
     check("aggregate averages fractional top1_accuracy", agg["top1_accuracy"] == 0.25)
     check("aggregate keeps a unanimous fractional hit at 1.0", agg["recall_at_200"] == 1.0)
@@ -141,7 +144,7 @@ def test_aggregate_averages_fractional_rows() -> None:
         {"mrr": 0.5, "top1_accuracy": True, "recall_at_10": True, "recall_at_50": True, "recall_at_200": True},
         {"mrr": 0.0, "top1_accuracy": False, "recall_at_10": False, "recall_at_50": True, "recall_at_200": True},
     ]
-    agg_bool = aggregate(booleans)
+    agg_bool = aggregate(booleans, top_ks=(10, 50, 200))
     check(
         "aggregate is unchanged on genuine boolean rows",
         agg_bool["recall_at_10"] == 0.5 and agg_bool["recall_at_50"] == 1.0 and agg_bool["top1_accuracy"] == 0.5,
@@ -191,6 +194,122 @@ def test_hybrid_agree_score(nmap) -> None:
         candidate, hypothesis["dimensions"], nmap, profile, {"FAMILY": None, "ROLE": None, "EVENT": None}, ("FAMILY", "ROLE", "EVENT")
     )
     check("all-abstain hybrid reduces to symbolic-only", abs(abstained - symbolic_only) < 1e-9, f"{abstained} vs {symbolic_only}")
+
+
+# --- verifier_mode: the five arms are five different scoring rules, not renamings ----------
+def _verifier_mode_fact() -> FactRecord:
+    """One fact, one hypothesis, two head candidates the verifier will split on."""
+    hypotheses = {
+        0: {"dimensions": {"FAMILY": "Cash", "ROLE": "carrying value", "EVENT": "UNRESOLVED",
+                           "QUALIFIER": "UNRESOLVED", "SCOPE": "UNRESOLVED", "TEMPORAL": "instant"}},
+    }
+    # Three candidates, so range-normalization leaves the rank-2 candidate 0.492 below the
+    # head -- a gap beta=0.6 can close. With only two candidates the normalized gap is 1.0 by
+    # construction and no verifier term can ever reorder anything.
+    pool = [
+        make_candidate("us-gaap:Revenues", 1, documentation="Revenue from contracts with customers."),
+        make_candidate("us-gaap:CashAndCashEquivalentsAtCarryingValue", 2,
+                       documentation="Cash and cash equivalents at carrying value."),
+        make_candidate("us-gaap:OtherAssets", 3, documentation="Other assets, noncurrent."),
+    ]
+    return FactRecord(
+        fact_id=7,
+        context_id="ctx7",
+        modality="table",
+        datatype="monetaryItemType",
+        gold_tags=["us-gaap:CashAndCashEquivalentsAtCarryingValue"],
+        hypotheses=hypotheses,
+        rankings={(0, "def"): list(pool), (0, "lab"): list(pool)},
+    )
+
+
+def test_llm_only_agree_score() -> None:
+    dims = ("FAMILY", "ROLE", "EVENT")
+
+    both = llm_only_agree_score({"FAMILY": True, "ROLE": True, "EVENT": True}, dims, "drop")
+    check("all-support LLM-only score is 1.0", abs(both - 1.0) < 1e-9, str(both))
+
+    # Partial abstention is where the two readings separate: 'drop' averages over what was
+    # ruled on (2/2 = 1.0), 'negative' counts the silence against the candidate (2/3).
+    dropped = llm_only_agree_score({"FAMILY": True, "ROLE": True, "EVENT": None}, dims, "drop")
+    strict = llm_only_agree_score({"FAMILY": True, "ROLE": True, "EVENT": None}, dims, "negative")
+    check("abstention='drop' averages over issued verdicts only", abs(dropped - 1.0) < 1e-9, str(dropped))
+    check("abstention='negative' counts an abstention as non-support", abs(strict - 2 / 3) < 1e-9, str(strict))
+    check("the two abstention readings are not the same experiment", dropped > strict)
+
+    # A candidate outside the top-M window has no verdict under either reading.
+    check("unseen candidate scores None under 'drop'", llm_only_agree_score(None, dims, "drop") is None)
+    check("unseen candidate scores 0.0 under 'negative'", llm_only_agree_score(None, dims, "negative") == 0.0)
+
+    # QUALIFIER/SCOPE/TEMPORAL must not leak in: only llm_dimensions are consulted.
+    ignored = llm_only_agree_score({"FAMILY": True, "QUALIFIER": False}, dims, "drop")
+    check("dimensions outside llm_dimensions are ignored", abs(ignored - 1.0) < 1e-9, str(ignored))
+
+
+def test_verifier_mode_resolution() -> None:
+    check(
+        "auto with no verdicts is the deterministic arm",
+        resolve_verifier_mode(AblationConfig()) == "deterministic",
+    )
+    check(
+        "auto with verdicts is the hybrid arm (pre-existing rows unchanged)",
+        resolve_verifier_mode(AblationConfig(llm_verifier_verdicts={})) == "hybrid",
+    )
+    for mode in ("hybrid", "llm_drop", "llm_strict"):
+        try:
+            resolve_verifier_mode(AblationConfig(verifier_mode=mode))
+            failed = False
+        except ValueError:
+            failed = True
+        check(f"verifier_mode={mode} without verdicts raises rather than silently degrading", failed)
+    try:
+        resolve_verifier_mode(AblationConfig(verifier_mode="nonsense"))
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("an unknown verifier_mode is rejected", rejected)
+
+
+def test_verifier_modes_are_distinct_rankings(nmap) -> None:
+    """The arms must actually rank differently on the same pool, or the ablation is vacuous."""
+    fact = _verifier_mode_fact()
+    verdicts = {
+        # Hypothesis 0 judges the two head candidates in opposite directions.
+        (7, 0, "us-gaap:Revenues"): {"FAMILY": False, "ROLE": False, "EVENT": None},
+        (7, 0, "us-gaap:CashAndCashEquivalentsAtCarryingValue"): {"FAMILY": True, "ROLE": True, "EVENT": None},
+    }
+    rankings = {}
+    for mode in ("deterministic", "hybrid", "llm_drop", "llm_strict"):
+        reset_consensus_cache()
+        config = AblationConfig(
+            name=mode,
+            beta=0.6,
+            verifier_mode=mode,
+            llm_verifier_verdicts=None if mode == "deterministic" else verdicts,
+        )
+        rankings[mode] = evaluate(fact, config, nmap)["candidate_tags"]
+
+    check("every mode returns the same candidate set", len({frozenset(v) for v in rankings.values()}) == 1)
+    # Designed so the abstention reading alone decides the top-1: gold carries two supporting
+    # verdicts and one abstention, worth 1.0 under 'drop' (enough to close the 0.492 gap once
+    # beta=0.6 is applied) but only 2/3 under 'negative' (0.400, not enough).
+    gold = "us-gaap:CashAndCashEquivalentsAtCarryingValue"
+    check("abstention='drop' promotes gold to rank 1", rankings["llm_drop"][0] == gold, str(rankings["llm_drop"]))
+    check(
+        "abstention='negative' leaves gold below the retrieval head",
+        rankings["llm_strict"][0] == "us-gaap:Revenues",
+        str(rankings["llm_strict"]),
+    )
+    check("the four verifier arms are not renamings of one ranking", len({tuple(v) for v in rankings.values()}) > 1)
+
+    reset_consensus_cache()
+    no_verifier = evaluate(fact, AblationConfig(name="none", beta=0.0), nmap)["candidate_tags"]
+    check(
+        "beta=0 (no verifier) is pure retrieval order",
+        no_verifier[0] == "us-gaap:Revenues",
+        str(no_verifier),
+    )
+    check("a verifier arm can move gold off the retrieval order", rankings["llm_drop"] != no_verifier)
 
 
 def test_rerank_share() -> None:
@@ -315,6 +434,11 @@ def main() -> None:
 
     print("\n[section 3.9] LLM verifier hybridization")
     test_hybrid_agree_score(nmap)
+
+    print("\n[verifier ablation] the five verifier arms")
+    test_llm_only_agree_score()
+    test_verifier_mode_resolution()
+    test_verifier_modes_are_distinct_rankings(nmap)
 
     print("\n[section 3.2] J=1 seed-noise guard")
     test_ensemble_requires_explicit_kept_idx()

@@ -42,8 +42,16 @@ from ags_symbolic_agreement import (  # noqa: E402
 from run_fintagging_grounding_baseline import normalize_tag  # noqa: E402
 
 
-TOP_KS = (10, 50, 200)
+# 20 is here because the deployed listwise reranker sees exactly the top 20, so the
+# verifier/reranker interaction table is stated at that depth. Adding a depth only adds a
+# recall_at_20 key; callers name the metrics they write, so existing CSV schemas are unchanged.
+TOP_KS = (10, 20, 50, 200)
 LLM_VERIFIER_DIMENSIONS_DEFAULT = ("FAMILY", "ROLE", "EVENT")
+
+# Which verifier supplies the rerank term. "auto" preserves the original behaviour --
+# hybrid when verdicts are attached, deterministic when they are not -- so every row
+# written before verifier_mode existed evaluates identically.
+VERIFIER_MODES = ("auto", "deterministic", "hybrid", "llm_drop", "llm_strict")
 
 
 @dataclass(frozen=True)
@@ -63,6 +71,15 @@ class AblationConfig:
     oracle_best_single: bool = False
     llm_verifier_top_m: int = 10
     llm_verifier_dimensions: tuple[str, ...] = LLM_VERIFIER_DIMENSIONS_DEFAULT
+    verifier_mode: str = "auto"
+    # The deployed pipeline truncates the fused pool to top_k BEFORE the consensus rerank
+    # (run_fintagging_grounding_baseline.fuse_round_candidates), so its rerank can only
+    # reorder within the top 200 and Recall@200 is fixed by fusion alone. This harness
+    # originally reranked the whole fused pool and truncated afterwards, which lets consensus
+    # pull a concept from outside the fused top 200 into it -- worth +0.0128 Recall@200 and
+    # the reason the two disagreed. False keeps the original behaviour so the pre-existing
+    # Table 5 rows are unchanged; True reproduces the deployed pipeline.
+    truncate_pool_to_top_k: bool = False
     # (fact_id, hyp_idx, tag) -> {"FAMILY": bool|None, "ROLE": bool|None, "EVENT": bool|None};
     # populated by run_llm_verifier.py for row 3.9, absent (None) for every other row.
     llm_verifier_verdicts: dict[tuple[int, int, str], dict[str, Any]] | None = None
@@ -196,6 +213,96 @@ def hybrid_consensus_scores(
     return scores
 
 
+def truncate_fused_pool(
+    scores: dict[str, float],
+    best_candidate: dict[str, dict[str, Any]],
+    top_k: int,
+) -> tuple[dict[str, float], dict[str, dict[str, Any]]]:
+    """Keep the top_k candidates by fused score, as the deployed fusion does before reranking.
+
+    Tie-break mirrors fuse_round_candidates: fused score descending, then the candidate's best
+    round rank, then the tag. Only the boundary of the pool can be affected by the tie-break,
+    and reproducing the deployed ordering there is the point.
+    """
+    if top_k <= 0 or len(scores) <= top_k:
+        return scores, best_candidate
+    ordered = sorted(
+        scores,
+        key=lambda tag: (-scores[tag], int(best_candidate[tag].get("rank", 10**9) or 10**9), tag),
+    )[:top_k]
+    kept = set(ordered)
+    return (
+        {tag: scores[tag] for tag in ordered},
+        {tag: best_candidate[tag] for tag in kept},
+    )
+
+
+def llm_only_agree_score(
+    llm_verdict: dict[str, Any] | None,
+    llm_dimensions: tuple[str, ...],
+    abstention: str,
+) -> float | None:
+    """agree() over the LLM's own dimensions only, with no symbolic term anywhere.
+
+    This is the "- deterministic verifier" arm: unlike hybrid_agree_score, an abstention does
+    NOT fall back to the symbolic verdict, and QUALIFIER/SCOPE/TEMPORAL never enter. Two
+    readings of what to do with an abstention, kept as separate arms because they are not the
+    same experiment:
+
+      abstention="drop"      average over the dimensions the verifier actually ruled on. A
+                             candidate it declined to judge entirely scores None, which the
+                             caller floors to 0.0 -- the same place an unseen candidate lands.
+      abstention="negative"  an abstention counts as non-support. Silence is evidence against
+                             the candidate, so a verifier that abstains on two of three
+                             dimensions cannot reach the top of the ranking on the third.
+
+    Candidates outside the top-M window have no verdict under either reading and score 0.0,
+    which is what confines this term to the head of the ranking.
+    """
+    if abstention not in ("drop", "negative"):
+        raise ValueError(f"Unknown abstention {abstention!r}; expected 'drop' or 'negative'")
+    if llm_verdict is None:
+        return None if abstention == "drop" else 0.0
+    matches: list[bool] = []
+    for dimension in llm_dimensions:
+        value = llm_verdict.get(dimension)
+        if value is None:
+            if abstention == "negative":
+                matches.append(False)
+            continue
+        matches.append(bool(value))
+    if not matches:
+        return None if abstention == "drop" else 0.0
+    return sum(matches) / len(matches)
+
+
+def llm_only_consensus_scores(
+    candidates: list[dict[str, Any]],
+    hypotheses: list[dict[str, Any]],
+    fact_id: int,
+    hyp_indices: list[int],
+    verdicts: dict[tuple[int, int, str], dict[str, Any]],
+    llm_dimensions: tuple[str, ...],
+    abstention: str,
+) -> dict[str, float]:
+    """Consensus over hypotheses using llm_only_agree_score. Same shape as
+    hybrid_consensus_scores -- mean over hypotheses, None floored to 0.0 -- so the two differ
+    only in where the per-dimension verdict comes from."""
+    if not hypotheses:
+        return {}
+    scores: dict[str, float] = {}
+    for candidate in candidates:
+        tag = normalize_tag(candidate.get("tag", ""))
+        if tag in scores:
+            continue
+        per_hypothesis = []
+        for hyp_idx in hyp_indices:
+            score = llm_only_agree_score(verdicts.get((fact_id, hyp_idx, tag)), llm_dimensions, abstention)
+            per_hypothesis.append(score if score is not None else 0.0)
+        scores[tag] = round(sum(per_hypothesis) / len(per_hypothesis), 6)
+    return scores
+
+
 def rerank_share(base_scores: dict[str, float], consensus: dict[str, float], beta: float) -> float | None:
     """Table 18's diagnostic: (beta * range(consensus)) / range(fused score), over the pool
     that survived to rerank. `base_scores` is the score consensus is added *to* -- the
@@ -209,6 +316,23 @@ def rerank_share(base_scores: dict[str, float], consensus: dict[str, float], bet
     consensus_values = [consensus.get(tag, 0.0) for tag in base_scores]
     consensus_range = max(consensus_values) - min(consensus_values) if consensus_values else 0.0
     return round((beta * consensus_range) / base_range, 6)
+
+
+def resolve_verifier_mode(config: AblationConfig) -> str:
+    """Which verifier term this config asks for, with "auto" resolved.
+
+    Fails loudly rather than silently degrading to the deterministic term: an LLM mode with
+    no verdicts attached would otherwise produce a plausible-looking row that is really the
+    deterministic arm under a different name.
+    """
+    mode = config.verifier_mode
+    if mode not in VERIFIER_MODES:
+        raise ValueError(f"Unknown verifier_mode {mode!r}; expected one of {VERIFIER_MODES}")
+    if mode == "auto":
+        return "hybrid" if config.llm_verifier_verdicts is not None else "deterministic"
+    if mode != "deterministic" and config.llm_verifier_verdicts is None:
+        raise ValueError(f"verifier_mode={mode!r} requires llm_verifier_verdicts; none were attached")
+    return mode
 
 
 _CONSENSUS_CACHE: dict[tuple[Any, ...], dict[str, float]] = {}
@@ -232,11 +356,12 @@ def _consensus_for(
     for the same J=2-dual selection under five different fusion/scaling/beta settings, so
     caching here turns the dominant cost (symbolic profile parsing over the pool) from five
     computations per fact into one."""
-    key = (fact_id, tuple(sorted(hyp_indices)), tuple(sorted(renderings)), config.llm_verifier_verdicts is not None)
+    mode = resolve_verifier_mode(config)
+    key = (fact_id, tuple(sorted(hyp_indices)), tuple(sorted(renderings)), mode)
     cached = _CONSENSUS_CACHE.get(key)
     if cached is not None:
         return cached
-    if config.llm_verifier_verdicts is not None:
+    if mode == "hybrid":
         result = hybrid_consensus_scores(
             pool,
             hypotheses,
@@ -245,6 +370,16 @@ def _consensus_for(
             hyp_indices,
             config.llm_verifier_verdicts,
             config.llm_verifier_dimensions,
+        )
+    elif mode in ("llm_drop", "llm_strict"):
+        result = llm_only_consensus_scores(
+            pool,
+            hypotheses,
+            fact_id,
+            hyp_indices,
+            config.llm_verifier_verdicts,
+            config.llm_verifier_dimensions,
+            abstention="drop" if mode == "llm_drop" else "negative",
         )
     else:
         result = consensus_scores(pool, hypotheses, normalization_map)
@@ -366,6 +501,8 @@ def evaluate(fact: FactRecord, config: AblationConfig, normalization_map: dict[s
         n_rankings = 0
     else:
         scores, best_candidate = fuse(rankings, config.rrf_kappa, config.fusion)
+        if config.truncate_pool_to_top_k:
+            scores, best_candidate = truncate_fused_pool(scores, best_candidate, config.top_k)
         ranked, diagnostics = rerank(
             scores, best_candidate, hypotheses_used, hyp_indices, actual_renderings, normalization_map, config, fact.fact_id
         )
