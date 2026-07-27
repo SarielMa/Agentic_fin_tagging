@@ -151,9 +151,13 @@ if [[ ! -f "${STAGED}" ]]; then
   cp "${RERANKED_RANKING}" "${STAGED}"
 fi
 
+# --query-mode must match the staged file's own query_mode, or validate_candidate_records
+# rejects it (run_fintagging_grounding_baseline.py:883). The ranking is frozen-AGS's, reordered
+# by candidate-level LLM reranking; the mode tag is unchanged by that reordering.
 python run_fintagging_grounding_baseline.py \
   --test-jsonl "${TEST_JSONL}" \
   --output-dir "${OUTPUT_DIR}" \
+  --query-mode frozen_ags \
   --reuse-candidates \
   --run-rerank \
   --rerank-model "${RERANK_MODEL}" \
