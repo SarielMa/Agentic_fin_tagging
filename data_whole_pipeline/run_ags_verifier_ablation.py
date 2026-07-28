@@ -56,6 +56,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map  # noqa: E402
 from ags_table5_ablation.core import AblationConfig, aggregate, evaluate, reset_consensus_cache  # noqa: E402
 from ags_table5_ablation.data_prep import DEFAULT_TEST_TRACE, load_test_facts  # noqa: E402
+from ags_table5_ablation.run_llm_verifier import ALL_JUDGED_DIMENSIONS, VERIFIER_DIMENSIONS  # noqa: E402
 from ags_table5_ablation.run_test_rows import load_llm_verifier_verdicts, rows_for_modality  # noqa: E402
 from compute_ags_seq_arm_metrics import paired_bootstrap  # noqa: E402
 from run_fintagging_grounding_baseline import normalize_tag  # noqa: E402
@@ -75,8 +76,16 @@ ARMS: tuple[tuple[str, str, float, bool], ...] = (
     ("- deterministic verifier", "llm_drop", 0.6, True),
     ("LLM verifier only", "llm_strict", 0.6, True),
     ("- both verifiers", "deterministic", 0.0, False),
+    # Scope-matched control. "- deterministic verifier" vs "Hybrid AGS (full)" compares a term
+    # reaching 10 of 200 candidates against one reaching all 200, then scores it at top-1 --
+    # the one rank the narrow term was aimed at. This arm gives the symbolic verdict the LLM's
+    # window and fill rule, so the contrast against "- deterministic verifier" varies only the
+    # verdict source. It consumes the verdicts file for its KEYS; no LLM judgement is scored,
+    # hence uses_llm=False for the cost columns.
+    ("Deterministic, window-matched", "det_window", 0.6, False),
 )
 BASELINE_ARM = ARMS[0][0]
+LLM_DIMS: tuple[str, ...] = VERIFIER_DIMENSIONS  # set from --llm-dimensions in main()
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +95,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calls", type=Path, default=DEFAULT_CALLS)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--normalization-map", type=Path, default=DEFAULT_NORMALIZATION_MAP)
+    # Must match the --judge-dimensions the verdicts were generated with. Verdicts carrying
+    # QUALIFIER/SCOPE/TEMPORAL scored under the default 3-tuple would silently drop half the
+    # judgements and look like a weaker version of the 3-dimension arm rather than a control.
+    parser.add_argument(
+        "--llm-dimensions",
+        choices=("llm", "all"),
+        default="llm",
+        help="Dimensions read from the verdicts file. 'llm' is FAMILY/ROLE/EVENT; use 'all' for "
+        "verdicts generated with run_llm_verifier.py --judge-dimensions all.",
+    )
     parser.add_argument("--bootstrap-samples", type=int, default=BOOTSTRAP_SAMPLES)
     parser.add_argument("--seed", type=int, default=BOOTSTRAP_SEED)
     parser.add_argument(
@@ -229,6 +248,9 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> None:
     args = parse_args()
+    global LLM_DIMS
+    LLM_DIMS = ALL_JUDGED_DIMENSIONS if args.llm_dimensions == "all" else VERIFIER_DIMENSIONS
+    print(f"scoring LLM verdicts over: {', '.join(LLM_DIMS)}", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     normalization_map = load_normalization_map(args.normalization_map)
@@ -262,6 +284,10 @@ def main() -> None:
             beta=beta,
             verifier_mode=mode,
             truncate_pool_to_top_k=True,
+            # Neutral fill for candidates the verifier never saw, so an LLM-only arm tests
+            # "which verdict source" rather than "verdict source plus a top-K_v prior".
+            llm_unjudged_fill="mean",
+            llm_verifier_dimensions=LLM_DIMS,
             llm_verifier_verdicts=verdicts if mode != "deterministic" else None,
         )
         rows, elapsed = run(name, config)
@@ -362,6 +388,7 @@ def main() -> None:
         "verdicts_path": str(args.verdicts),
         "calls_path": str(args.calls),
         "generated_top_m": generated_m,
+        "llm_unjudged_fill": "mean",
         "sensitivity_unavailable_top_m": unavailable,
         "verifier_call_cost_total": call_cost,
         "pooled": {

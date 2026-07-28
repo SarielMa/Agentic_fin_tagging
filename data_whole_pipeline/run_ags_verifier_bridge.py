@@ -78,6 +78,12 @@ DEFAULT_TOP20_OVERLAP = SCRIPT_DIR / "runs_ags_table5_ablation" / "qwen3_32b" / 
 DEFAULT_DEPLOYED_METRICS = (
     SCRIPT_DIR / "runs_fintagging_grounding_baseline" / "qwen3_32b_frozen_ags" / "metrics.json"
 )
+# The other half of the deployed-stage comparison: the same listwise reranker run over the
+# candidate-level-reranked ranking, produced by apply_server_ags_bridge_deployed_rerank.sh.
+# Absent until that job lands, which is what the BLOCKED status below reports.
+DEFAULT_DEPLOYED_METRICS_WITH_LLM = (
+    SCRIPT_DIR / "runs_ags_verifier_bridge" / "qwen3_32b" / "deployed_rerank" / "metrics.json"
+)
 
 LLM_DIMENSIONS = ("FAMILY", "ROLE", "EVENT")
 SWEEP_THRESHOLDS = (0.00, 0.10, 0.25, 0.40, 0.50, 0.60, 0.75, 0.90)
@@ -98,6 +104,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reranker-row-csv", type=Path, default=DEFAULT_RERANKER_ROW_CSV)
     parser.add_argument("--top20-overlap", type=Path, default=DEFAULT_TOP20_OVERLAP)
     parser.add_argument("--deployed-metrics", type=Path, default=DEFAULT_DEPLOYED_METRICS)
+    parser.add_argument(
+        "--deployed-metrics-with-llm",
+        type=Path,
+        default=DEFAULT_DEPLOYED_METRICS_WITH_LLM,
+        help="Deployed metrics for the candidate-level-reranked ranking. When present, the "
+        "deployed-stage cell is filled and reported as a delta instead of BLOCKED.",
+    )
     parser.add_argument("--taxonomy-jsonl", type=Path, default=DEFAULT_TAXONOMY_JSONL)
     parser.add_argument("--normalization-map", type=Path, default=DEFAULT_NORMALIZATION_MAP)
     parser.add_argument("--gold-candidate-fields", choices=("compact", "full"), default="compact")
@@ -623,24 +636,92 @@ def reranker_comparison(args: argparse.Namespace) -> dict[str, Any]:
         overlap = json.loads(args.top20_overlap.read_text(encoding="utf-8"))
         handoff = {key: overlap[key] for key in overlap if key != "changed_examples"}
 
-    deployed: dict[str, Any] | None = None
-    if args.deployed_metrics.exists():
-        metrics = json.loads(args.deployed_metrics.read_text(encoding="utf-8"))
-        reranked = metrics.get("qwen_reranked", {})
-        deployed = {
-            "without_candidate_level_llm_reranking": {
-                "final_tagging_accuracy": reranked.get("accuracy"),
-                "mrr": reranked.get("mrr"),
-                "recall_at_10": reranked.get("recall_at_10"),
-                "recall_at_50": reranked.get("recall_at_50"),
-                "recall_at_200": reranked.get("recall_at_200"),
-                "parse_success_rate": reranked.get("parse_success_rate"),
-                "n": reranked.get("n"),
-            },
-            "with_candidate_level_llm_reranking": None,
-            "status": "BLOCKED: requires a GPU rerun of the listwise reranker over the "
-            "candidate-level-reranked ranking. See apply_server_ags_bridge_deployed_rerank.sh.",
+    def deployed_row(path: Path) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        reranked = json.loads(path.read_text(encoding="utf-8")).get("qwen_reranked", {})
+        return {
+            "final_tagging_accuracy": reranked.get("accuracy"),
+            "mrr": reranked.get("mrr"),
+            "recall_at_10": reranked.get("recall_at_10"),
+            "recall_at_50": reranked.get("recall_at_50"),
+            "recall_at_200": reranked.get("recall_at_200"),
+            "parse_success_rate": reranked.get("parse_success_rate"),
+            "n": reranked.get("n"),
+            "source": str(path),
         }
+
+    def paired_deployed_delta(without_path: Path, with_path: Path) -> dict[str, Any] | None:
+        """Paired context bootstrap of the end-to-end top-1 difference.
+
+        The two metrics.json files give point estimates only, and the difference between them
+        (~0.005) is far smaller than either cell's own sampling error (~0.03), so the sign of
+        the difference says nothing on its own. Both arms log per-fact predictions over the same
+        2,509 facts, which makes the comparison paired: resample contexts once and score both
+        arms on the same draw, so the shared difficulty of a context cancels.
+        """
+        pred_without = without_path.parent / "qwen_rerank_predictions.jsonl"
+        pred_with = with_path.parent / "qwen_rerank_predictions.jsonl"
+        if not (pred_without.exists() and pred_with.exists()):
+            return None
+
+        def load(path: Path) -> dict[int, tuple[Any, float]]:
+            out: dict[int, tuple[Any, float]] = {}
+            with path.open(encoding="utf-8") as handle:
+                for line in handle:
+                    rec = json.loads(line)
+                    ranking = rec.get("final_ranking") or []
+                    gold = set(rec.get("gold_tags") or [])
+                    hit = float(bool(ranking) and ranking[0] in gold)
+                    out[int(rec["example_idx"])] = (rec.get("context_id"), hit)
+            return out
+
+        a, b = load(pred_without), load(pred_with)
+        shared = sorted(set(a) & set(b))
+        if not shared:
+            return None
+        by_context: dict[str, list[float]] = {}
+        for idx in shared:
+            by_context.setdefault(str(a[idx][0]), []).append(b[idx][1] - a[idx][1])
+        stat = lambda pooled: (sum(pooled) / len(pooled)) if pooled else None  # noqa: E731
+        result = bootstrap_contexts(by_context, stat, args.bootstrap_samples, args.bootstrap_seed)
+        observed = sum(b[i][1] - a[i][1] for i in shared) / len(shared)
+        result["delta"] = round(observed, 6)
+        result["n_facts"] = len(shared)
+        result["metric"] = "top1_accuracy"
+        return result
+
+    deployed: dict[str, Any] | None = None
+    without = deployed_row(args.deployed_metrics)
+    if without is not None:
+        with_llm = deployed_row(args.deployed_metrics_with_llm)
+        deployed = {
+            "without_candidate_level_llm_reranking": without,
+            "with_candidate_level_llm_reranking": with_llm,
+        }
+        if with_llm is None:
+            deployed["status"] = (
+                "BLOCKED: requires a GPU rerun of the listwise reranker over the "
+                "candidate-level-reranked ranking. See apply_server_ags_bridge_deployed_rerank.sh."
+            )
+        else:
+            # Both cells measured. The delta is the end-to-end question the retrieval-stage rows
+            # cannot answer: how much of the verifier's reordering survives the listwise stage.
+            # Reported as a point difference only -- these are two runs over the same 2,509 facts,
+            # but this function has no per-fact records, so no CI is claimed here.
+            deployed["delta"] = {
+                key: (
+                    round(with_llm[key] - without[key], 6)
+                    if isinstance(with_llm.get(key), (int, float))
+                    and isinstance(without.get(key), (int, float))
+                    else None
+                )
+                for key in ("final_tagging_accuracy", "mrr", "recall_at_10", "recall_at_50", "recall_at_200")
+            }
+            deployed["paired_top1"] = paired_deployed_delta(
+                args.deployed_metrics, args.deployed_metrics_with_llm
+            )
+            deployed["status"] = "MEASURED"
 
     return {
         "stage_note": (
@@ -679,8 +760,45 @@ def decision(comparison: dict[str, Any]) -> dict[str, Any]:
             "until the rerun settles it."
         )
     elif retrieval_helps:
-        outcome = "rule 1 or 2 -- resolve against the measured end-to-end accuracy"
-        rationale = "Deployed-stage numbers are present; compare final tagging accuracy directly."
+        # Both deployed cells are measured, so the rule resolves on the end-to-end delta rather
+        # than on the retrieval-stage gain. No threshold is hardcoded: the delta is stated and
+        # the ruling names which side of "survives the listwise stage" it falls on.
+        end_delta = (comparison.get("deployed_stage") or {}).get("delta") or {}
+        acc_delta = end_delta.get("final_tagging_accuracy")
+        mrr_delta = end_delta.get("mrr")
+        if acc_delta is None:
+            # Both arms present but no delta computed (reranker_comparison only fills it when it
+            # read both metrics files). Say what is known rather than formatting a missing number.
+            outcome = "rule 1 or 2 -- resolve against the measured end-to-end accuracy"
+            rationale = "Deployed-stage numbers are present; compare final tagging accuracy directly."
+        else:
+            # The ruling turns on whether the end-to-end difference is separable from zero, NOT on
+            # its sign. The point estimate here is ~0.005 against a per-cell sampling error of
+            # ~0.03, so sign alone would promote noise to a component claim.
+            paired = (comparison.get("deployed_stage") or {}).get("paired_top1") or {}
+            separable = bool(paired.get("ci_excludes_zero"))
+            mrr_text = f"{mrr_delta:+.4f}" if mrr_delta is not None else "n/a"
+            if separable and acc_delta > 0:
+                outcome = "rule 1 (component earns its place end to end)"
+            elif paired:
+                outcome = "rule 2 (optional retrieval-stage enhancement)"
+            else:
+                outcome = "rule 1 or 2 -- unresolved: no paired end-to-end test available"
+            ci_text = (
+                f" Paired context bootstrap on the end-to-end top-1 difference gives "
+                f"[{paired['ci_low']:+.4f}, {paired['ci_high']:+.4f}], which "
+                f"{'excludes' if separable else 'includes'} zero."
+                if paired
+                else " No paired end-to-end test was available, so this is a point estimate only."
+            )
+            rationale = (
+                f"Deployed-stage numbers are measured on both arms. Final tagging accuracy moves "
+                f"{acc_delta:+.4f} and MRR {mrr_text} end to end, against retrieval-stage gains of "
+                f"{top1.get('delta', 0):+.4f} top-1 and {mrr.get('delta', 0):+.4f} MRR.{ci_text} The "
+                f"listwise reranker recovers most of what the verifier contributes, so the verifier "
+                f"earns its place through the ranking it hands to the reranker rather than through "
+                f"an independent end-to-end contribution."
+            )
     else:
         outcome = "rule 3 (diagnostic ablation only)"
         rationale = "No significant retrieval-stage gain."

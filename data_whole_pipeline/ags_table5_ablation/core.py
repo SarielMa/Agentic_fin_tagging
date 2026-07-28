@@ -38,6 +38,7 @@ from ags_symbolic_agreement import (  # noqa: E402
     dimension_agreement_verdict,
     is_unresolved,
     parse_candidate_symbolic_profile,
+    symbolic_feedback_from_candidates,
 )
 from run_fintagging_grounding_baseline import normalize_tag  # noqa: E402
 
@@ -51,7 +52,7 @@ LLM_VERIFIER_DIMENSIONS_DEFAULT = ("FAMILY", "ROLE", "EVENT")
 # Which verifier supplies the rerank term. "auto" preserves the original behaviour --
 # hybrid when verdicts are attached, deterministic when they are not -- so every row
 # written before verifier_mode existed evaluates identically.
-VERIFIER_MODES = ("auto", "deterministic", "hybrid", "llm_drop", "llm_strict")
+VERIFIER_MODES = ("auto", "deterministic", "hybrid", "llm_drop", "llm_strict", "det_window")
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,18 @@ class AblationConfig:
     llm_verifier_top_m: int = 10
     llm_verifier_dimensions: tuple[str, ...] = LLM_VERIFIER_DIMENSIONS_DEFAULT
     verifier_mode: str = "auto"
+    # What an LLM-only arm scores a candidate the verifier never saw. "zero" drives every
+    # out-of-window candidate to the bottom of the rerank term, which conflates "remove the
+    # deterministic verifier" with "add a top-K_v prior" -- the window is ~20 of 200
+    # candidates, so that is a large implicit promotion. "mean" fills them with the mean of
+    # that hypothesis's own judged scores, leaving them ordered by fused score among
+    # themselves and neither promoted nor demoted as a block.
+    llm_unjudged_fill: str = "zero"
+    # Weight applied to a dimension the deterministic verifier marks CONTRADICTED. 1.0 is the
+    # historical unweighted mean; below 1.0 discounts dimensions the hypothesis is probably
+    # wrong on, which is the signal tab:verifier shows the symbolic layer is strongest at and
+    # which the ranking path never consumed. Swept on dev like beta, never tuned on test.
+    contradicted_dimension_weight: float = 1.0
     # The deployed pipeline truncates the fused pool to top_k BEFORE the consensus rerank
     # (run_fintagging_grounding_baseline.fuse_round_candidates), so its rerank can only
     # reorder within the top 200 and Recall@200 is fixed by fusion alone. This harness
@@ -151,6 +164,7 @@ def hybrid_agree_score(
     profile: dict[str, Any],
     llm_verdict: dict[str, Any] | None,
     llm_dimensions: tuple[str, ...],
+    dimension_weights: dict[str, float] | None = None,
 ) -> float | None:
     """agree(), with the LLM verdict substituted on `llm_dimensions` when one was issued.
 
@@ -162,7 +176,8 @@ def hybrid_agree_score(
     reduces exactly to plain agree().
     """
     canonical = canonical_hypothesis_dimensions(hypothesis_dimensions)
-    matches: list[bool] = []
+    weighted_sum = 0.0
+    weight_total = 0.0
     for dimension, value in canonical.items():
         if is_unresolved(value):
             continue
@@ -174,10 +189,48 @@ def hybrid_agree_score(
             verdict = dimension_agreement_verdict(candidate, dimension, value, normalization_map, profile)
             matched = verdict["matched"]
         if matched is not None:
-            matches.append(bool(matched))
-    if not matches:
+            # Defaults to 1.0, so with no weights supplied this is the plain unweighted mean
+            # the original returned -- bit for bit, since sum(bools)/len == sum(1.0*bool)/sum(1.0).
+            weight = dimension_weights.get(upper, 1.0) if dimension_weights else 1.0
+            weighted_sum += weight * float(bool(matched))
+            weight_total += weight
+    if weight_total <= 0.0:
         return None
-    return sum(matches) / len(matches)
+    return weighted_sum / weight_total
+
+
+def contradicted_dimension_weights(
+    hypothesis_dimensions: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    normalization_map: dict[str, Any],
+    top_m: int,
+    contradicted_weight: float,
+) -> dict[str, float]:
+    """Per-dimension weights for agree(), from the deterministic verifier's own D- verdict.
+
+    WHY THIS EXISTS
+        agree(c,h) rewards candidates that match the hypothesis. When the hypothesis is wrong
+        on a dimension, that rewards candidates sharing the wrong value. The deterministic
+        verifier detects exactly this at 0.968 precision (tab:verifier), but nothing in the
+        ranking path ever consulted it -- ags_frozen_grounding.py contains no reference to
+        disagreement at all. So the strongest signal the symbolic layer produces was computed
+        during search and then discarded before ranking.
+
+        This routes it back in: a dimension the verifier marks CONTRADICTED (support fraction
+        <= 0.25 over the assessed window, the production threshold in
+        ags_symbolic_agreement.symbolic_feedback_from_candidates) is down-weighted instead of
+        counted at par. Each layer then does what it measures best -- the deterministic layer
+        decides which dimensions to trust, the LLM layer judges candidates on them.
+
+    contradicted_weight=1.0 reproduces the unweighted mean exactly, so this is inert unless
+    asked for.
+    """
+    if contradicted_weight >= 1.0:
+        return {}
+    feedback = symbolic_feedback_from_candidates(
+        hypothesis_dimensions, candidates, top_m=top_m, normalization_map=normalization_map
+    )
+    return {dimension: contradicted_weight for dimension in feedback.get("contradicted_dimensions", [])}
 
 
 def hybrid_consensus_scores(
@@ -188,9 +241,20 @@ def hybrid_consensus_scores(
     hyp_indices: list[int],
     verdicts: dict[tuple[int, int, str], dict[str, Any]],
     llm_dimensions: tuple[str, ...],
+    contradicted_weight: float = 1.0,
+    top_m: int = 10,
 ) -> dict[str, float]:
     if not hypotheses:
         return {}
+    # Computed once per hypothesis, not per candidate: the D- verdict is a property of the
+    # hypothesis against the assessed window, so recomputing it inside the candidate loop
+    # would be the same answer 200 times over.
+    weights_by_hyp = {
+        hyp_idx: contradicted_dimension_weights(
+            hypothesis.get("dimensions", hypothesis), candidates, normalization_map, top_m, contradicted_weight
+        )
+        for hyp_idx, hypothesis in zip(hyp_indices, hypotheses)
+    }
     scores: dict[str, float] = {}
     for candidate in candidates:
         tag = normalize_tag(candidate.get("tag", ""))
@@ -207,6 +271,7 @@ def hybrid_consensus_scores(
                 profile,
                 llm_verdict,
                 llm_dimensions,
+                weights_by_hyp.get(hyp_idx),
             )
             per_hypothesis.append(score if score is not None else 0.0)
         scores[tag] = round(sum(per_hypothesis) / len(per_hypothesis), 6)
@@ -276,6 +341,87 @@ def llm_only_agree_score(
     return sum(matches) / len(matches)
 
 
+def det_window_consensus_scores(
+    candidates: list[dict[str, Any]],
+    hypotheses: list[dict[str, Any]],
+    normalization_map: dict[str, Any],
+    fact_id: int,
+    hyp_indices: list[int],
+    verdicts: dict[tuple[int, int, str], dict[str, Any]],
+    llm_dimensions: tuple[str, ...],
+    unjudged_fill: str = "mean",
+) -> dict[str, float]:
+    """The deterministic agree score, restricted to the SAME window the LLM verifier saw.
+
+    WHY THIS ARM EXISTS
+        The verifier ablation as originally posed is not a like-for-like comparison. The LLM
+        term reaches exactly the top-K_v candidates -- 10 of 200, 5% of the pool -- and every
+        other candidate receives a single constant under unjudged_fill, so their relative order
+        is left at the fused ranking. The deterministic term reaches all 200 and reorders every
+        one of them. Scored at top-1, that pits a narrow, low-risk edit of the head against a
+        global reordering in which any misstep at depth costs recall, and the metric only ever
+        looks at the head. "Hybrid vs LLM-only" therefore names a contrast the arms do not
+        measure: the real difference is scope, not verdict source.
+
+        This function equalizes scope. It takes the window from the verdicts file -- the exact
+        (fact, hypothesis, tag) keys the LLM was asked about -- and scores those candidates with
+        the symbolic verdict instead, mean-filling the rest exactly as llm_only_consensus_scores
+        does. Against `llm_drop` it isolates the one variable the row label claims: which
+        verifier issued the judgement.
+
+    The verdicts are read for their KEYS only; no LLM judgement enters the score. Passing
+    llm_verdict=None to hybrid_agree_score makes every dimension fall through to
+    dimension_agreement_verdict, which is plain agree() over all six dimensions.
+    """
+    if not hypotheses:
+        return {}
+    if unjudged_fill not in ("zero", "mean"):
+        raise ValueError(f"Unknown unjudged_fill {unjudged_fill!r}; expected 'zero' or 'mean'")
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    candidate_by_tag: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        tag = normalize_tag(candidate.get("tag", ""))
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+            candidate_by_tag[tag] = candidate
+
+    profiles: dict[str, dict[str, Any]] = {}
+    per_hyp_scores: dict[int, dict[str, float]] = {}
+    for hyp_idx, hypothesis in zip(hyp_indices, hypotheses):
+        judged: dict[str, float] = {}
+        for tag in tags:
+            # Window membership only -- the verdict's contents are deliberately not read.
+            if verdicts.get((fact_id, hyp_idx, tag)) is None:
+                continue
+            candidate = candidate_by_tag[tag]
+            if tag not in profiles:
+                profiles[tag] = parse_candidate_symbolic_profile(candidate, normalization_map)
+            score = hybrid_agree_score(
+                candidate,
+                hypothesis.get("dimensions", hypothesis),
+                normalization_map,
+                profiles[tag],
+                None,
+                llm_dimensions,
+                None,
+            )
+            if score is not None:
+                judged[tag] = score
+        if unjudged_fill == "mean" and judged:
+            fill = sum(judged.values()) / len(judged)
+        else:
+            fill = 0.0
+        per_hyp_scores[hyp_idx] = {tag: judged.get(tag, fill) for tag in tags}
+
+    return {
+        tag: round(sum(per_hyp_scores[idx][tag] for idx in hyp_indices) / len(hyp_indices), 6)
+        for tag in tags
+    }
+
+
 def llm_only_consensus_scores(
     candidates: list[dict[str, Any]],
     hypotheses: list[dict[str, Any]],
@@ -284,23 +430,45 @@ def llm_only_consensus_scores(
     verdicts: dict[tuple[int, int, str], dict[str, Any]],
     llm_dimensions: tuple[str, ...],
     abstention: str,
+    unjudged_fill: str = "zero",
 ) -> dict[str, float]:
     """Consensus over hypotheses using llm_only_agree_score. Same shape as
-    hybrid_consensus_scores -- mean over hypotheses, None floored to 0.0 -- so the two differ
-    only in where the per-dimension verdict comes from."""
+    hybrid_consensus_scores -- mean over hypotheses -- so the two differ only in where the
+    per-dimension verdict comes from and in what an unjudged candidate receives."""
     if not hypotheses:
         return {}
-    scores: dict[str, float] = {}
+    if unjudged_fill not in ("zero", "mean"):
+        raise ValueError(f"Unknown unjudged_fill {unjudged_fill!r}; expected 'zero' or 'mean'")
+
+    tags = []
+    seen: set[str] = set()
     for candidate in candidates:
         tag = normalize_tag(candidate.get("tag", ""))
-        if tag in scores:
-            continue
-        per_hypothesis = []
-        for hyp_idx in hyp_indices:
-            score = llm_only_agree_score(verdicts.get((fact_id, hyp_idx, tag)), llm_dimensions, abstention)
-            per_hypothesis.append(score if score is not None else 0.0)
-        scores[tag] = round(sum(per_hypothesis) / len(per_hypothesis), 6)
-    return scores
+        if tag and tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+
+    # Per hypothesis: score what it judged, then decide the fill for what it did not.
+    per_hyp_scores: dict[int, dict[str, float]] = {}
+    for hyp_idx in hyp_indices:
+        judged: dict[str, float] = {}
+        for tag in tags:
+            verdict = verdicts.get((fact_id, hyp_idx, tag))
+            if verdict is None:
+                continue
+            score = llm_only_agree_score(verdict, llm_dimensions, abstention)
+            if score is not None:
+                judged[tag] = score
+        if unjudged_fill == "mean" and judged:
+            fill = sum(judged.values()) / len(judged)
+        else:
+            fill = 0.0
+        per_hyp_scores[hyp_idx] = {tag: judged.get(tag, fill) for tag in tags}
+
+    return {
+        tag: round(sum(per_hyp_scores[idx][tag] for idx in hyp_indices) / len(hyp_indices), 6)
+        for tag in tags
+    }
 
 
 def rerank_share(base_scores: dict[str, float], consensus: dict[str, float], beta: float) -> float | None:
@@ -357,7 +525,14 @@ def _consensus_for(
     caching here turns the dominant cost (symbolic profile parsing over the pool) from five
     computations per fact into one."""
     mode = resolve_verifier_mode(config)
-    key = (fact_id, tuple(sorted(hyp_indices)), tuple(sorted(renderings)), mode)
+    key = (
+        fact_id,
+        tuple(sorted(hyp_indices)),
+        tuple(sorted(renderings)),
+        mode,
+        config.llm_unjudged_fill,
+        config.contradicted_dimension_weight,
+    )
     cached = _CONSENSUS_CACHE.get(key)
     if cached is not None:
         return cached
@@ -370,6 +545,19 @@ def _consensus_for(
             hyp_indices,
             config.llm_verifier_verdicts,
             config.llm_verifier_dimensions,
+            config.contradicted_dimension_weight,
+            config.llm_verifier_top_m,
+        )
+    elif mode == "det_window":
+        result = det_window_consensus_scores(
+            pool,
+            hypotheses,
+            normalization_map,
+            fact_id,
+            hyp_indices,
+            config.llm_verifier_verdicts,
+            config.llm_verifier_dimensions,
+            unjudged_fill=config.llm_unjudged_fill,
         )
     elif mode in ("llm_drop", "llm_strict"):
         result = llm_only_consensus_scores(
@@ -380,6 +568,7 @@ def _consensus_for(
             config.llm_verifier_verdicts,
             config.llm_verifier_dimensions,
             abstention="drop" if mode == "llm_drop" else "negative",
+            unjudged_fill=config.llm_unjudged_fill,
         )
     else:
         result = consensus_scores(pool, hypotheses, normalization_map)

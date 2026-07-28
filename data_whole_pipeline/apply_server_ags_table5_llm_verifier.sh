@@ -104,6 +104,34 @@ export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 export VLLM_BATCH_SIZE="${VLLM_BATCH_SIZE:-32}"
+# fused = window cut from the fused retrieval ranking, before either verifier. The old
+# behaviour ("deployed") cut it from final_candidates, which is already deterministically
+# reranked, so the deterministic verifier chose what the LLM was shown even in the arms that
+# remove it. Keep this at fused for anything feeding a verifier ablation.
+export WINDOW_SOURCE="${WINDOW_SOURCE:-fused}"
+# vLLM only batches if the script hands it more than one prompt at a time; the old loop called
+# generate_one, so a B200 ran at batch size 1.
+export GENERATION_CHUNK="${GENERATION_CHUNK:-64}"
+# SYMBOLIC_HINT=1 hands the deterministic D- verdict to the LLM as prompt context instead of
+# using it as a scoring term. Score the resulting verdicts with verifier_mode=llm_drop.
+# HINT_DIMENSIONS selects what the hint may name. "llm" (default) restricts it to
+# FAMILY/ROLE/EVENT -- the dimensions the LLM already judges -- which is what the first hint
+# run used, and which withholds exactly the dimensions the symbolic layer uniquely covers.
+# "all" passes every resolved dimension and widens the hypothesis shown in the prompt to match.
+HINT_ARGS=()
+if [[ "${SYMBOLIC_HINT:-0}" == "1" ]]; then
+  HINT_ARGS=(--symbolic-hint --hint-dimensions "${HINT_DIMENSIONS:-llm}")
+fi
+# JUDGE_DIMENSIONS=all asks the LLM for QUALIFIER/SCOPE/TEMPORAL as well -- the control for the
+# hint experiment. A verdict entry roughly doubles in length, so the output cap has to grow with
+# it: at 3 dimensions an entry is ~110-130 tokens and top_m=10 fits in 1536, at 6 it does not,
+# and an undersized cap truncates every response mid-array (that failure mode once produced a
+# 100% parse failure across a full run).
+JUDGE_ARGS=(--judge-dimensions "${JUDGE_DIMENSIONS:-llm}")
+if [[ "${JUDGE_DIMENSIONS:-llm}" == "all" ]]; then
+  QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-2816}"
+fi
+QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-1536}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs_ags_table5_ablation/qwen3_32b}"
 RESUME_ARGS=()
 if [[ "${RESUME:-1}" == "1" ]]; then
@@ -120,14 +148,30 @@ echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "QUERY_GENERATION_MODEL=${QUERY_GENERATION_MODEL}"
 echo "QUERY_GENERATION_BACKEND=${QUERY_GENERATION_BACKEND}"
 echo "TOP_M=${TOP_M}"
+echo "WINDOW_SOURCE=${WINDOW_SOURCE}"
+echo "GENERATION_CHUNK=${GENERATION_CHUNK}"
 echo "LIMIT=${LIMIT:-<none>}"
 echo "============================================================"
 
 python -m py_compile ags_table5_ablation/run_llm_verifier.py
 
+# Defaults to the gold-instance test trace. Point it at a fulltagging run's
+# bm25_candidates.jsonl to verify the extractor-driven pipeline instead; the two traces share
+# the frozen_ags_hypotheses / final_candidates schema this script reads.
+TRACE_ARGS=()
+if [[ -n "${TEST_TRACE:-}" ]]; then
+  TRACE_ARGS=(--test-trace "${TEST_TRACE}")
+fi
+
 python ags_table5_ablation/run_llm_verifier.py \
   --output-dir "${OUTPUT_DIR}" \
+  "${TRACE_ARGS[@]}" \
   --top-m "${TOP_M}" \
+  --window-source "${WINDOW_SOURCE}" \
+  --query-max-new-tokens "${QUERY_MAX_NEW_TOKENS}" \
+  "${HINT_ARGS[@]}" \
+  "${JUDGE_ARGS[@]}" \
+  --generation-chunk "${GENERATION_CHUNK}" \
   --query-generation-model "${QUERY_GENERATION_MODEL}" \
   --query-generation-backend "${QUERY_GENERATION_BACKEND}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \

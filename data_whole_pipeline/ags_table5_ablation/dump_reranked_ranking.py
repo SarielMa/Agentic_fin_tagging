@@ -80,10 +80,57 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--calls", type=Path, default=DEFAULT_CALLS, help="Call log, needed only for --top-m.")
     parser.add_argument(
+        "--llm-unjudged-fill",
+        choices=("mean", "zero"),
+        default="mean",
+        help="What an LLM-only arm (llm_drop / llm_strict) scores a candidate the verifier never "
+        "saw. Must match run_ags_verifier_ablation.py, which uses 'mean', or this arm's final "
+        "accuracy is computed from a different ranking than its own retrieval-stage row. "
+        "AblationConfig defaults to 'zero'; that default is deliberately NOT inherited here.",
+    )
+    parser.add_argument(
         "--no-truncate",
         action="store_true",
         help="Rerank the whole fused pool and truncate afterwards. This is NOT the deployed "
         "order and inflates Recall@200 by 0.0128; kept only to reproduce the original bridge run.",
+    )
+    # --- tab:ablation's deterministic-core diagnostic arms -------------------------------------
+    # These reach the same evaluate() through AblationConfig knobs rather than the verifier
+    # ones, so their rankings can be dumped and reranked exactly like the verifier arms. Each
+    # default below is AblationConfig's own, so omitting all of them changes nothing.
+    parser.add_argument(
+        "--n-hypotheses",
+        type=int,
+        default=2,
+        help="J. Use 1 with --kept-hypothesis-idx for the -ensemble arm.",
+    )
+    parser.add_argument(
+        "--kept-hypothesis-idx",
+        type=int,
+        default=None,
+        help="Which hypothesis survives when --n-hypotheses 1. Required in that case. The "
+        "paper's -ensemble row is the MEAN of idx 0 and idx 1, so it needs one dump and one "
+        "rerank per index, averaged afterwards -- there is no single ranking for that row.",
+    )
+    parser.add_argument(
+        "--renderings",
+        default="def,lab",
+        help="Comma-separated rendering forms. 'def' alone is the -label-form arm; 'lab' alone "
+        "is the -definition-form arm.",
+    )
+    parser.add_argument(
+        "--lab-only-fallback",
+        choices=("none", "def"),
+        default="none",
+        help="For a lab-only rendering, what a label-less concept falls back to. 'none' is the "
+        "zero-recall variant, which is the one tab:ablation reports.",
+    )
+    parser.add_argument("--fusion", choices=("sum", "mean"), default="sum")
+    parser.add_argument("--scaling", choices=("range", "raw"), default="range")
+    parser.add_argument(
+        "--oracle-best-single",
+        action="store_true",
+        help="Oracle row: keep the best of the J hypotheses per fact using gold.",
     )
     parser.add_argument(
         "--summary",
@@ -120,10 +167,16 @@ def main() -> None:
             raise SystemExit(f"Missing required input: {path}")
 
     normalization_map = load_normalization_map(args.normalization_map)
-    verdicts = load_llm_verifier_verdicts(args.verdicts)
-    if not verdicts:
-        raise SystemExit(f"No verdicts loaded from {args.verdicts}")
-    print(f"verdicts loaded: {len(verdicts)}", flush=True)
+    # The deterministic-core arms never consult a verdict, so requiring the verdicts file for
+    # them would make an unrelated missing input block the whole diagnostic block.
+    if args.verifier_mode == "deterministic":
+        verdicts = {}
+        print("verifier_mode=deterministic: no verdicts needed", flush=True)
+    else:
+        verdicts = load_llm_verifier_verdicts(args.verdicts)
+        if not verdicts:
+            raise SystemExit(f"No verdicts loaded from {args.verdicts}")
+        print(f"verdicts loaded: {len(verdicts)}", flush=True)
 
     facts = load_test_facts(args.test_trace, limit=args.limit)
     print(f"test facts: {len(facts)}", flush=True)
@@ -140,17 +193,31 @@ def main() -> None:
         verdicts = restrict_verdicts(verdicts, windows, args.top_m)
         print(f"verdicts restricted to M={args.top_m}: {len(verdicts)}", flush=True)
 
+    renderings = tuple(part.strip() for part in args.renderings.split(",") if part.strip())
+    if not renderings:
+        raise SystemExit("--renderings must name at least one form")
+    if args.n_hypotheses == 1 and args.kept_hypothesis_idx is None:
+        raise SystemExit("--n-hypotheses 1 requires --kept-hypothesis-idx (evaluate() rejects it otherwise)")
+
     uses_llm = args.verifier_mode != "deterministic"
     config = AblationConfig(
         name=f"verifier_mode={args.verifier_mode} beta={args.beta}",
         beta=args.beta,
         verifier_mode=args.verifier_mode,
+        n_hypotheses=args.n_hypotheses,
+        kept_hypothesis_idx=args.kept_hypothesis_idx,
+        renderings=renderings,
+        lab_only_fallback=None if args.lab_only_fallback == "none" else args.lab_only_fallback,
+        fusion=args.fusion,
+        scaling=args.scaling,
+        oracle_best_single=args.oracle_best_single,
         # Deployed truncation order: cut the fused pool to top_k before reranking. Under this
         # setting the deterministic arm reproduces the deployed retrieval stage to 0.000000,
         # so the ranking handed to the listwise reranker is the one the pipeline would build.
         truncate_pool_to_top_k=not args.no_truncate,
         llm_verifier_top_m=args.top_m or generated_top_m or 10,
         llm_verifier_verdicts=verdicts if uses_llm else None,
+        llm_unjudged_fill=args.llm_unjudged_fill,
     )
     reset_consensus_cache()
     ranking_by_fact: dict[int, list[str]] = {}
@@ -209,6 +276,7 @@ def main() -> None:
         "verifier_mode": args.verifier_mode,
         "top_m": args.top_m or generated_top_m,
         "llm_verdicts_used": len(verdicts) if uses_llm else 0,
+        "llm_unjudged_fill": args.llm_unjudged_fill if uses_llm else None,
         "note": (
             "Candidate objects are copied verbatim from the trace; only order and rank change. "
             "Feed to run_fintagging_grounding_baseline.py with --reuse-candidates."

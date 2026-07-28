@@ -221,6 +221,36 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertTrue(ruling["end_to_end_available"])
         self.assertNotIn("PROVISIONAL", ruling["outcome"])
 
+    def test_measured_delta_resolves_the_rule(self) -> None:
+        """The ruling turns on whether the end-to-end difference is separable from zero, not on
+        its sign. A large retrieval-stage gain that does not survive the listwise stage must land
+        on rule 2 even when the end-to-end point estimate is positive."""
+        comparison = self.comparison(True, 0.065, True)
+        comparison["deployed_stage"]["delta"] = {"final_tagging_accuracy": 0.005, "mrr": 0.006}
+
+        # Positive point estimate, CI includes zero -> rule 2, not rule 1.
+        comparison["deployed_stage"]["paired_top1"] = {
+            "ci_low": -0.011, "ci_high": 0.021, "ci_excludes_zero": False,
+        }
+        ruling = decision(comparison)
+        self.assertIn("rule 2", ruling["outcome"])
+        self.assertIn("includes zero", ruling["rationale"])
+
+        # Same point estimate, CI excludes zero -> rule 1.
+        comparison["deployed_stage"]["paired_top1"] = {
+            "ci_low": 0.002, "ci_high": 0.009, "ci_excludes_zero": True,
+        }
+        ruling = decision(comparison)
+        self.assertIn("rule 1", ruling["outcome"])
+        self.assertIn("excludes zero", ruling["rationale"])
+
+    def test_no_paired_test_refuses_to_rule(self) -> None:
+        """Without a paired end-to-end test the rule must not resolve from point estimates."""
+        comparison = self.comparison(True, 0.065, True)
+        comparison["deployed_stage"]["delta"] = {"final_tagging_accuracy": 0.005, "mrr": 0.006}
+        ruling = decision(comparison)
+        self.assertIn("unresolved", ruling["outcome"])
+
 
 if __name__ == "__main__":
     unittest.main()
