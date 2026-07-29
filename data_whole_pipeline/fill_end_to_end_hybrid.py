@@ -27,7 +27,16 @@ sys.path.insert(0, str(REPO))
 from run_fintagging_grounding_baseline import normalize_tag  # noqa: E402
 
 TEST = REPO / "FinTagging_800_200_grounding_test_JSON" / "data" / "test.jsonl"
-LABEL = r"\textbf{AGS (hybrid verification)}"
+# Row label history, because this script fails SILENTLY when it drifts -- a non-matching label
+# just prints "nothing to fill (row already populated)" and exits 0:
+#   "AGS (hybrid verification)"  while the paper carried the hybrid framing
+#   "AGS (full)"                 after the rewrite around the LLM-only result
+#   "FHS (full)"                 after 2026-07-29, when the method was renamed to Factorized
+#                                Hypothesis Search to match the paper's title (AGS appeared 64
+#                                times and was never expanded anywhere).
+# It is tab:ablation's own bold baseline row: the llm_drop / fused-window arm. The measurement
+# that fills it is apply_server_fulltagging_llmonly_rerank.sh.
+LABEL = r"\textbf{FHS (full)}"
 SEED, SAMPLES = 20260724, 2000
 
 

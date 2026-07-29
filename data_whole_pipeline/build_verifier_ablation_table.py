@@ -52,6 +52,20 @@ DEFAULT_RUN_DIR = SCRIPT_DIR / "runs_ags_verifier_ablation" / "qwen3_32b"
 # to fall back to, so averaging over the dimensions actually ruled on is what removal means.
 # "negative" adds a new assumption -- silence is evidence against -- exactly the way
 # llm_unjudged_fill="zero" smuggled in a top-K_v prior. It is reported as sensitivity instead.
+#
+# THESE LABELS NO LONGER MATCH THE PAPER, DELIBERATELY. The rewrite around the LLM-only result
+# renamed the block: the bold baseline is now "AGS (full)" and it is the no_determ arm, not
+# hybrid_full; "$-$ LLM reranker (fused retrieval score only)" is no_verifier; "Program-driven
+# score instead of LLM reranker" is no_llm; and no hybrid_full row survives. Injection matches on
+# the label text, so the mismatch is inert -- inject_paper reports "labels drifted" and writes
+# nothing (verified against a copy). tab:ablation is already filled and was checked cell by cell
+# against the fused reranks, so nothing is lost by that.
+#
+# Do NOT just swap in the new strings. The daggers come from verifier_ablation.csv's
+# ci_excludes_zero, whose deltas are all computed against "Hybrid AGS (full)". Relabelling
+# no_determ as the baseline while its CIs still reference hybrid_full would print significance
+# marks against a baseline the table no longer shows. Re-enabling this path means recomputing the
+# paired bootstraps with no_determ as the reference first.
 ABLATION_ROWS: tuple[tuple[str, str, str, bool], ...] = (
     (r"\textbf{AGS (hybrid verification; full)}", "Hybrid AGS (full)", "hybrid_full", True),
     (r"$-$ candidate-level LLM verifier (deterministic core)", "- LLM verifier", "no_llm", False),
@@ -92,7 +106,11 @@ MARKER_FOR_FRAGMENT: dict[str, str] = {
 # Columns each marker's tabular declares, so a fragment can never be pasted under headings it
 # does not match. table_ablation_block.tex and table_interaction.tex are NOT injected: they
 # belong to the main paper's tables, which have their own column orders.
-DEFAULT_PAPER = SCRIPT_DIR.parent / "comparing_methods" / "acl_latex.tex"
+# acl_latex.tex was the paper until the rewrite around the LLM-only result; it now lives on as
+# acl_latex_old_July28.tex and the live paper is acl_latex_llmonly.tex. Pointing here at the old
+# name did not fail loudly -- it just found no file, so an injection run reported nothing and
+# changed nothing.
+DEFAULT_PAPER = SCRIPT_DIR.parent / "comparing_methods" / "acl_latex_llmonly.tex"
 
 # tab:ablation's deterministic-core diagnostic rows: paper row label -> rerank dir(s).
 # Only the last two cells (Final Acc., std) are written for these. Their retrieval-stage cells
@@ -167,11 +185,26 @@ def num(value: Any, digits: int = 3, dagger: bool = False, bold: bool = False) -
     return text + (r"$^{\dagger}$" if dagger else "")
 
 
+def arm_dir(run_dir: Path, arm: str) -> Path:
+    """The directory holding an arm's rerank, preferring the clean fused-window rerun.
+
+    stage_fused_reranks.sh writes the reranks built from the fused-window verdicts to
+    rerank_<arm>_k10fused/, leaving the original rerank_<arm>/ in place. Those originals are the
+    PROVISIONAL ones whose candidate window was ordered by the deterministic score -- exactly what
+    the fused rerun exists to replace. Reading rerank_<arm>/ unconditionally silently published
+    the stale numbers with no error to show for it, so the fused directory wins whenever it
+    exists. Arms with no LLM in them (no_llm, no_verifier) have no fused variant and fall back,
+    correctly: there is no window for the deterministic score to have ordered.
+    """
+    fused = run_dir / f"rerank_{arm}_k10fused"
+    return fused if (fused / "metrics.json").exists() else run_dir / f"rerank_{arm}"
+
+
 def reranked(run_dir: Path, arm: str | None) -> dict[str, Any]:
     """The qwen_reranked block for an arm, or {} if its GPU job has not landed."""
     if arm is None:
         return {}
-    path = run_dir / f"rerank_{arm}" / "metrics.json"
+    path = arm_dir(run_dir, arm) / "metrics.json"
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8")).get("qwen_reranked", {})
@@ -191,9 +224,10 @@ def reranked_accuracy_se(run_dir: Path, arm: str | None, iterations: int = 2000,
     # file on disk -- bootstrapping it yields a confident-looking std over whatever fraction has
     # landed, printed next to a "--" accuracy. The std and the accuracy it qualifies must appear
     # together or not at all, so both use the same completion signal.
-    if not (run_dir / f"rerank_{arm}" / "metrics.json").exists():
+    directory = arm_dir(run_dir, arm)
+    if not (directory / "metrics.json").exists():
         return None
-    path = run_dir / f"rerank_{arm}" / "qwen_rerank_predictions.jsonl"
+    path = directory / "qwen_rerank_predictions.jsonl"
     if not path.exists():
         return None
     by_context: dict[Any, list[float]] = {}

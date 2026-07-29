@@ -210,6 +210,12 @@ if [[ "${REUSE_CANDIDATES}" == "1" ]]; then
   ARGS+=(--reuse-candidates)
 fi
 
+# Forces w_cov for any query mode. Unset by default, so every existing run behaves exactly as
+# before; the python side refuses to override the frozen_ags family, which pins its own value.
+if [[ -n "${LABEL_COVERAGE_WEIGHT:-}" ]]; then
+  ARGS+=(--label-coverage-weight "${LABEL_COVERAGE_WEIGHT}")
+fi
+
 if [[ -n "${QUERY_DESCRIPTION_PATH}" ]]; then
   ARGS+=(--query-description-path "${QUERY_DESCRIPTION_PATH}")
 fi

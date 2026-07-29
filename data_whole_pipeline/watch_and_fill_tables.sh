@@ -8,7 +8,10 @@
 set -uo pipefail
 REPO="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/data_whole_pipeline"
 RUN="${REPO}/runs_ags_verifier_ablation/qwen3_32b"
-PAPER="${REPO}/../comparing_methods/acl_latex.tex"
+# The live paper. acl_latex.tex was renamed to acl_latex_old_July28.tex in the rewrite around
+# the LLM-only result; count_placeholders.py on the old name throws FileNotFoundError, which
+# this loop swallows into REMAINING="?" and then polls forever without ever exiting.
+PAPER="${REPO}/../paper/acl_latex_llmonly (2).tex"
 LOG="${REPO}/watch_and_fill.log"
 cd "${REPO}"
 
@@ -49,8 +52,12 @@ while true; do
     fi
   fi
 
-  # ---- fulltagging hybrid -> tab:end_to_end's last row
-  FT="${REPO}/runs_fintagging_fulltagging/qwen2.5_14b_extractors/qwen3_32b_hybrid_verification"
+  # ---- fulltagging LLM-only -> tab:end_to_end's last row
+  # Was qwen3_32b_hybrid_verification. That arm scores with verifier_mode=hybrid, but the row it
+  # fills is now labelled "AGS (full)", which in the rewritten paper is the llm_drop arm
+  # (tab:ablation's own AGS (full) = rerank_no_determ_k10fused). Filling from the hybrid run
+  # would put a number under a label that does not describe it.
+  FT="${REPO}/runs_fintagging_fulltagging/qwen2.5_14b_extractors/qwen3_32b_llmonly_verification"
   if [[ -f "${FT}/fulltagging_metrics.json" ]] && ! done_marker end_to_end; then
     say "fulltagging hybrid landed -> filling tab:end_to_end"
     if python fill_end_to_end_hybrid.py --run-dir "${FT}" --paper "${PAPER}" >> "${LOG}" 2>&1; then

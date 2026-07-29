@@ -83,6 +83,8 @@ QUERY_MODE_ALIASES = {
     "ags_sequential": "ags_seq",
     "ags_seq_random": "ags_seq_random",
     "ags_sequential_random": "ags_seq_random",
+    "seq_verifier": "seq_verifier",
+    "fhs_seq": "seq_verifier",
     "ags_j1": "one_pass_structured",
     "one_pass_structured": "one_pass_structured",
     "one_pass_grounding_structured": "one_pass_structured",
@@ -100,6 +102,7 @@ MULTI_ROUND_QUERY_MODES = {
     "frozen_ags",
     "ags_seq",
     "ags_seq_random",
+    "seq_verifier",
     "one_pass_structured",
 }
 LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
@@ -117,6 +120,11 @@ FROZEN_AGS_FAMILY_QUERY_MODES = FROZEN_AGS_QUERY_MODES | ONE_PASS_STRUCTURED_QUE
 # The two sequential negative-control arms start from frozen_ags's round one and differ
 # from each other only in directive selection (see ags_sequential_arms).
 AGS_SEQ_QUERY_MODES = {"ags_seq", "ags_seq_random"}
+# The matched control the paper describes: FHS with the parallel fan replaced by a loop, every
+# other component including the candidate-level verifier held identical. Separate from
+# AGS_SEQ_QUERY_MODES because it shares none of their controller machinery -- no posterior bank,
+# no slate scoring, no counterfactual replay. See ags_seq_verifier_arm.
+SEQ_VERIFIER_QUERY_MODES = {"seq_verifier"}
 DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
 OPERATOR_LIBRARY = (
     "direct_label",
@@ -832,9 +840,27 @@ def build_candidate_records(
     query_mode: str,
     rrf_kappa: float = 60.0,
     query_descriptions: dict[int, str] | None = None,
+    label_coverage_weight: float = 0.0,
+    label_coverage_pool_multiplier: int = 10,
 ) -> list[dict[str, Any]]:
     query_mode = canonical_query_mode(query_mode)
-    retriever = TaxonomyRetriever(taxonomy, type_filter=type_filter)
+    # Defaults match TaxonomyRetriever's own, so callers that do not pass these keep the exact
+    # behaviour every published non-frozen baseline ran with (w_cov=0.0). This is the retriever
+    # the non-LLM query modes actually use -- the frozen-family override in the method-record
+    # builder never reaches here, which is why direct_retrieval and one_pass_grounding ran with
+    # the coverage term off.
+    retriever = TaxonomyRetriever(
+        taxonomy,
+        type_filter=type_filter,
+        label_coverage_weight=label_coverage_weight,
+        label_coverage_pool_multiplier=label_coverage_pool_multiplier,
+    )
+    if label_coverage_weight > 0.0:
+        print(
+            f"build_candidate_records: w_cov={label_coverage_weight} "
+            f"pool_multiplier={label_coverage_pool_multiplier}",
+            flush=True,
+        )
     records: list[dict[str, Any]] = []
     for example in examples:
         query, query_description = build_retrieval_query(example, query_mode, query_descriptions)
@@ -3386,7 +3412,7 @@ def build_comparison_candidate_records(
     ags_seq_config = None
     ags_seq_bank = None
     build_ags_seq_method_record = None
-    if query_mode in AGS_SEQ_QUERY_MODES:
+    if query_mode in AGS_SEQ_QUERY_MODES or query_mode in SEQ_VERIFIER_QUERY_MODES:
         # The sequential arms reuse frozen_ags's retrieval scaling and startup gate, then
         # add the controller loop on top; the posterior bank spans the whole stream.
         from ags_frozen_grounding import FrozenAgsConfig, frozen_ags_startup_assertions
@@ -3451,6 +3477,32 @@ def build_comparison_candidate_records(
         )
         print(
             f"{frozen_ags_config.variant} startup assertions passed: {json.dumps(assertion_report)}",
+            flush=True,
+        )
+
+    # The coverage term is an index property the paper reports as applied to every method
+    # (Appendix "Label-coverage diagnostics" measures its gain for raw-context and free-text
+    # queries too), but the assignments above fire only for the frozen_ags family, so the
+    # non-structured baselines silently ran at the constructor default w_cov=0.0. This override
+    # applies to any query mode. Default None leaves every existing run's behaviour unchanged.
+    if args.label_coverage_weight is not None:
+        # Guard: the frozen family already ran frozen_ags_startup_assertions against the w_cov
+        # its config pins. Overriding after that gate would run a configuration nothing asserted,
+        # and ags_frozen_grounding requires w_cov > 0. Refuse rather than drift silently.
+        if frozen_ags_config is not None and (
+            args.label_coverage_weight != frozen_ags_config.label_coverage_weight
+        ):
+            raise SystemExit(
+                f"--label-coverage-weight {args.label_coverage_weight} conflicts with "
+                f"{frozen_ags_config.variant}'s pinned w_cov="
+                f"{frozen_ags_config.label_coverage_weight}; the startup assertions already "
+                "gated on the pinned value. Use this flag only for non-frozen query modes."
+            )
+        retriever.label_coverage_weight = args.label_coverage_weight
+        retriever.label_coverage_pool_multiplier = args.label_coverage_pool_multiplier
+        print(
+            f"label coverage overridden: w_cov={retriever.label_coverage_weight} "
+            f"pool_multiplier={retriever.label_coverage_pool_multiplier}",
             flush=True,
         )
 
@@ -3537,6 +3589,19 @@ def build_comparison_candidate_records(
                     retriever,
                     example,
                     memory_store=memory_store,
+                )
+            elif query_mode in SEQ_VERIFIER_QUERY_MODES:
+                from ags_seq_verifier_arm import build_seq_verifier_record
+
+                record = build_seq_verifier_record(
+                    args,
+                    query_mode,
+                    generator,
+                    retriever,
+                    example,
+                    frozen_ags_normalization_map,
+                    None,
+                    cfg=ags_seq_config,
                 )
             elif query_mode in AGS_SEQ_QUERY_MODES:
                 record = build_ags_seq_method_record(
@@ -3915,6 +3980,15 @@ def parse_args() -> argparse.Namespace:
         help="frozen_ags coverage rescoring pool; <=0 scores the full type-filtered pool.",
     )
     parser.add_argument(
+        "--label-coverage-weight",
+        type=float,
+        default=None,
+        help=(
+            "Force w_cov for ANY query mode. Without it only the frozen_ags family enables "
+            "the coverage term and every other baseline runs at w_cov=0.0."
+        ),
+    )
+    parser.add_argument(
         "--frozen-ags-top-p",
         type=float,
         default=1.0,
@@ -4114,6 +4188,14 @@ def main() -> None:
                 query_mode=args.query_mode,
                 rrf_kappa=args.rrf_kappa,
                 query_descriptions=query_descriptions,
+                **(
+                    {
+                        "label_coverage_weight": args.label_coverage_weight,
+                        "label_coverage_pool_multiplier": args.label_coverage_pool_multiplier,
+                    }
+                    if args.label_coverage_weight is not None
+                    else {}
+                ),
             )
         write_jsonl(candidates_path, candidate_records)
 
