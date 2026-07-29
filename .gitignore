@@ -91,3 +91,5 @@ FinTagging_800_200_*/
 runs_fintagging_value_type/
 runs_fintagging_*/
 comparing_methods/
+runs_ags_*/
+*.tex
