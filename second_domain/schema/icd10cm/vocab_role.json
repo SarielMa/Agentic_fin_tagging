@@ -1,0 +1,47 @@
+{
+  "congenital": [
+    "congenital",
+    "congenital",
+    "congenital"
+  ],
+  "disease-disorder": [
+    "disease-disorder",
+    "disease disorder",
+    "disease/disorder"
+  ],
+  "external-cause": [
+    "external-cause",
+    "external cause",
+    "external/cause"
+  ],
+  "health-status-factor": [
+    "health-status-factor",
+    "health status factor",
+    "health/status/factor"
+  ],
+  "injury-poisoning": [
+    "injury-poisoning",
+    "injury poisoning",
+    "injury/poisoning"
+  ],
+  "neoplasm": [
+    "neoplasm",
+    "neoplasm",
+    "neoplasm"
+  ],
+  "perinatal": [
+    "perinatal",
+    "perinatal",
+    "perinatal"
+  ],
+  "pregnancy-related": [
+    "pregnancy-related",
+    "pregnancy related",
+    "pregnancy/related"
+  ],
+  "symptom-sign-abnormal-finding": [
+    "symptom-sign-abnormal-finding",
+    "symptom sign abnormal finding",
+    "symptom/sign/abnormal/finding"
+  ]
+}

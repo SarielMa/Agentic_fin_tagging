@@ -1,0 +1,72 @@
+{
+  "acute": [
+    "acute"
+  ],
+  "chronic": [
+    "chronic"
+  ],
+  "acute-on-chronic": [
+    "acute on chronic",
+    "acute-on-chronic"
+  ],
+  "with-complication": [
+    "with complication",
+    "complicated"
+  ],
+  "without-complication": [
+    "without complication",
+    "uncomplicated"
+  ],
+  "mild": [
+    "mild"
+  ],
+  "moderate": [
+    "moderate"
+  ],
+  "severe": [
+    "severe"
+  ],
+  "displaced": [
+    "displaced"
+  ],
+  "nondisplaced": [
+    "nondisplaced",
+    "non displaced"
+  ],
+  "primary": [
+    "primary"
+  ],
+  "secondary": [
+    "secondary"
+  ],
+  "malignant": [
+    "malignant"
+  ],
+  "benign": [
+    "benign"
+  ],
+  "in-situ": [
+    "in situ",
+    "in-situ"
+  ],
+  "uncertain-behavior": [
+    "uncertain behavior"
+  ],
+  "unspecified": [
+    "unspecified"
+  ],
+  "type-1": [
+    "type 1",
+    "type I"
+  ],
+  "type-2": [
+    "type 2",
+    "type II"
+  ],
+  "open": [
+    "open"
+  ],
+  "closed": [
+    "closed"
+  ]
+}

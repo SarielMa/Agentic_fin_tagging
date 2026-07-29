@@ -1,0 +1,65 @@
+{
+  "chapter-1": [
+    "Certain infectious and parasitic diseases (A00-B99)"
+  ],
+  "chapter-2": [
+    "Neoplasms (C00-D49)"
+  ],
+  "chapter-3": [
+    "Diseases of the blood and blood-forming organs and certain disorders involving the immune mechanism (D50-D89)"
+  ],
+  "chapter-4": [
+    "Endocrine, nutritional and metabolic diseases (E00-E89)"
+  ],
+  "chapter-5": [
+    "Mental, Behavioral and Neurodevelopmental disorders (F01-F99)"
+  ],
+  "chapter-6": [
+    "Diseases of the nervous system (G00-G99)"
+  ],
+  "chapter-7": [
+    "Diseases of the eye and adnexa (H00-H59)"
+  ],
+  "chapter-8": [
+    "Diseases of the ear and mastoid process (H60-H95)"
+  ],
+  "chapter-9": [
+    "Diseases of the circulatory system (I00-I99)"
+  ],
+  "chapter-10": [
+    "Diseases of the respiratory system (J00-J99)"
+  ],
+  "chapter-11": [
+    "Diseases of the digestive system (K00-K95)"
+  ],
+  "chapter-12": [
+    "Diseases of the skin and subcutaneous tissue (L00-L99)"
+  ],
+  "chapter-13": [
+    "Diseases of the musculoskeletal system and connective tissue (M00-M99)"
+  ],
+  "chapter-14": [
+    "Diseases of the genitourinary system (N00-N99)"
+  ],
+  "chapter-15": [
+    "Pregnancy, childbirth and the puerperium (O00-O9A)"
+  ],
+  "chapter-16": [
+    "Certain conditions originating in the perinatal period (P00-P96)"
+  ],
+  "chapter-17": [
+    "Congenital malformations, deformations and chromosomal abnormalities (Q00-Q99)"
+  ],
+  "chapter-18": [
+    "Symptoms, signs and abnormal clinical and laboratory findings, not elsewhere classified (R00-R99)"
+  ],
+  "chapter-19": [
+    "Injury, poisoning and certain other consequences of external causes (S00-T88)"
+  ],
+  "chapter-20": [
+    "External causes of morbidity (V00-Y99)"
+  ],
+  "chapter-21": [
+    "Factors influencing health status and contact with health services (Z00-Z99)"
+  ]
+}

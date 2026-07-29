@@ -1,0 +1,234 @@
+[
+  {
+    "definition": "24 hours or more after hospital admission",
+    "count": 4
+  },
+  {
+    "definition": "advanced atrophic with subfoveal involvement",
+    "count": 1
+  },
+  {
+    "definition": "advanced atrophic without subfoveal involvement",
+    "count": 1
+  },
+  {
+    "definition": "at arrival to emergency department",
+    "count": 4
+  },
+  {
+    "definition": "at hospital admission",
+    "count": 4
+  },
+  {
+    "definition": "bilateral",
+    "count": 25
+  },
+  {
+    "definition": "early dry stage",
+    "count": 1
+  },
+  {
+    "definition": "fetus 1",
+    "count": 15
+  },
+  {
+    "definition": "fetus 2",
+    "count": 15
+  },
+  {
+    "definition": "fetus 3",
+    "count": 15
+  },
+  {
+    "definition": "fetus 4",
+    "count": 15
+  },
+  {
+    "definition": "fetus 5",
+    "count": 15
+  },
+  {
+    "definition": "in the field [EMT or ambulance]",
+    "count": 4
+  },
+  {
+    "definition": "indeterminate stage",
+    "count": 11
+  },
+  {
+    "definition": "initial encounter",
+    "count": 408
+  },
+  {
+    "definition": "initial encounter for closed fracture",
+    "count": 31
+  },
+  {
+    "definition": "initial encounter for fracture",
+    "count": 8
+  },
+  {
+    "definition": "initial encounter for open fracture",
+    "count": 10
+  },
+  {
+    "definition": "initial encounter for open fracture type I or II",
+    "count": 3
+  },
+  {
+    "definition": "initial encounter for open fracture type IIIA, IIIB, or IIIC",
+    "count": 3
+  },
+  {
+    "definition": "intermediate dry stage",
+    "count": 1
+  },
+  {
+    "definition": "left eye",
+    "count": 25
+  },
+  {
+    "definition": "mild stage",
+    "count": 11
+  },
+  {
+    "definition": "moderate stage",
+    "count": 11
+  },
+  {
+    "definition": "not applicable or unspecified",
+    "count": 15
+  },
+  {
+    "definition": "other fetus",
+    "count": 15
+  },
+  {
+    "definition": "right eye",
+    "count": 25
+  },
+  {
+    "definition": "sequela",
+    "count": 445
+  },
+  {
+    "definition": "sequela of fracture",
+    "count": 2
+  },
+  {
+    "definition": "severe stage",
+    "count": 11
+  },
+  {
+    "definition": "stable",
+    "count": 2
+  },
+  {
+    "definition": "stage unspecified",
+    "count": 13
+  },
+  {
+    "definition": "subsequent encounter",
+    "count": 408
+  },
+  {
+    "definition": "subsequent encounter for closed fracture with delayed healing",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for closed fracture with malunion",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for closed fracture with nonunion",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for closed fracture with routine healing",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for fracture with delayed healing",
+    "count": 36
+  },
+  {
+    "definition": "subsequent encounter for fracture with malunion",
+    "count": 30
+  },
+  {
+    "definition": "subsequent encounter for fracture with nonunion",
+    "count": 34
+  },
+  {
+    "definition": "subsequent encounter for fracture with routine healing",
+    "count": 36
+  },
+  {
+    "definition": "subsequent encounter for open fracture type I or II with delayed healing",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type I or II with malunion",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type I or II with nonunion",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type I or II with routine healing",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with malunion",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with nonunion",
+    "count": 3
+  },
+  {
+    "definition": "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing",
+    "count": 3
+  },
+  {
+    "definition": "unspecified eye",
+    "count": 25
+  },
+  {
+    "definition": "unspecified time",
+    "count": 4
+  },
+  {
+    "definition": "with active choroidal neovascularization",
+    "count": 1
+  },
+  {
+    "definition": "with inactive choroidal neovascularization",
+    "count": 1
+  },
+  {
+    "definition": "with inactive scar",
+    "count": 1
+  },
+  {
+    "definition": "with macular edema",
+    "count": 2
+  },
+  {
+    "definition": "with retinal neovascularization",
+    "count": 2
+  },
+  {
+    "definition": "with tophus (tophi)",
+    "count": 1
+  },
+  {
+    "definition": "without tophus (tophi)",
+    "count": 1
+  }
+]

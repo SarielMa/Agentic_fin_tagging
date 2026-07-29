@@ -1,0 +1,85 @@
+{
+  "fetus-specific": [
+    "fetus 1",
+    "fetus 2",
+    "fetus 3",
+    "fetus 4",
+    "fetus 5",
+    "other fetus"
+  ],
+  "initial-encounter": [
+    "initial encounter",
+    "initial encounter for closed fracture",
+    "initial encounter for fracture",
+    "initial encounter for open fracture",
+    "initial encounter for open fracture type I or II",
+    "initial encounter for open fracture type IIIA, IIIB, or IIIC"
+  ],
+  "not-applicable": [
+    "not applicable"
+  ],
+  "other-extension": [
+    "24 hours or more after hospital admission",
+    "advanced atrophic with subfoveal involvement",
+    "advanced atrophic without subfoveal involvement",
+    "at arrival to emergency department",
+    "at hospital admission",
+    "bilateral",
+    "in the field [EMT or ambulance]",
+    "left eye",
+    "right eye",
+    "stable",
+    "with active choroidal neovascularization",
+    "with inactive choroidal neovascularization",
+    "with inactive scar",
+    "with macular edema",
+    "with retinal neovascularization",
+    "with tophus (tophi)",
+    "without tophus (tophi)"
+  ],
+  "sequela": [
+    "sequela",
+    "sequela of fracture"
+  ],
+  "stage": [
+    "early dry stage",
+    "indeterminate stage",
+    "intermediate dry stage",
+    "mild stage",
+    "moderate stage",
+    "severe stage"
+  ],
+  "subsequent-delayed-healing": [
+    "subsequent encounter for closed fracture with delayed healing",
+    "subsequent encounter for fracture with delayed healing",
+    "subsequent encounter for open fracture type I or II with delayed healing",
+    "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with delayed healing"
+  ],
+  "subsequent-encounter": [
+    "subsequent encounter"
+  ],
+  "subsequent-malunion": [
+    "subsequent encounter for closed fracture with malunion",
+    "subsequent encounter for fracture with malunion",
+    "subsequent encounter for open fracture type I or II with malunion",
+    "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with malunion"
+  ],
+  "subsequent-nonunion": [
+    "subsequent encounter for closed fracture with nonunion",
+    "subsequent encounter for fracture with nonunion",
+    "subsequent encounter for open fracture type I or II with nonunion",
+    "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with nonunion"
+  ],
+  "subsequent-routine-healing": [
+    "subsequent encounter for closed fracture with routine healing",
+    "subsequent encounter for fracture with routine healing",
+    "subsequent encounter for open fracture type I or II with routine healing",
+    "subsequent encounter for open fracture type IIIA, IIIB, or IIIC with routine healing"
+  ],
+  "unspecified": [
+    "not applicable or unspecified",
+    "stage unspecified",
+    "unspecified eye",
+    "unspecified time"
+  ]
+}

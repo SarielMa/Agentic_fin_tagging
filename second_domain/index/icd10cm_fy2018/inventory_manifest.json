@@ -1,0 +1,12 @@
+{
+  "inventory_size": 71344,
+  "valid_diagnosis_codes": 98288,
+  "fy2018_billable_codes": 71704,
+  "intersection_rule": "CodiEsp diagnosis valid codes intersected with ICD-10-CM FY2018 billable codes.",
+  "definition_substitution": [
+    "current-code inclusionTerm notes",
+    "inherited includes notes from chapter/section/ancestor diag",
+    "hierarchy path text: chapter desc > section desc > parent diag desc",
+    "alphabetic-index lead/sub-term paths resolving to the code"
+  ]
+}

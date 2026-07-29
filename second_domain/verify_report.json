@@ -1,0 +1,63 @@
+{
+  "codiesp_root": "raw/codiesp/extracted/final_dataset_v4_to_publish",
+  "codiesp_splits": {
+    "train": {
+      "D_columns": [
+        2
+      ],
+      "X_columns": [
+        5
+      ],
+      "text_files": 500,
+      "text_files_en": 500,
+      "has_discontinuous_offsets": true
+    },
+    "dev": {
+      "D_columns": [
+        2
+      ],
+      "X_columns": [
+        5
+      ],
+      "text_files": 250,
+      "text_files_en": 250,
+      "has_discontinuous_offsets": true
+    },
+    "test": {
+      "D_columns": [
+        2
+      ],
+      "X_columns": [
+        5
+      ],
+      "text_files": 250,
+      "text_files_en": 250,
+      "has_discontinuous_offsets": true
+    }
+  },
+  "valid_codes": {
+    "D_columns": [
+      3
+    ],
+    "path": "raw/valid_codes/extracted/codiesp_codes/codiesp-D_codes.tsv"
+  },
+  "icd10cm": {
+    "tabular_xml": "raw/icd10cm_fy2018/extracted/icd10cm_tabular_2018.xml",
+    "index_xml": "raw/icd10cm_fy2018/extracted/icd10cm_index_2018.xml",
+    "codes_txt": "raw/icd10cm_fy2018/extracted/icd10cm_codes_2018.txt",
+    "observed_elements": [
+      "chapter",
+      "section",
+      "diag",
+      "name",
+      "desc",
+      "inclusionTerm",
+      "includes",
+      "excludes1",
+      "excludes2",
+      "sevenChrDef",
+      "extension"
+    ]
+  },
+  "discrepancies": []
+}

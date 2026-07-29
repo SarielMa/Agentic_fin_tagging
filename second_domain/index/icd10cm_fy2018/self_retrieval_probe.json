@@ -1,0 +1,44 @@
+{
+  "checked": 158,
+  "top1_failures": 6,
+  "top1_failure_rate": 0.037975,
+  "failed": false,
+  "first_failures": [
+    {
+      "tag": "us-gaap:D41.00",
+      "standard_label": "Neoplasm of uncertain behavior of unspecified kidney",
+      "top_tag": "us-gaap:D41.9",
+      "top_label": "Neoplasm of uncertain behavior of unspecified urinary organ"
+    },
+    {
+      "tag": "us-gaap:H54.62",
+      "standard_label": "Unqualified visual loss, left eye, normal vision right eye",
+      "top_tag": "us-gaap:H54.61",
+      "top_label": "Unqualified visual loss, right eye, normal vision left eye"
+    },
+    {
+      "tag": "us-gaap:I95.9",
+      "standard_label": "Hypotension, unspecified",
+      "top_tag": "us-gaap:I95.89",
+      "top_label": "Other hypotension"
+    },
+    {
+      "tag": "us-gaap:J91.0",
+      "standard_label": "Malignant pleural effusion",
+      "top_tag": "us-gaap:J91.8",
+      "top_label": "Pleural effusion in other conditions classified elsewhere"
+    },
+    {
+      "tag": "us-gaap:M32.9",
+      "standard_label": "Systemic lupus erythematosus, unspecified",
+      "top_tag": "us-gaap:M32.10",
+      "top_label": "Systemic lupus erythematosus, organ or system involvement unspecified"
+    },
+    {
+      "tag": "us-gaap:R11.0",
+      "standard_label": "Nausea",
+      "top_tag": "us-gaap:R11.11",
+      "top_label": "Vomiting without nausea"
+    }
+  ]
+}

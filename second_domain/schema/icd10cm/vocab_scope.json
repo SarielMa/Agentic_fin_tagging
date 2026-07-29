@@ -1,0 +1,29 @@
+{
+  "right": [
+    "right",
+    "right side",
+    "right eye",
+    "right arm",
+    "right leg"
+  ],
+  "left": [
+    "left",
+    "left side",
+    "left eye",
+    "left arm",
+    "left leg"
+  ],
+  "bilateral": [
+    "bilateral",
+    "both sides"
+  ],
+  "unspecified-side": [
+    "unspecified side",
+    "unspecified eye",
+    "unspecified limb"
+  ],
+  "not-applicable": [
+    "not applicable",
+    "without laterality"
+  ]
+}
