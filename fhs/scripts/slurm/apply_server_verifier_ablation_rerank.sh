@@ -123,7 +123,70 @@ case "${ARM}" in
                    EXTRA_FLAGS="--n-hypotheses 1 --kept-hypothesis-idx 0" ;;
   ensemble_idx1)   MODE=deterministic; BETA=0.6; TOP_M_FLAG=""
                    EXTRA_FLAGS="--n-hypotheses 1 --kept-hypothesis-idx 1" ;;
+
+  # THE SAME DIAGNOSTIC ROWS, SCORED BY THE LLM-ONLY VERIFIER (2026-07-29).
+  # The arms above supply the rerank term from the deterministic check, while tab:ablation's FHS
+  # row is llm_drop -- so their printed deltas mixed "component removed" with "verifier changed".
+  # These arms remove that confound. Each needs VERDICTS pointing at ITS OWN verdict file, i.e.
+  # one generated with run_llm_verifier.py --window-tags arm_windows/window_<arm>.jsonl, because
+  # an arm's fused top-K_v window is not FHS's: measured head coverage is 0.76-0.84
+  # (ablation_window_coverage.json). Passing FHS's verdicts here would silently reproduce the
+  # numbers this rerun exists to replace.
+  # EXCEPTION: llmonly_raw_scaling needs no new verdicts. Range-normalization is monotone, so
+  # removing it leaves the fused ORDER -- and therefore the window -- identical to FHS's
+  # (coverage 1.000), and verdicts_k10_fused applies unchanged.
+
+# NO llmonly_* ARM MAY PASS --top-m. It used to pass `--top-m 10`, which looks harmless because
+# every verdict file here IS generated at K_v=10 -- but --top-m restricts the verdicts through
+# `--calls`, and this script never passes --calls, so the restriction ran against
+# dump_reranked_ranking.py's DEFAULT_CALLS: the 2026-07-25 DETERMINISTIC-window call log. Measured
+# 2026-07-30: verdicts_k10_judge6 has 50,180 keys and comes back with 42,910 after that
+# restriction, i.e. 14.5% of the fused-window verdicts are dropped for not appearing in the
+# deterministic window -- reintroducing exactly the confound the per-arm windows exist to remove,
+# with no error and plausible numbers. `rerank_llmonly_ask6_score6` was staged that way (68% of
+# facts differ in top-10 from the unrestricted dump) and its rerank job was cancelled. The
+# verdicts already carry the intended window, so the correct setting is no --top-m at all.
+# dump_reranked_ranking.py now refuses --top-m unless --calls is given explicitly.
+#
+# Every llmonly_* arm pins the judged/scored dimension set explicitly. core.py's
+# LLM_VERIFIER_DIMENSIONS_DEFAULT is a shared constant that a concurrent experiment can widen to
+# all six; under llm_drop that is provably a no-op (an unasked dimension has no key, so it drops
+# out of the denominator -- verified byte-identical on the published FHS row), but under
+# llm_strict it would silently penalise every candidate on three dimensions the verifier was
+# never asked about. Pinning here costs nothing and removes the dependency.
+  llmonly_raw_scaling)   MODE=llm_drop; BETA=0.6; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--scaling raw --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
+  llmonly_mean_fusion)   MODE=llm_drop; BETA=0.6; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--fusion mean --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
+  llmonly_label_form)    MODE=llm_drop; BETA=0.8; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--renderings def --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
+  llmonly_definition_form) MODE=llm_drop; BETA=0.2; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--renderings lab --lab-only-fallback none --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
+  llmonly_ensemble_idx0) MODE=llm_drop; BETA=0.6; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--n-hypotheses 1 --kept-hypothesis-idx 0 --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
+  llmonly_ensemble_idx1) MODE=llm_drop; BETA=0.6; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--n-hypotheses 1 --kept-hypothesis-idx 1 --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
+  llmonly_oracle_single) MODE=llm_drop; BETA=0.6; TOP_M_FLAG=""
+                         EXTRA_FLAGS="--oracle-best-single --llm-unjudged-fill mean --llm-verifier-dimensions FAMILY,ROLE,EVENT,QUALIFIER,SCOPE,TEMPORAL" ;;
   *) echo "Unknown ARM=${ARM}" >&2; exit 2 ;;
+esac
+
+# An llmonly_* arm other than raw_scaling that was handed FHS's verdicts is the one failure mode
+# that produces plausible numbers instead of an error, so refuse it here rather than in review.
+case "${ARM}" in
+  llmonly_raw_scaling) : ;;
+  llmonly_*)
+    if [[ -z "${VERDICTS:-}" ]]; then
+      echo "ARM=${ARM} needs VERDICTS=<its own verdicts_arm_*/llm_verifier_verdicts.json>." >&2
+      echo "Generate it with apply_server_ags_table5_llm_verifier.sh and WINDOW_TAGS=arm_windows/window_<arm>.jsonl." >&2
+      exit 2
+    fi
+    if [[ "${VERDICTS}" == *"/verdicts_k10_fused/"* ]]; then
+      echo "ARM=${ARM} was pointed at FHS's own verdicts (${VERDICTS})." >&2
+      echo "That reproduces FHS's window, which is exactly the confound this arm removes." >&2
+      exit 2
+    fi
+    ;;
 esac
 
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs/runs_ags_verifier_ablation/qwen3_32b/rerank_${ARM}}"

@@ -58,7 +58,7 @@ MISSING INPUT: ${RERANKED_RANKING}
 This job reranks the candidate-level-LLM-reranked ranking, but that ranking has not been
 materialised yet. It is produced by re-running the offline ablation's evaluate() under
 AblationConfig(llm_verifier_verdicts=...) and persisting the per-fact ranking rather than
-only the aggregate metrics -- ags_table5_ablation/run_verifier_row_only.py computes exactly
+only the aggregate metrics -- src/verifier/run_verifier_row_only.py computes exactly
 this ranking today but keeps only the summary rows.
 
 To materialise it, extend that script to dump the per-fact ranking to

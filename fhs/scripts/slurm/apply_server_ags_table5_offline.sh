@@ -90,8 +90,8 @@ echo "OUTPUT_DIR=${OUTPUT_DIR}"
 echo "LIMIT=${LIMIT:-<none>}"
 echo "============================================================"
 
-python -m py_compile ags_table5_ablation/core.py ags_table5_ablation/data_prep.py \
-  ags_table5_ablation/run_beta_sweep.py ags_table5_ablation/run_test_rows.py \
-  ags_table5_ablation/run_index_ablation.py
+python -m py_compile src/verifier/core.py src/verifier/data_prep.py \
+  src/verifier/run_beta_sweep.py src/verifier/run_test_rows.py \
+  src/verifier/run_index_ablation.py
 
-python ags_table5_ablation/run_all_offline.py --output-dir "${OUTPUT_DIR}" "${LIMIT_ARGS[@]}" "${SKIP_BETA_SWEEP_ARGS[@]}"
+python src/verifier/run_all_offline.py --output-dir "${OUTPUT_DIR}" "${LIMIT_ARGS[@]}" "${SKIP_BETA_SWEEP_ARGS[@]}"

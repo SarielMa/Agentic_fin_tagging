@@ -20,7 +20,8 @@ export RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs_fintagging_grounding_baseline}"
 export QUERY_MODE="${QUERY_MODE:-decomposed_retrieval}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/qwen3_32b_decomposed_retrieval}"
 export RETRIEVAL_ROUNDS="${RETRIEVAL_ROUNDS:-4}"
-export QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-384}"
+# Output budget deliberately NOT set here: it is shared, and lives in
+# apply_server_fintagging_direct_retrieval.sh. A per-method cap is a confound.
 export QUERY_GENERATION_MODEL="${QUERY_GENERATION_MODEL:-Qwen/Qwen3-32B}"
 export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
 export RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-32B}"

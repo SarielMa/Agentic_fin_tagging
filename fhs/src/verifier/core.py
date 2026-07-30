@@ -56,12 +56,19 @@ from run_fintagging_grounding_baseline import normalize_tag  # noqa: E402
 # verifier/reranker interaction table is stated at that depth. Adding a depth only adds a
 # recall_at_20 key; callers name the metrics they write, so existing CSV schemas are unchanged.
 TOP_KS = (10, 20, 50, 200)
-LLM_VERIFIER_DIMENSIONS_DEFAULT = ("FAMILY", "ROLE", "EVENT")
+# THE DEPLOYED CONFIGURATION, changed 2026-07-30: the verifier is asked about, and scored over,
+# every dimension the generator emits. The earlier three-dimension set (FAMILY/ROLE/EVENT) split
+# the schema into "text-decidable" and "metadata-determined" -- a per-domain human judgement that
+# does not transfer: in ICD-10-CM laterality and encounter type are written into the code's own
+# text, so that split would be wrong there. Asking and scoring all six needs no such decision.
+# Every number in the paper is regenerated under this setting; ask-3 artifacts are superseded.
+LLM_VERIFIER_DIMENSIONS_DEFAULT = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
 
 # Which verifier supplies the rerank term. "auto" preserves the original behaviour --
 # hybrid when verdicts are attached, deterministic when they are not -- so every row
 # written before verifier_mode existed evaluates identically.
-VERIFIER_MODES = ("auto", "deterministic", "hybrid", "llm_drop", "llm_strict", "det_window")
+VERIFIER_MODES = ("auto", "deterministic", "hybrid", "llm_drop", "llm_strict", "det_window",
+                  "llm_neutral", "llm_varweight")
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,14 @@ class AblationConfig:
     oracle_best_single: bool = False
     llm_verifier_top_m: int = 10
     llm_verifier_dimensions: tuple[str, ...] = LLM_VERIFIER_DIMENSIONS_DEFAULT
+    # One weight per dimension, estimated ONCE over the whole corpus rather than inside each
+    # K_v window. The per-window form (verifier_mode="llm_varweight") estimates from <=10 binary
+    # verdicts and is measurably unstable: weight sd >= mean on all six dimensions, and the two
+    # hypotheses of the same fact -- which see the SAME candidate window -- disagree on the
+    # top-weighted dimension 45.3% of the time. A corpus-level weight keeps the property that
+    # makes the idea transferable (no human picks the dimensions) without that noise. None keeps
+    # equal weights, i.e. the deployed mean, so every existing call is unchanged.
+    llm_verifier_dimension_weights: tuple[tuple[str, float], ...] | None = None
     verifier_mode: str = "auto"
     # What an LLM-only arm scores a candidate the verifier never saw. "zero" drives every
     # out-of-window candidate to the bottom of the rerank term, which conflates "remove the
@@ -315,6 +330,7 @@ def llm_only_agree_score(
     llm_verdict: dict[str, Any] | None,
     llm_dimensions: tuple[str, ...],
     abstention: str,
+    weights: dict[str, float] | None = None,
 ) -> float | None:
     """agree() over the LLM's own dimensions only, with no symbolic term anywhere.
 
@@ -333,10 +349,26 @@ def llm_only_agree_score(
     Candidates outside the top-M window have no verdict under either reading and score 0.0,
     which is what confines this term to the head of the ranking.
     """
-    if abstention not in ("drop", "negative"):
-        raise ValueError(f"Unknown abstention {abstention!r}; expected 'drop' or 'negative'")
+    if abstention not in ("drop", "negative", "neutral"):
+        raise ValueError(f"Unknown abstention {abstention!r}; expected 'drop', 'negative' or 'neutral'")
+    if abstention == "neutral":
+        if llm_verdict is None:
+            return 0.5
+        vals = [0.5 if llm_verdict.get(d) is None else float(bool(llm_verdict.get(d)))
+                for d in llm_dimensions]
+        return sum(vals) / len(vals) if vals else 0.5
     if llm_verdict is None:
         return None if abstention == "drop" else 0.0
+    if weights is not None:
+        num = den = 0.0
+        for dimension in llm_dimensions:
+            value = llm_verdict.get(dimension)
+            if value is None:
+                continue
+            w = float(weights.get(dimension, 0.0))
+            num += w * float(bool(value))
+            den += w
+        return (num / den) if den > 0 else None
     matches: list[bool] = []
     for dimension in llm_dimensions:
         value = llm_verdict.get(dimension)
@@ -440,6 +472,7 @@ def llm_only_consensus_scores(
     llm_dimensions: tuple[str, ...],
     abstention: str,
     unjudged_fill: str = "zero",
+    global_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Consensus over hypotheses using llm_only_agree_score. Same shape as
     hybrid_consensus_scores -- mean over hypotheses -- so the two differ only in where the
@@ -461,11 +494,37 @@ def llm_only_consensus_scores(
     per_hyp_scores: dict[int, dict[str, float]] = {}
     for hyp_idx in hyp_indices:
         judged: dict[str, float] = {}
+        # Corpus-level weights, when supplied, replace the per-window estimate: same weighted
+        # arithmetic, but one number per dimension estimated over every window instead of from
+        # the <=10 verdicts inside this one.
+        weights = dict(global_weights) if global_weights else None
+        if abstention == "varweight":
+            # A dimension that rules the same way on every candidate in this window cannot
+            # reorder them; it only contributes a constant, and -- because abstentions vary
+            # across candidates -- perturbs the denominator. Weight each dimension by the
+            # variance of its verdicts inside the window, so such a dimension goes to zero.
+            weights = {}
+            for dimension in llm_dimensions:
+                vals = []
+                for tag in tags:
+                    verdict = verdicts.get((fact_id, hyp_idx, tag))
+                    if verdict is None:
+                        continue
+                    value = verdict.get(dimension)
+                    if value is not None:
+                        vals.append(float(bool(value)))
+                if len(vals) > 1:
+                    mean = sum(vals) / len(vals)
+                    weights[dimension] = sum((v - mean) ** 2 for v in vals) / len(vals)
+                else:
+                    weights[dimension] = 0.0
+            if not any(weights.values()):
+                weights = {d: 1.0 for d in llm_dimensions}
         for tag in tags:
             verdict = verdicts.get((fact_id, hyp_idx, tag))
             if verdict is None:
                 continue
-            score = llm_only_agree_score(verdict, llm_dimensions, abstention)
+            score = llm_only_agree_score(verdict, llm_dimensions, abstention, weights=weights)
             if score is not None:
                 judged[tag] = score
         if unjudged_fill == "mean" and judged:
@@ -567,8 +626,10 @@ def _consensus_for(
             config.llm_verifier_verdicts,
             config.llm_verifier_dimensions,
             unjudged_fill=config.llm_unjudged_fill,
+            global_weights=(dict(config.llm_verifier_dimension_weights)
+                            if config.llm_verifier_dimension_weights else None),
         )
-    elif mode in ("llm_drop", "llm_strict"):
+    elif mode in ("llm_drop", "llm_strict", "llm_neutral", "llm_varweight"):
         result = llm_only_consensus_scores(
             pool,
             hypotheses,
@@ -576,8 +637,12 @@ def _consensus_for(
             hyp_indices,
             config.llm_verifier_verdicts,
             config.llm_verifier_dimensions,
-            abstention="drop" if mode == "llm_drop" else "negative",
+            abstention=("drop" if mode == "llm_drop"
+                    else "neutral" if mode == "llm_neutral"
+                    else "varweight" if mode == "llm_varweight" else "negative"),
             unjudged_fill=config.llm_unjudged_fill,
+            global_weights=(dict(config.llm_verifier_dimension_weights)
+                            if config.llm_verifier_dimension_weights else None),
         )
     else:
         result = consensus_scores(pool, hypotheses, normalization_map)

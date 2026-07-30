@@ -69,8 +69,8 @@ from run_ags_verifier_ablation import (  # noqa: E402
 DEFAULT_WINDOWS = (5, 20)
 
 
-def variant_name(top_m: int) -> str:
-    return f"Hybrid AGS (K_v={top_m})"
+def variant_name(top_m: int, prefix: str = "Hybrid AGS") -> str:
+    return f"{prefix} (K_v={top_m})"
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +97,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-samples", type=int, default=BOOTSTRAP_SAMPLES)
     parser.add_argument("--seed", type=int, default=BOOTSTRAP_SEED)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--verifier-mode",
+        default="hybrid",
+        choices=("hybrid", "llm_drop", "llm_strict"),
+        help="Which rerank term the swept arm carries. Default 'hybrid' is the arm this script "
+        "was written for and leaves every existing invocation unchanged. 'llm_drop' is the "
+        "deployed LLM-only arm the paper reports as FHS, whose K_v=10 row must reproduce "
+        "tab:ablation's FHS row -- pass --baseline-per-fact per_fact/deterministic_verifier.jsonl "
+        "with it, or the pairing is against the wrong arm.",
+    )
+    parser.add_argument(
+        "--variant-prefix",
+        default=None,
+        help="Row label prefix in the CSV. Defaults to 'Hybrid AGS' for --verifier-mode hybrid "
+        "and 'FHS' otherwise. Rows are matched by this label downstream, so two modes written "
+        "under one prefix would silently overwrite each other.",
+    )
+    parser.add_argument(
+        "--baseline-window",
+        type=int,
+        default=10,
+        help="The window --baseline-per-fact was generated at. If that window is also swept "
+        "here, its recomputed metrics must reproduce the baseline exactly; a mismatch means the "
+        "config differs from the arm on disk and the whole sweep is off-baseline.",
+    )
     parser.add_argument(
         "--min-parse-rate",
         type=float,
@@ -191,12 +216,14 @@ def main() -> None:
     args = parse_args()
     args.run_dir.mkdir(parents=True, exist_ok=True)
     windows = resolve_windows(args)
+    prefix = args.variant_prefix or ("Hybrid AGS" if args.verifier_mode == "hybrid" else "FHS")
     baseline_path = args.baseline_per_fact or args.run_dir / "per_fact" / "hybrid_ags_full.jsonl"
 
     normalization_map = load_normalization_map(args.normalization_map)
     baseline_rows = rehydrate_baseline(baseline_path)
     baseline_agg = aggregate(baseline_rows)
-    print(f"baseline K_v=10 from {baseline_path.name}: {len(baseline_rows)} facts", flush=True)
+    print(f"mode {args.verifier_mode}, rows labelled {variant_name(0, prefix)[:-6]}...", flush=True)
+    print(f"baseline K_v={args.baseline_window} from {baseline_path.name}: {len(baseline_rows)} facts", flush=True)
     print(f"  recall@10 {baseline_agg['recall_at_10']:.6f}  mrr {baseline_agg['mrr']:.6f}  "
           f"top1 {baseline_agg['top1_accuracy']:.6f}", flush=True)
 
@@ -221,9 +248,9 @@ def main() -> None:
             continue
 
         config = AblationConfig(
-            name=variant_name(top_m),
+            name=variant_name(top_m, prefix),
             beta=0.6,
-            verifier_mode="hybrid",
+            verifier_mode=args.verifier_mode,
             # Same deployed settings as the arms in run_ags_verifier_ablation.py, so the only
             # thing that differs between this row and the K_v=10 row is the window.
             truncate_pool_to_top_k=True,
@@ -238,9 +265,27 @@ def main() -> None:
         print(f"  K_v={top_m:<3} {elapsed:7.1f}s  verdicts {len(run['verdicts'])}  "
               f"calls {run['call_cost']['calls']}", flush=True)
 
+        if top_m == args.baseline_window and args.limit is None:
+            # The baseline arm re-scored from its own verdicts must land back on the published
+            # row. If it does not, this sweep is pinned to an arm the paper does not report and
+            # every delta below is measured against the wrong thing.
+            recomputed = aggregate(rows)
+            drift = {
+                metric: (recomputed[metric], baseline_agg[metric])
+                for metric in ("recall_at_10", "recall_at_50", "mrr", "top1_accuracy")
+                if abs(recomputed[metric] - baseline_agg[metric]) > 1e-9
+            }
+            if drift:
+                raise SystemExit(
+                    f"K_v={top_m} recomputed under verifier_mode={args.verifier_mode} does not "
+                    f"reproduce {baseline_path.name}: {drift}. Either --baseline-per-fact names "
+                    "another arm or the config here has drifted from the one on disk."
+                )
+            print(f"  K_v={top_m:<3} reproduces {baseline_path.name} exactly", flush=True)
+
         fresh.extend(
             bootstrap_rows(
-                variant_name(top_m),
+                variant_name(top_m, prefix),
                 rows,
                 baseline_rows,
                 args.bootstrap_samples,
@@ -263,7 +308,7 @@ def main() -> None:
     if out_path.exists() and out_path.stat().st_size > 0:
         import csv as _csv
 
-        regenerated = {variant_name(k) for k in done}
+        regenerated = {variant_name(k, prefix) for k in done}
         with out_path.open(encoding="utf-8", newline="") as handle:
             for row in _csv.DictReader(handle):
                 if row.get("variant") not in regenerated:

@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import math
 import random
 import re
@@ -33,7 +34,11 @@ from dataclasses import dataclass
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from typing import Iterable
+
+import generation_budget
 
 try:
     import torch
@@ -873,16 +878,19 @@ def build_candidate_records(
                 "candidates": candidates,
             }
         ]
-        records.append(
-            finalize_candidate_record(
-                example,
-                query_mode=query_mode,
-                rounds=rounds,
-                top_k=top_k,
-                rrf_kappa=rrf_kappa,
-                total_llm_calls=1 if query_mode == "one_pass_grounding" else 0,
-            )
+        record = finalize_candidate_record(
+            example,
+            query_mode=query_mode,
+            rounds=rounds,
+            top_k=top_k,
+            rrf_kappa=rrf_kappa,
+            total_llm_calls=1 if query_mode == "one_pass_grounding" else 0,
         )
+        # Stamp the weight the retriever above actually carried, so the run is self-describing.
+        # Inferring it later from the directory name is how a w_cov=0 baseline ended up printed
+        # next to a w_cov=1 method without anything in the metadata contradicting it.
+        record["label_coverage_weight"] = float(retriever.label_coverage_weight)
+        records.append(record)
     return records
 
 
@@ -1469,6 +1477,9 @@ def llm_call_record(
         "backend": backend,
         "model": model_name,
     }
+    # Counted in a module with a single identity: this file runs as __main__ while
+    # ags_frozen_grounding imports it by name, so a counter defined here would exist twice.
+    generation_budget.note(completion_tokens)
     if extra_fields:
         record.update(extra_fields)
     return record
@@ -1596,6 +1607,27 @@ def build_parallel_sampling_messages(
     context_max_chars: int,
 ) -> list[dict[str, str]]:
     evidence = serialize_evidence(example, context_max_chars)
+    # PARALLEL_PROMPT_STYLE=plain drops the diversity instruction, giving the i.i.d. sampling that
+    # self-consistency actually describes. The default ("instructed") keeps the historical prompt,
+    # which tells the model this is sample i of N and to make it "meaningfully distinct" -- that is
+    # a forced-variation arm, and the development pilot found forced variation LOWERS
+    # single-hypothesis recall. Comparing FHS's unmodified sampling against an instructed free-text
+    # arm therefore risks crediting factorization with a handicap imposed on the baseline.
+    if os.environ.get("PARALLEL_PROMPT_STYLE", "instructed") == "plain":
+        user = f"""Generate a semantic interpretation of financial evidence for retrieving the correct US-GAAP XBRL taxonomy concept.
+
+Return JSON only with this schema:
+{{"query": "semantic retrieval description"}}
+
+Evidence:
+{evidence}
+
+Rules:
+- Do not include explanations or markdown."""
+        return [
+            {"role": "system", "content": "You generate US-GAAP retrieval hypotheses."},
+            {"role": "user", "content": user},
+        ]
     user = f"""Generate a semantic interpretation of financial evidence for retrieving the correct US-GAAP XBRL taxonomy concept.
 
 This is interpretation {sample_idx} of {total_samples}. Explore a different plausible reading of the evidence. Consider varying:
@@ -2716,6 +2748,11 @@ def build_parallel_diversity_method_record(
         wall_time=time.monotonic() - start_time,
         extra_fields={
             "rrf_kappa": args.rrf_kappa,
+            # The retriever's ACTUAL coverage weight, not the flag: only the frozen family
+            # assigns it, so a baseline run without --label-coverage-weight silently used 0.0.
+            # Recorded here so a run is self-describing and verify_single_code_path.py can check
+            # it instead of inferring it from the directory name.
+            "label_coverage_weight": float(getattr(retriever, "label_coverage_weight", 0.0)),
             "fusion_mode": "per_hypothesis_then_across",
             "generation_design": "sequential_exclusion_B_calls",
             "mean_pairwise_neighborhood_overlap_at_200": pairwise_candidate_overlap(rounds, args.top_k),
@@ -3075,6 +3112,11 @@ def build_bandit_freeform_method_record(
         wall_time=time.monotonic() - start_time,
         extra_fields={
             "rrf_kappa": args.rrf_kappa,
+            # The retriever's ACTUAL coverage weight, not the flag: only the frozen family
+            # assigns it, so a baseline run without --label-coverage-weight silently used 0.0.
+            # Recorded here so a run is self-describing and verify_single_code_path.py can check
+            # it instead of inferring it from the directory name.
+            "label_coverage_weight": float(getattr(retriever, "label_coverage_weight", 0.0)),
             "bandit_freeform_manifest": {
                 "arms": list(arms),
                 "n_arms": len(arms),
@@ -3389,6 +3431,11 @@ def build_structured_method_record(
         wall_time=time.monotonic() - start_time,
         extra_fields={
             "rrf_kappa": args.rrf_kappa,
+            # The retriever's ACTUAL coverage weight, not the flag: only the frozen family
+            # assigns it, so a baseline run without --label-coverage-weight silently used 0.0.
+            # Recorded here so a run is self-describing and verify_single_code_path.py can check
+            # it instead of inferring it from the directory name.
+            "label_coverage_weight": float(getattr(retriever, "label_coverage_weight", 0.0)),
             "operator_transitions": transitions,
         },
     )
@@ -4083,7 +4130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-description-path", type=Path, default=None)
     parser.add_argument("--query-context-max-chars", type=int, default=12000)
     parser.add_argument("--query-max-input-tokens", type=int, default=16000)
-    parser.add_argument("--query-max-new-tokens", type=int, default=128)
+    parser.add_argument("--query-max-new-tokens", type=int, default=2048)
     parser.add_argument("--query-temperature", type=float, default=0.0)
     parser.add_argument("--query-top-p", type=float, default=1.0)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -4105,6 +4152,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Arm the truncation counter with this run's cap before any generation happens.
+    generation_budget.arm(args.query_max_new_tokens)
     args.query_mode = canonical_query_mode(args.query_mode)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4239,7 +4288,26 @@ def main() -> None:
             "feedback_candidate_count": args.feedback_candidate_count
             if args.query_mode in {"retrieval_feedback_refinement", "operator_refinement", "memory_guided_refinement"}
             else None,
+            "truncation": generation_budget.report(),
+            # Recorded because it is not shared: the frozen family overrides it to its own
+            # sampling temperature inside sample_hypotheses, while every other mode decodes at
+            # whatever the shell passed. Without this field a run cannot say which it used.
+            "query_temperature": args.query_temperature,
+            "prompt_style": os.environ.get("PARALLEL_PROMPT_STYLE", "instructed"),
             "rrf_kappa": args.rrf_kappa,
+            # The retriever's ACTUAL coverage weight, not the flag: only the frozen family
+            # assigns it, so a baseline run without --label-coverage-weight silently used 0.0.
+            # Recorded here so a run is self-describing and verify_single_code_path.py can check
+            # it instead of inferring it from the directory name.
+            # The coverage weight the retriever actually used. main() does not hold the
+            # retriever (the builders own it), so this reads the value they recorded on the
+            # candidate records; the fallback is the flag, and None means neither was available
+            # rather than a silent 0.0.
+            "label_coverage_weight": next(
+                (r["label_coverage_weight"] for r in candidate_records
+                 if isinstance(r, dict) and r.get("label_coverage_weight") is not None),
+                args.label_coverage_weight,
+            ),
             "grounding_trace_path": str(grounding_trace_path) if args.query_mode in MULTI_ROUND_QUERY_MODES else None,
             "query_description_path": str(query_description_path) if args.query_mode == "one_pass_grounding" else None,
             "query_generation_model": args.query_generation_model if args.query_mode in LLM_QUERY_MODES else None,

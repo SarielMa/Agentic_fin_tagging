@@ -125,9 +125,9 @@ echo "RRF_KAPPA=${RRF_KAPPA}   BETA=${BETA} (not re-tuned, per spec)"
 echo "LIMIT=${LIMIT:-<none>}   THREADS=${OMP_NUM_THREADS}"
 echo "============================================================"
 
-python -m py_compile ags_t7_t28/dense_index.py ags_t7_t28/run_t28_retriever_robustness.py
+python -m py_compile src/efficiency/dense_index.py src/efficiency/run_t28_retriever_robustness.py
 
-python ags_t7_t28/run_t28_retriever_robustness.py \
+python src/efficiency/run_t28_retriever_robustness.py \
   --output-dir "${OUTPUT_DIR}" \
   --dense-model "${DENSE_MODEL}" \
   --device cpu \

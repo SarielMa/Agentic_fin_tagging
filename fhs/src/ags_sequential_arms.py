@@ -99,7 +99,7 @@ OPERATORS = tuple(DIMENSION_OPERATOR[dimension] for dimension in DIMENSIONS) + (
 # is admissible under any feedback.
 MODE_PRIORITY = {"REFINE": 0, "CHANGE_STRATEGY": 1, "BRANCH": 2, "PERTURB": 3}
 
-# Retained psi block, produced by compute_ags_seq_psi_reduction.py on the 250-instance
+# Retained psi block, measured on the 250-instance
 # diagnostic logs (spec section 4). `is_text` merges into `is_table` (complementary
 # indicators, rank-deficient against `bias`); `is_percent` drops against `is_monetary`
 # (r = -0.92). Condition number on the diagnostic stream falls from 20,518 (11 features)

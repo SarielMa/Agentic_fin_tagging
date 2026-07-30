@@ -101,7 +101,7 @@ echo "============================================================"
 STAGED="${OUTPUT_DIR}/bm25_candidates.jsonl"
 if [[ ! -s "${STAGED}" ]]; then
   echo ">>> stage 1: building ${RETRIEVER}/${METHOD} ranking"
-  python ags_t7_t28/build_t28_deployed_candidates.py \
+  python src/efficiency/build_t28_deployed_candidates.py \
     --retriever-kind "${RETRIEVER}" \
     --method "${METHOD}" \
     --embedding-cache "${EMBED_CACHE}" \

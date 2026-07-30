@@ -59,10 +59,15 @@ from run_fintagging_grounding_baseline import (  # noqa: E402
 )
 
 
-VERIFIER_DIMENSIONS = ("FAMILY", "ROLE", "EVENT")
 # The six dimensions the generator actually emits. SYMBOLIC_DIMENSIONS carries a seventh name,
 # AGGREGATION, that no hypothesis ever fills (measured 0/1,200), so it is deliberately not here.
 ALL_JUDGED_DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
+# The pre-2026-07-30 configuration, kept only to re-read verdict files generated under it.
+LEGACY_JUDGED_DIMENSIONS = ("FAMILY", "ROLE", "EVENT")
+# Deployed as of 2026-07-30: ask about every generated dimension. The old three-dimension set
+# required a per-domain judgement about which dimensions a candidate's text can decide, and that
+# judgement does not transfer (ICD-10-CM writes laterality and encounter type into the code text).
+VERIFIER_DIMENSIONS = ALL_JUDGED_DIMENSIONS
 # Descriptions follow the paper's own typing (Section: task instantiation, M=6): FAMILY/ROLE/
 # EVENT are label-derived and compared by token overlap; QUALIFIER/SCOPE/TEMPORAL are
 # metadata-determined and matched against controlled vocabularies of 18, 7 and 11 categories.
@@ -133,6 +138,28 @@ def parse_args() -> argparse.Namespace:
         "that makes the deterministic verifier choose which candidates the LLM ever judges, "
         "so the '- deterministic verifier' arms are not then independent of it. 'deployed' "
         "exists only to reproduce verdicts generated before this flag.",
+    )
+    parser.add_argument(
+        "--ask-decisive-dimensions",
+        action="store_true",
+        help="Also ask the verifier which dimensions actually discriminate among the candidates "
+        "it was shown, and persist that list per (fact, hypothesis). Costs no extra call. The "
+        "per-dimension verdicts are unchanged, so a verdicts file generated with this flag is a "
+        "superset of one generated without it: score it as usual, or filter each verdict to the "
+        "model's own decisive set to test LLM-chosen scoring against a hand-picked one.",
+    )
+    parser.add_argument(
+        "--window-tags",
+        type=Path,
+        default=None,
+        help="JSONL of per-fact windows written by analysis/stage_arm_windows.py: "
+        '{"fact_id", "hypothesis_indices", "window_tags"}. Given, it REPLACES --window-source: '
+        "the window is the listed tags in the listed order and only the listed hypotheses are "
+        "judged. This is how an ablation arm gets verdicts over its OWN fused ranking instead "
+        "of the deployed one -- without it every arm inherits FHS's window, which is why the "
+        "rendering/ensemble/fusion rows of tab:ablation could only be scored with the "
+        "deterministic term. A fact absent from the file is skipped (the arm has no ranking "
+        "for it, e.g. lab-only on narrative evidence).",
     )
     parser.add_argument(
         "--generation-chunk",
@@ -206,7 +233,7 @@ def parse_args() -> argparse.Namespace:
     # different proposition from asking for the label-derived three.
     parser.add_argument(
         "--judge-dimensions",
-        choices=("llm", "all"),
+        choices=("llm", "all", "legacy"),
         default="llm",
         help="Dimensions the LLM is asked to return a verdict on. 'llm' is FAMILY/ROLE/EVENT "
         "(every run before this flag). 'all' adds QUALIFIER/SCOPE/TEMPORAL. Score the result "
@@ -214,7 +241,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hint-dimensions",
-        choices=("llm", "all"),
+        choices=("llm", "all", "legacy"),
         default="llm",
         help="Dimensions the --symbolic-hint pre-check may mention. 'all' also widens the "
         "hypothesis shown in the prompt so every named dimension has a visible value.",
@@ -279,6 +306,7 @@ def build_verifier_messages(
     hint: str = "",
     hypothesis_scope: str = "llm",
     judged_dimensions: tuple[str, ...] = VERIFIER_DIMENSIONS,
+    ask_decisive: bool = False,
 ) -> list[dict[str, str]]:
     evidence = serialize_evidence(_EvidenceView(record), context_max_chars)
     candidate_text = "\n\n".join(
@@ -319,12 +347,26 @@ def build_verifier_messages(
     dimension_list = ", ".join(f"{d} ({DIMENSION_GLOSS[d]})" for d in judged_dimensions)
     dimension_names = "/".join(judged_dimensions)
     schema_fields = ", ".join(f'"{d}": "support|contradict|unresolved"' for d in judged_dimensions)
+    # An extra field, not an extra call: the model also names which dimensions actually separate
+    # THESE candidates. That replaces a hand-picked or variance-estimated scoring set with the
+    # model's own choice, which needs no per-domain decision -- while the per-dimension verdicts
+    # above stay exactly as they were, so the factorized mechanism is untouched.
+    decisive_block = ""
+    decisive_schema = ""
+    if ask_decisive:
+        decisive_block = (
+            "\n\nAlso report which of these dimensions actually DISCRIMINATE among the candidates shown --"
+            "\na dimension on which every candidate gets the same verdict cannot separate them, however"
+            "\nimportant it is in general. List them most discriminating first; the list may be empty."
+        )
+        decisive_schema = ', "decisive_dimensions": ["EVENT"]'
+
     user = f"""Judge how well each candidate taxonomy concept matches a grounding hypothesis, on {count_word}
 dimensions: {dimension_list}.
 
 Do not judge any other dimension. Do not try to identify which candidate is the correct answer -- assess
 each dimension independently for every candidate. If the evidence does not let you decide a dimension for
-a candidate, say "unresolved" rather than guessing.
+a candidate, say "unresolved" rather than guessing.{decisive_block}
 
 Hypothesis ({hypothesis_label}):
 {hypothesis_text}
@@ -337,7 +379,7 @@ Candidates:
 {candidate_text}
 
 Return JSON only, one entry per candidate tag, with this schema:
-{{"verdicts": [{{"tag": "us-gaap:Example", {schema_fields}, "confidence": 0.0}}]}}"""
+{{"verdicts": [{{"tag": "us-gaap:Example", {schema_fields}, "confidence": 0.0}}]{decisive_schema}}}"""
     return [
         {"role": "system", "content": f"You verify US-GAAP grounding hypotheses against candidate concepts on {dimension_names} only."},
         {"role": "user", "content": user},
@@ -397,6 +439,28 @@ def salvage_verdict_entries(raw_output: str) -> list[dict[str, Any]]:
         elif char == "]" and depth == 0:
             break
     return entries
+
+
+def parse_decisive_dimensions(raw_output: str, judged_dimensions: tuple[str, ...]) -> list[str]:
+    """The model's own list of discriminating dimensions, or [] if it did not answer usably.
+
+    Parsed separately from the verdicts so `parse_verifier_output`'s contract is unchanged -- the
+    sequential arm calls that function too, and a truncated response must still yield the
+    per-candidate verdicts it did finish.
+    """
+    parsed, _ = parse_json_object(raw_output)
+    if not isinstance(parsed, dict):
+        return []
+    raw = parsed.get("decisive_dimensions")
+    if not isinstance(raw, list):
+        return []
+    allowed = set(judged_dimensions)
+    seen: list[str] = []
+    for item in raw:
+        name = str(item).strip().upper()
+        if name in allowed and name not in seen:
+            seen.append(name)
+    return seen
 
 
 def parse_verifier_output(
@@ -461,7 +525,9 @@ def load_existing(path: Path) -> tuple[dict[tuple[int, int], dict[str, Any]], in
 
 def main() -> None:
     args = parse_args()
-    JUDGED = ALL_JUDGED_DIMENSIONS if args.judge_dimensions == "all" else VERIFIER_DIMENSIONS
+    # "llm"/"all" both mean the deployed set, which is all six. "legacy" reproduces the
+    # pre-2026-07-30 three-dimension configuration; nothing in the paper uses it any more.
+    JUDGED = LEGACY_JUDGED_DIMENSIONS if args.judge_dimensions == "legacy" else ALL_JUDGED_DIMENSIONS
     normalization_map = load_normalization_map(DEFAULT_NORMALIZATION_MAP)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     raw_calls_path = args.output_dir / "llm_verifier_calls.jsonl"
@@ -548,6 +614,12 @@ def main() -> None:
                 "parse_mode": parse_mode,
                 "call": call,
             }
+            if args.ask_decisive_dimensions:
+                # Persisted per (fact, hypothesis), which is the grain the model answered at.
+                # Empty list means it answered nothing usable -- distinguishable from "it said
+                # no dimension discriminates", which is also an empty list only because those
+                # two are the same claim for scoring purposes.
+                row["decisive_dimensions"] = parse_decisive_dimensions(raw_output, JUDGED)
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             accumulate(row)
         handle.flush()
@@ -574,17 +646,67 @@ def main() -> None:
                 flush=True,
             )
 
+    arm_windows: dict[int, dict[str, Any]] | None = None
+    if args.window_tags is not None:
+        arm_windows = {}
+        for line in args.window_tags.open(encoding="utf-8"):
+            entry = json.loads(line)
+            arm_windows[int(entry["fact_id"])] = {
+                "window_tags": [normalize_tag(t) for t in entry["window_tags"]],
+                "hypothesis_indices": [int(i) for i in entry["hypothesis_indices"]],
+            }
+        if not arm_windows:
+            raise SystemExit(f"--window-tags {args.window_tags} is empty")
+        print(
+            f"per-arm windows: {len(arm_windows)} facts from {args.window_tags.name} "
+            f"(--window-source {args.window_source} is overridden)",
+            flush=True,
+        )
+
+    facts_seen = 0
     try:
         for offset, record in enumerate(stream_jsonl(args.test_trace), start=1):
             if args.limit is not None and offset > args.limit:
                 break
+            facts_seen += 1
             fact_id = int(record["example_idx"])
-            ranking = window_ranking(record, args.window_source)
-            representatives = cluster_representatives(ranking, normalization_map, args.top_m, args.cluster_scan_depth)
+            keep_hypotheses: set[int] | None = None
+            if arm_windows is not None:
+                entry = arm_windows.get(fact_id)
+                if entry is None:
+                    continue
+                # Candidate objects live in the per-round lists as well; a fused head computed
+                # from those rounds can contain a tag the record's own top-K final list dropped.
+                # Only looking at final_candidates lost 4.9% of the w_cov=0 arm's window.
+                pool = list(record.get("final_candidates") or record.get("candidates") or [])
+                for round_record in record.get("rounds") or []:
+                    pool.extend(round_record.get("candidates") or [])
+                by_tag = {normalize_tag(c.get("tag", "")): c for c in pool}
+                representatives = [by_tag[tag] for tag in entry["window_tags"] if tag in by_tag]
+                if len(representatives) != len(entry["window_tags"]):
+                    raise SystemExit(
+                        f"fact {fact_id}: {len(entry['window_tags']) - len(representatives)} window "
+                        "tags have no candidate object in the trace, so they cannot be put in the "
+                        "prompt. stage_arm_windows.py checks this on CPU -- regenerate the window file."
+                    )
+                keep_hypotheses = {int(i) for i in entry["hypothesis_indices"]}
+                # The window came from the file, not from the deployed fused score. An earlier
+                # indentation slip let a for/else clause overwrite it with the deployed window on
+                # every record, which would have produced plausible verdicts for the wrong window.
+                assert [normalize_tag(c.get("tag", "")) for c in representatives] == list(entry["window_tags"]), (
+                    f"fact {fact_id}: window does not match the staged file"
+                )
+            else:
+                ranking = window_ranking(record, args.window_source)
+                representatives = cluster_representatives(
+                    ranking, normalization_map, args.top_m, args.cluster_scan_depth
+                )
             candidate_tags = [normalize_tag(candidate["tag"]) for candidate in representatives]
 
             for hypothesis in record.get("frozen_ags_hypotheses", []):
                 hyp_idx = int(hypothesis["hypothesis_idx"])
+                if keep_hypotheses is not None and hyp_idx not in keep_hypotheses:
+                    continue
                 key = (fact_id, hyp_idx)
                 if key in existing:
                     accumulate(existing[key])
@@ -612,7 +734,7 @@ def main() -> None:
                     generator.tokenizer,
                     lambda ctx_chars: build_verifier_messages(
                         record, hypothesis, representatives, ctx_chars, args.candidate_doc_max_chars,
-                        hint, hyp_scope, JUDGED,
+                        hint, hyp_scope, JUDGED, args.ask_decisive_dimensions,
                     ),
                     context_max_chars=args.query_context_max_chars,
                     max_input_tokens=args.query_max_input_tokens,
@@ -654,6 +776,10 @@ def main() -> None:
         "judge_dimensions": list(JUDGED),
         "hint_dimensions": args.hint_dimensions if args.symbolic_hint else None,
         "window_source": args.window_source,
+        # Which arm these verdicts belong to. Without this a per-arm verdict file is
+        # indistinguishable from the deployed one, and scoring an arm with the wrong verdicts
+        # is exactly the mistake this flag exists to prevent.
+        "window_tags_path": str(args.window_tags) if args.window_tags else None,
         "query_max_new_tokens": args.query_max_new_tokens,
         "firing_counts": dict(firing_counts),
         "opportunity_counts": dict(opportunity_counts),
@@ -678,6 +804,34 @@ def main() -> None:
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2), flush=True)
+
+    # COMPLETENESS. Both files are already on disk above, so a shortfall here loses no work and a
+    # resume picks up where this run stopped -- but it must NOT exit 0, because the downstream
+    # listwise rerank is chained with `afterok` and would otherwise consume a partial verdict set.
+    # That failure mode has already cost one GPU allocation: a ranking staged from 42,910 of 50,180
+    # keys looked completely normal in its own summary (see the --top-m guard in
+    # dump_reranked_ranking.py). Silent partial coverage is the thing to make impossible.
+    if args.window_tags is not None and args.limit is None:
+        expected = sum(
+            len(entry["window_tags"]) * len(entry["hypothesis_indices"])
+            for entry in (arm_windows or {}).values()
+        )
+        got = len(all_verdicts)
+        print(f"completeness: {got}/{expected} (fact, hypothesis, tag) verdicts", flush=True)
+        if got != expected:
+            raise SystemExit(
+                f"INCOMPLETE: {got} of {expected} verdict keys were written, {expected - got} "
+                f"short of {args.window_tags.name}'s window. Both output files are intact -- rerun "
+                "the same command with --resume to finish; do not score an arm from this file."
+            )
+    elif args.limit is None:
+        trace_facts = sum(1 for _ in stream_jsonl(args.test_trace))
+        print(f"completeness: {facts_seen}/{trace_facts} facts visited", flush=True)
+        if facts_seen != trace_facts:
+            raise SystemExit(
+                f"INCOMPLETE: {facts_seen} of {trace_facts} trace facts were visited. Both output "
+                "files are intact -- rerun with --resume to finish; do not score from this file."
+            )
 
 
 if __name__ == "__main__":

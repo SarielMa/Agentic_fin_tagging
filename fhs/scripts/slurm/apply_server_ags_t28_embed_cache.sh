@@ -104,9 +104,9 @@ echo "EMBEDDING_CACHE=${EMBEDDING_CACHE}"
 echo "DENSE_MODEL=${DENSE_MODEL}"
 echo "============================================================"
 
-python -m py_compile ags_t7_t28/dense_index.py ags_t7_t28/run_t28_retriever_robustness.py
+python -m py_compile src/efficiency/dense_index.py src/efficiency/run_t28_retriever_robustness.py
 
-python ags_t7_t28/run_t28_retriever_robustness.py \
+python src/efficiency/run_t28_retriever_robustness.py \
   --output-dir "${OUTPUT_DIR}" \
   --dense-model "${DENSE_MODEL}" \
   --embed-batch-size "${EMBED_BATCH_SIZE}" \

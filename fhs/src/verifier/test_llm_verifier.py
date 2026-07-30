@@ -54,6 +54,10 @@ def fake_generator(output):
         model_name = "fake-model"
         def __init__(self, args): self.tokenizer = None
         def generate_one(self, prompt): return output
+        # The runner batches through generate_many (it called generate_one per prompt until the
+        # batching fix, which is why this fake silently stopped matching it and the test failed
+        # with AttributeError rather than a wrong assertion).
+        def generate_many(self, prompts): return [output for _ in prompts]
         def count_text_tokens(self, text): return len(text) // 4
         def close(self): pass
     return FakeGen
@@ -103,7 +107,13 @@ with tempfile.TemporaryDirectory() as tmp:
     msg = str(exc)
     check("abort message names truncation + the flag", "query-max-new-tokens" in msg, "")
     calls = [json.loads(l) for l in (outdir / "llm_verifier_calls.jsonl").open()]
-    check("aborted after ~25 calls, not the whole run", len(calls) <= 26, f"{len(calls)} calls before abort")
+    # The guard used to fire on equality with --abort-check-after (~25 calls). Generation is now
+    # batched, so it fires on the first CHUNK that reaches the threshold: the bound is
+    # abort_check_after + generation_chunk, not 26. What matters is that it aborts on a small
+    # multiple of the chunk rather than running the whole trace.
+    check("aborted within one chunk of the threshold, not the whole run",
+          len(calls) <= 25 + 64 and len(calls) < 200,
+          f"{len(calls)} calls before abort")
 
 # --- 3. resume regenerates unusable rows ------------------------------------------------
 with tempfile.TemporaryDirectory() as tmp:

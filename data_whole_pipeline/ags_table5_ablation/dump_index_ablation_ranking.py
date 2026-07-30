@@ -32,6 +32,7 @@ from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization
 from ags_table5_ablation.core import AblationConfig, FactRecord, evaluate, reset_consensus_cache  # noqa: E402
 from ags_table5_ablation.data_prep import _compact, stream_jsonl  # noqa: E402
 from ags_table5_ablation.run_index_ablation import DEFAULT_AGS_TRACE, TOP_K  # noqa: E402
+from ags_table5_ablation.run_test_rows import load_llm_verifier_verdicts  # noqa: E402
 from run_fintagging_grounding_baseline import (  # noqa: E402
     DEFAULT_TAXONOMY_JSONL,
     TaxonomyRetriever,
@@ -53,6 +54,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=TOP_K)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=100)
+    # AblationConfig's own defaults are verifier_mode="auto" and llm_unjudged_fill="zero", neither
+    # of which is the deployed configuration. Pinning them here keeps this dump on the same code
+    # path as every other row of tab:ablation instead of silently scoring the arm differently.
+    parser.add_argument("--verifier-mode", default="llm_drop")
+    parser.add_argument("--llm-unjudged-fill", default="mean")
+    parser.add_argument("--llm-verifier-verdicts", type=Path, default=None,
+                        help="Verdicts for THIS w_cov's own window (stage_arm_windows.py + "
+                             "run_llm_verifier.py --window-tags). Without it the rerank term has "
+                             "no LLM support to consume and the row is not comparable to FHS.")
     return parser.parse_args()
 
 
@@ -70,7 +80,31 @@ def main() -> None:
     )
     print(f"retriever built at w_cov={args.label_coverage_weight}", flush=True)
 
-    config = AblationConfig(name=f"AGS (w_cov={args.label_coverage_weight})", beta=args.beta)
+    # Two stages, because the verifier window has to be cut from THIS w_cov's own fused ranking:
+    #   stage 1 (no verdicts): emit the pre-verifier fused order and the rewritten rounds, so
+    #           stage_arm_windows.py can compute this arm's window and the verifier can judge it;
+    #   stage 2 (verdicts):    re-emit under the deployed rerank, which is what the row reports.
+    # core.py refuses a non-deterministic mode with no verdicts attached, so stage 1 is explicit
+    # rather than a silent fallback to a deterministic term.
+    if args.llm_verifier_verdicts is None:
+        verdicts = None
+        verifier_mode, beta = "deterministic", 0.0
+        print("STAGE 1: no verdicts attached -> emitting the pre-verifier fused order. "
+              "This file is the input to stage_arm_windows.py, NOT a reportable row.", flush=True)
+    else:
+        verdicts = load_llm_verifier_verdicts(args.llm_verifier_verdicts)
+        verifier_mode, beta = args.verifier_mode, args.beta
+        print(f"STAGE 2: {len(verdicts)} verdicts, verifier_mode={verifier_mode} beta={beta} "
+              f"llm_unjudged_fill={args.llm_unjudged_fill}", flush=True)
+
+    config = AblationConfig(
+        name=f"AGS (w_cov={args.label_coverage_weight})",
+        beta=beta,
+        verifier_mode=verifier_mode,
+        llm_unjudged_fill=args.llm_unjudged_fill,
+        llm_verifier_verdicts=verdicts,
+        truncate_pool_to_top_k=True,
+    )
     reset_consensus_cache()
 
     written = 0
@@ -86,13 +120,23 @@ def main() -> None:
             }
             rankings: dict[tuple[int, str], list[dict[str, Any]]] = {}
             pool: dict[str, dict[str, Any]] = {}
+            # Rewritten in place, so the emitted record's `rounds` carry THIS w_cov's rankings.
+            # Leaving them as the source trace's was a silent defect: data_prep.load_test_facts,
+            # core.fuse and stage_arm_windows.py all read rankings out of `rounds`, so an emitted
+            # file with stale rounds reproduces the w_cov=1 fusion and the w_cov=1 verifier window
+            # exactly (measured: 25,090/25,090 window tags identical), while only the metrics
+            # computed from final_candidates moved. Every consumer must see the same ablation.
+            rebuilt_rounds: list[dict[str, Any]] = []
             for round_record in record.get("rounds", []):
+                emitted_round = dict(round_record)
                 if round_record.get("label_render_skipped"):
+                    rebuilt_rounds.append(emitted_round)
                     continue
                 candidates = retrieve_candidates(retriever, round_record["query"], entity_type, args.top_k)
-                rankings[(int(round_record["hypothesis_idx"]), round_record["rendering"])] = [
-                    _compact(candidate) for candidate in candidates
-                ]
+                compacted = [_compact(candidate) for candidate in candidates]
+                rankings[(int(round_record["hypothesis_idx"]), round_record["rendering"])] = compacted
+                emitted_round["candidates"] = [dict(c) for c in candidates]
+                rebuilt_rounds.append(emitted_round)
                 for candidate in candidates:
                     pool.setdefault(normalize_tag(candidate.get("tag", "")), candidate)
 
@@ -120,9 +164,12 @@ def main() -> None:
                     break
 
             out = dict(record)
+            out["rounds"] = rebuilt_rounds
             out["candidates"] = rebuilt
             out["final_candidates"] = rebuilt
             out["index_ablation_w_cov"] = args.label_coverage_weight
+            out["index_ablation_verifier_mode"] = verifier_mode
+            out["index_ablation_beta"] = beta
             handle.write(json.dumps(out, ensure_ascii=False) + "\n")
             written += 1
             if args.log_every and offset % args.log_every == 0:
@@ -133,7 +180,11 @@ def main() -> None:
         "facts_written": written,
         "unresolved_tags_dropped": unresolved_total,
         "label_coverage_weight": args.label_coverage_weight,
-        "beta": args.beta,
+        "beta": beta,
+        "verifier_mode": verifier_mode,
+        "llm_unjudged_fill": args.llm_unjudged_fill,
+        "llm_verifier_verdicts": str(args.llm_verifier_verdicts) if args.llm_verifier_verdicts else None,
+        "rounds_rewritten": True,
         "top_k": args.top_k,
     }
     summary_path = args.summary or args.output.with_name("index_ablation_ranking_summary.json")

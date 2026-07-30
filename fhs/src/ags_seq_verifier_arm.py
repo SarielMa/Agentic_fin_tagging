@@ -25,9 +25,12 @@ This module is the matched control. Only the control flow differs from FHS:
     program-driven check;
   * the revision target is chosen deterministically, so there is no controller to confound.
 
-Revision targets FAMILY, ROLE and EVENT because those are the dimensions the verifier rules on
-(`LLM_VERIFIER_DIMENSIONS_DEFAULT`). QUALIFIER, SCOPE and TEMPORAL are generated and rendered
-into queries but never verified, so the loop has no signal on which to revise them.
+Revision targets whichever dimensions the verifier rules on, read live from
+`LLM_VERIFIER_DIMENSIONS_DEFAULT` -- as of 2026-07-30 that is all six the generator emits, so the
+loop can revise QUALIFIER, SCOPE and TEMPORAL too (`DIMENSION_OPERATOR` has a REFINE operator for
+each, and the tally is keyed off the same constant, so widening it needs no change here). Before
+2026-07-30 the constant held FAMILY/ROLE/EVENT only and the other three were rendered into queries
+but never verified, which left the loop no signal on which to revise them.
 
 Cost note: FHS makes J verifier calls per fact. This loop makes J per round, so a four-round
 budget is ~4x the verifier cost of FHS. That is inherent to the control being matched -- an arm
@@ -57,8 +60,11 @@ from verifier.run_llm_verifier import (  # noqa: E402
     parse_verifier_output,
 )
 from ags_symbolic_agreement import normalize_tag  # noqa: E402
+from run_fintagging_grounding_baseline import build_prompt_under_query_budget  # noqa: E402
 
-VERIFIER_DIMENSIONS = LLM_VERIFIER_DIMENSIONS_DEFAULT  # ("FAMILY", "ROLE", "EVENT")
+VERIFIER_DIMENSIONS = LLM_VERIFIER_DIMENSIONS_DEFAULT
+# How many verifier calls to allow before insisting that at least one parsed cleanly.
+MIN_CALLS_BEFORE_PARSE_GUARD = 8
 
 
 def support_value(verdict: dict[str, Any] | None) -> float | None:
@@ -97,14 +103,23 @@ def verify_window(
     tags = [normalize_tag(c.get("tag", "")) for c in window]
     prompts, index = [], []
     for hyp_idx, hypothesis in enumerate(hypotheses):
-        messages = build_verifier_messages(
-            record,
-            hypothesis,
-            window,
-            args.query_context_max_chars,
-            args.candidate_doc_max_chars,
+        # generate_many takes rendered prompt strings, not chat messages, and the context has
+        # to be trimmed to the token budget before it gets there -- both are what
+        # build_prompt_under_query_budget does, and it is the same call the one-shot verifier
+        # in verifier/run_llm_verifier.py makes, so the two arms send identical prompts.
+        prompt, _prompt_tokens, _used_chars = build_prompt_under_query_budget(
+            generator.tokenizer,
+            lambda ctx_chars, hypothesis=hypothesis: build_verifier_messages(
+                record,
+                hypothesis,
+                window,
+                ctx_chars,
+                args.candidate_doc_max_chars,
+            ),
+            context_max_chars=args.query_context_max_chars,
+            max_input_tokens=args.query_max_input_tokens,
         )
-        prompts.append(messages)
+        prompts.append(prompt)
         index.append(hyp_idx)
 
     raw_outputs = generator.generate_many(prompts)
@@ -320,6 +335,18 @@ def build_seq_verifier_record(
         )
         verifier_calls += vstats["calls"]
         clean_parses += vstats["clean_parses"]
+        # A truncated verdict array is indistinguishable from agreement downstream: salvage keeps
+        # the first few candidates, the tally then finds no unsupported dimension, and the loop
+        # exits after round one. That produced a silent 0/171-clean-parse run once, so refuse to
+        # continue past the first few facts when nothing is parsing cleanly.
+        if verifier_calls >= MIN_CALLS_BEFORE_PARSE_GUARD and clean_parses == 0:
+            raise SystemExit(
+                f"seq_verifier: {verifier_calls} verifier calls, 0 clean parses. Responses are "
+                f"being truncated -- raise --query-max-new-tokens (currently "
+                f"{getattr(args, 'query_max_new_tokens', '?')}); a verdict array over "
+                f"{cfg.feedback_top_m} candidates x {len(VERIFIER_DIMENSIONS)} dimensions needs "
+                "roughly 2,800 tokens."
+            )
         current = revised
         realized_rounds += 1
         rounds_log.append(

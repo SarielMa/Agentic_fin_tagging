@@ -128,10 +128,25 @@ fi
 # and an undersized cap truncates every response mid-array (that failure mode once produced a
 # 100% parse failure across a full run).
 JUDGE_ARGS=(--judge-dimensions "${JUDGE_DIMENSIONS:-llm}")
-if [[ "${JUDGE_DIMENSIONS:-llm}" == "all" ]]; then
-  QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-2816}"
+# ASK_DECISIVE=1 adds one output field: which dimensions actually discriminate among the
+# candidates shown. No extra call, and the per-dimension verdicts are unchanged, so the file
+# stays a superset of a normal run.
+if [[ "${ASK_DECISIVE:-0}" == "1" ]]; then
+  JUDGE_ARGS+=(--ask-decisive-dimensions)
 fi
-QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-1536}"
+# The cap must follow the SIZE of the judged set, not the spelling of the flag. Since
+# 2026-07-30 the default judged set is all six dimensions, so the default cap is the wide one, and
+# an undersized cap truncates responses mid-array, which reads as total abstention rather than as
+# an error. Only the legacy three-dimension mode may use the narrow cap.
+# MEASURED on the finished ask-6 runs (2026-07-30, 5,018 + 2,752 calls, top_m=10): mean completion
+# 887-891 tokens, max 1,137, and hit_token_cap = 0. Ask-3 was 610 mean / 765 max. So six dimensions
+# cost ~46% more completion, not the ~2x an earlier comment here estimated, and the responses would
+# in fact have fitted in 1536; 2816 is headroom that costs nothing, not a requirement. Do not use
+# that old estimate to size anything -- read hit_token_cap out of the call log instead.
+if [[ "${JUDGE_DIMENSIONS:-llm}" == "legacy" ]]; then
+  QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-1536}"
+fi
+QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-2816}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs_ags_table5_ablation/qwen3_32b}"
 RESUME_ARGS=()
 if [[ "${RESUME:-1}" == "1" ]]; then
@@ -153,6 +168,19 @@ echo "GENERATION_CHUNK=${GENERATION_CHUNK}"
 echo "LIMIT=${LIMIT:-<none>}"
 echo "============================================================"
 
+# Pre-flight: the flag values this wrapper passes must exist in the script it calls. A renamed
+# choice (--judge-dimensions llm -> legacy happened once) otherwise costs a full GPU allocation
+# and fails in argparse a minute later, after the queue wait.
+for _flag in "--judge-dimensions ${JUDGE_DIMENSIONS:-llm}" "--hint-dimensions ${HINT_DIMENSIONS:-llm}"; do
+  set -- ${_flag}
+  if ! python "${VERIFIER_PY:-${REPO_ROOT}/ags_table5_ablation/run_llm_verifier.py}" --help 2>/dev/null \
+       | tr -d " \n" | grep -q "$(echo "$1" | sed 's/^--//')"; then continue; fi
+  if ! python "${VERIFIER_PY:-${REPO_ROOT}/ags_table5_ablation/run_llm_verifier.py}" "$1" "$2" --help >/dev/null 2>&1; then
+    echo "FATAL: ${1} ${2} is not accepted by run_llm_verifier.py. Its choices changed; fix the wrapper." >&2
+    exit 2
+  fi
+done
+
 python -m py_compile ags_table5_ablation/run_llm_verifier.py
 
 # Defaults to the gold-instance test trace. Point it at a fulltagging run's
@@ -163,11 +191,25 @@ if [[ -n "${TEST_TRACE:-}" ]]; then
   TRACE_ARGS=(--test-trace "${TEST_TRACE}")
 fi
 
+# WINDOW_TAGS points at a per-arm window file from stage_arm_windows.py. With it the verifier
+# judges that arm's OWN fused head instead of the deployed one, which is what lets an ablation
+# row be scored by the LLM-only verifier. Without it nothing changes.
+WINDOW_TAG_ARGS=()
+if [[ -n "${WINDOW_TAGS:-}" ]]; then
+  if [[ ! -f "${WINDOW_TAGS}" ]]; then
+    echo "WINDOW_TAGS=${WINDOW_TAGS} does not exist; run stage_arm_windows.py first." >&2
+    exit 1
+  fi
+  WINDOW_TAG_ARGS=(--window-tags "${WINDOW_TAGS}")
+  echo "WINDOW_TAGS=${WINDOW_TAGS}"
+fi
+
 python ags_table5_ablation/run_llm_verifier.py \
   --output-dir "${OUTPUT_DIR}" \
   "${TRACE_ARGS[@]}" \
   --top-m "${TOP_M}" \
   --window-source "${WINDOW_SOURCE}" \
+  "${WINDOW_TAG_ARGS[@]}" \
   --query-max-new-tokens "${QUERY_MAX_NEW_TOKENS}" \
   "${HINT_ARGS[@]}" \
   "${JUDGE_ARGS[@]}" \

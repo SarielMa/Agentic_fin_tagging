@@ -22,7 +22,8 @@ export OUTPUT_DIR="${OUTPUT_DIR:-${RUNS_ROOT}/qwen3_32b_memory_guided_refinement
 export RETRIEVAL_ROUNDS="${RETRIEVAL_ROUNDS:-4}"
 export FEEDBACK_CANDIDATE_COUNT="${FEEDBACK_CANDIDATE_COUNT:-10}"
 export MEMORY_TOP_K="${MEMORY_TOP_K:-3}"
-export QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-512}"
+# Output budget deliberately NOT set here: it is shared, and lives in
+# apply_server_fintagging_direct_retrieval.sh. A per-method cap is a confound.
 export QUERY_GENERATION_MODEL="${QUERY_GENERATION_MODEL:-Qwen/Qwen3-32B}"
 export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
 export RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-32B}"

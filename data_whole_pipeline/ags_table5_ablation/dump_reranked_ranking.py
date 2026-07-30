@@ -125,6 +125,16 @@ def parse_args() -> argparse.Namespace:
         help="For a lab-only rendering, what a label-less concept falls back to. 'none' is the "
         "zero-recall variant, which is the one tab:ablation reports.",
     )
+    parser.add_argument(
+        "--llm-verifier-dimensions",
+        default=None,
+        help=(
+            "Comma-separated dimensions the SCORE averages over. Unset keeps "
+            "LLM_VERIFIER_DIMENSIONS_DEFAULT, so every existing invocation is unchanged. This is "
+            "the scoring set only; which dimensions the verifier was ASKED about is fixed in the "
+            "verdicts file and cannot be changed here."
+        ),
+    )
     parser.add_argument("--fusion", choices=("sum", "mean"), default="sum")
     parser.add_argument("--scaling", choices=("range", "raw"), default="range")
     parser.add_argument(
@@ -182,7 +192,26 @@ def main() -> None:
     print(f"test facts: {len(facts)}", flush=True)
 
     generated_top_m = None
+    restricted_away = 0
     if args.top_m is not None:
+        # --top-m restricts the verdicts through --calls, so the two files must come from the SAME
+        # generation run. They did not, silently, for every llmonly_* arm of
+        # apply_server_verifier_ablation_rerank.sh: --calls was left at DEFAULT_CALLS, the
+        # 2026-07-25 deterministic-window log, so fused-window verdicts were filtered by
+        # membership in the deterministic window. Measured: verdicts_k10_judge6 50,180 -> 42,910
+        # keys, and 68% of facts changed their top-10. Refuse the default pairing outright.
+        # DEFAULT_CALLS pairs with DEFAULT_VERDICTS -- that combination is one run and is fine
+        # (hybrid_m5 uses it to shrink a window on purpose). Only the mixed pair is the defect.
+        if args.calls == DEFAULT_CALLS and args.verdicts != DEFAULT_VERDICTS:
+            raise SystemExit(
+                "--top-m needs --calls pointing at the call log of the SAME run as --verdicts "
+                f"(currently the default, {DEFAULT_CALLS.name} from the 2026-07-25 "
+                "deterministic-window generation). Pairing a fused-window verdicts file with "
+                "that log filters the verdicts through the deterministic window and reproduces "
+                "the confound the fused windows exist to remove. Verdicts already carry the "
+                "window they were generated at, so the usual fix is to drop --top-m entirely; "
+                "pass it only to SHRINK a window on purpose, with that run's own --calls."
+            )
         windows, call_cost = load_call_windows(args.calls)
         generated_top_m = call_cost["generated_top_m"]
         if args.top_m > generated_top_m:
@@ -190,8 +219,18 @@ def main() -> None:
                 f"--top-m {args.top_m} exceeds the window these verdicts were generated at "
                 f"({generated_top_m}); a larger window needs its own generation run."
             )
+        before = len(verdicts)
         verdicts = restrict_verdicts(verdicts, windows, args.top_m)
+        restricted_away = before - len(verdicts)
         print(f"verdicts restricted to M={args.top_m}: {len(verdicts)}", flush=True)
+        if args.top_m == generated_top_m and restricted_away:
+            # A no-op restriction that is not a no-op means the two files disagree about the
+            # window, which is the same defect with a matching --calls path.
+            raise SystemExit(
+                f"--top-m {args.top_m} equals the generated window, so it should drop nothing, "
+                f"but {restricted_away} of {before} verdict keys are absent from "
+                f"{args.calls}. The call log and the verdicts file are from different runs."
+            )
 
     renderings = tuple(part.strip() for part in args.renderings.split(",") if part.strip())
     if not renderings:
@@ -218,6 +257,11 @@ def main() -> None:
         llm_verifier_top_m=args.top_m or generated_top_m or 10,
         llm_verifier_verdicts=verdicts if uses_llm else None,
         llm_unjudged_fill=args.llm_unjudged_fill,
+        **(
+            {"llm_verifier_dimensions": tuple(
+                d.strip().upper() for d in args.llm_verifier_dimensions.split(",") if d.strip())}
+            if args.llm_verifier_dimensions else {}
+        ),
     )
     reset_consensus_cache()
     ranking_by_fact: dict[int, list[str]] = {}
@@ -256,6 +300,15 @@ def main() -> None:
             unresolved_total += unresolved
 
             out = dict(record)
+            # gold_rank recomputed for the NEW order. Copying the trace's value made it look as
+            # though the rerank changed nothing (measured: identical on every fact, while the
+            # actual order changed on 711 of 2,509), which is a diagnostic trap even though no
+            # reported metric reads this field -- every metric is computed from the order itself.
+            gold = {normalize_tag(t) for t in (record.get("gold_tags") or [])}
+            out["gold_rank"] = next(
+                (entry["rank"] for entry in rebuilt if normalize_tag(entry.get("tag", "")) in gold),
+                None,
+            )
             out["candidates"] = rebuilt
             # Keep the trace's own consolidated view available for diagnostics, but the
             # reranker reads `candidates`.
@@ -276,7 +329,17 @@ def main() -> None:
         "verifier_mode": args.verifier_mode,
         "top_m": args.top_m or generated_top_m,
         "llm_verdicts_used": len(verdicts) if uses_llm else 0,
+        # Which verdicts file, and how many keys --top-m removed. `llm_verdicts_used` alone cannot
+        # distinguish "this file has N keys" from "this file had more and was filtered"; that
+        # ambiguity is what made the det-window contamination invisible in a summary.
+        "llm_verdicts_path": str(args.verdicts) if uses_llm else None,
+        "llm_verdicts_dropped_by_top_m": restricted_away if uses_llm else 0,
+        "calls_path": str(args.calls) if args.top_m is not None else None,
         "llm_unjudged_fill": args.llm_unjudged_fill if uses_llm else None,
+        # Which dimensions were SCORED. Not recoverable from the verdicts file, which records
+        # only which were ASKED -- and the two differ whenever a scoring set is pinned. Without
+        # this an arm's own metadata cannot distinguish score3 from score6.
+        "llm_verifier_dimensions": list(config.llm_verifier_dimensions) if uses_llm else None,
         "note": (
             "Candidate objects are copied verbatim from the trace; only order and rank change. "
             "Feed to run_fintagging_grounding_baseline.py with --reuse-candidates."

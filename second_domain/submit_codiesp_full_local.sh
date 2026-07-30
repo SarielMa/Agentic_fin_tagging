@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Validate full CodiEsp exact-only inputs locally, then submit the base GPU
-# grounding jobs for both coverage settings. The oracle and three extra
-# ablations are handled by submit_codiesp_new_requirements.sh.
+# grounding jobs for both coverage settings. Extra comparison arms and
+# FHS-family ablations are handled by submit_codiesp_new_requirements.sh.
 set -euo pipefail
 
 DOMAIN_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/second_domain"

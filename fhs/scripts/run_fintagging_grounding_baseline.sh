@@ -80,7 +80,19 @@ QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
 QUERY_DESCRIPTION_PATH="${QUERY_DESCRIPTION_PATH:-}"
 QUERY_CONTEXT_MAX_CHARS="${QUERY_CONTEXT_MAX_CHARS:-12000}"
 QUERY_MAX_INPUT_TOKENS="${QUERY_MAX_INPUT_TOKENS:-16000}"
-QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-128}"
+# SHARED GENERATION BUDGET. This was 128 with a per-mode bump to 512 for the frozen family
+# only, which starved four baselines the paper compares against: measured at the 128 cap,
+# one_pass_structured truncated 8.5% of its generations (11/200 parse failures),
+# parallel_sampling_diversity 33.1% (397/1200), intrinsic_self_refinement 5.9% and
+# retrieval_feedback_refinement 4.2% -- every failure sat exactly at 127-128 tokens, while
+# frozen_ags at 512 never touched its cap (longest output 161) and ags_seq never did either
+# (longest 245). A method-dependent output budget is not a budget-matched comparison, so the
+# cap is now uniform and set well above every measured length (longest observed: frozen_ags
+# 161, ags_seq 245, decomposed 235, parallel_sampling 102). 512 would probably have been enough,
+# but the four truncated methods' true output lengths are unobservable from truncated data, so
+# the cap is set high rather than guessed and the run reports any call that still reaches it --
+# vLLM stops at EOS, so a generous cap costs nothing when the model finishes on its own.
+QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-2048}"
 QUERY_TEMPERATURE="${QUERY_TEMPERATURE:-0.0}"
 QUERY_TOP_P="${QUERY_TOP_P:-1.0}"
 BF16="${BF16:-1}"
@@ -126,6 +138,16 @@ case "${QUERY_MODE}" in
   ags|frozen_ags|frozen_ags_grounding|ags_seq|ags_sequential|ags_seq_random|ags_sequential_random)
     if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" ]]; then
       QUERY_MAX_NEW_TOKENS=512
+    fi
+    ;;
+  # seq_verifier calls the candidate-level verifier INSIDE the loop, so this cap also bounds a
+  # verdict array over K_v candidates x every judged dimension -- not just one hypothesis. At 128
+  # (and at 512) every response is cut off, salvage recovers only the first few candidates, and
+  # the loop then sees "no unsupported dimension" and stops after round one: measured 0/171 clean
+  # parses and 70/75 facts stopping at round 1 before this was raised.
+  seq_verifier)
+    if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" || "${QUERY_MAX_NEW_TOKENS}" == "512" ]]; then
+      QUERY_MAX_NEW_TOKENS=2816
     fi
     ;;
 esac

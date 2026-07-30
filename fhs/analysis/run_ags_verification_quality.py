@@ -2,7 +2,7 @@
 """Table 3 / Table 13: verification quality, on the FROZEN TEST SPLIT.
 
 Replaces the development-set placeholders that
-`run_ags_feedback_verdict_accuracy.py` produced (250 tabular facts from the
+an earlier development-set run produced (250 tabular facts from the
 coverage-pilot sample, n=5,765 dimension verdicts). Same question, same
 estimator, same ground-truth definition -- different data.
 

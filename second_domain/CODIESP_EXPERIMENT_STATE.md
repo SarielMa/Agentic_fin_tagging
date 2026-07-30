@@ -1,6 +1,6 @@
 # CodiEsp Second-Domain Experiment State
 
-Last updated: 2026-07-30 01:25 America/New_York.
+Last updated: 2026-07-30 03:20 America/New_York.
 
 This top section is the handoff for the next session. Lower sections contain
 older history and are not the authoritative current queue state.
@@ -25,44 +25,57 @@ Active input set is the exact-only full CodiEsp diagnosis slice:
 Current coverage-expanded matrix. Gold oracle is run once; the other seven
 methods are run with both `wcov0` and `wcov1`, for 15 final result units total.
 
+Clean restart note:
+
+- All previous CodiEsp GPU jobs were cancelled or were already terminal.
+- `runs_codiesp_grounding_baseline/` and `logs/` were cleared before restart.
+- The valid result wave is the current-code submission wave from 2026-07-30
+  03:10-03:18 EDT. Do not mix in earlier job outputs.
+
+Method grouping for reporting:
+
+- Independent comparison/baseline methods: `direct_retrieval`,
+  `one_pass_grounding`, `parallel_sampling_n2`, and the CPU-only
+  `gold_label_definition_retrieval` oracle diagnostic.
+- FHS-family ablations: `one_pass_structured`, `frozen_ags`, `fhs_j1`, and
+  `fhs_no_verifier`. These all run through the same
+  `ags_frozen_grounding.build_frozen_ags_method_record` implementation and
+  differ only by frozen config constants (`J`, `beta`, verifier use, and
+  coverage setting).
+
 | Method | Coverage | Status | Job | Output |
 |---|---|---|---|---|
-| `direct_retrieval` | `wcov0` | final done; Slurm job exited `FAILED` only because of a post-result shell syntax error from the submitted script copy | `20459406` | `runs_codiesp_grounding_baseline/qwen3_32b_direct_retrieval_full_wcov0/` |
-| `direct_retrieval` | `wcov1` | BM25/candidates done locally; GPU rerank pending | `20474170` | `runs_codiesp_grounding_baseline/qwen3_32b_direct_retrieval_full_wcov1/` |
+| `direct_retrieval` | `wcov0` | pending in clean restart | `20488374` | `runs_codiesp_grounding_baseline/qwen3_32b_direct_retrieval_full_wcov0/` |
+| `direct_retrieval` | `wcov1` | BM25/candidates rebuilt locally from current code; GPU rerank pending | `20488827` | `runs_codiesp_grounding_baseline/qwen3_32b_direct_retrieval_full_wcov1/` |
 | `gold_label_definition_retrieval` | single oracle | final done locally, CPU-only | local | `runs_codiesp_grounding_baseline/qwen3_32b_gold_label_definition_retrieval_full_exact/` |
-| `one_pass_grounding` | `wcov0` | running; query generation complete, candidates and rerank predictions are being written | `20459408` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov0/` |
-| `one_pass_grounding` | `wcov1` | pending | `20473790` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov1/` |
-| `one_pass_structured` | `wcov0` | running; Qwen3-32B loaded on GPU and structured traces are being written | `20459410` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov0/` |
-| `one_pass_structured` | `wcov1` | pending | `20473792` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov1/` |
-| `parallel_sampling`, N=2 | `wcov0` | pending | `20474745` | `runs_codiesp_grounding_baseline/qwen3_32b_parallel_sampling_n2_full_wcov0/` |
-| `parallel_sampling`, N=2 | `wcov1` | pending; output dir name predates coverage suffix cleanup | `20466298` | `runs_codiesp_grounding_baseline/qwen3_32b_parallel_sampling_n2_full_exact/` |
-| `frozen_ags` / FHS full | `wcov0` | pending | `20459412` | `runs_codiesp_grounding_baseline/qwen3_32b_frozen_ags_full_wcov0/` |
-| `frozen_ags` / FHS full | `wcov1` | pending | `20473791` | `runs_codiesp_grounding_baseline/qwen3_32b_frozen_ags_full_wcov1/` |
-| `fhs_j1` | `wcov0` | pending | `20474744` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_j1_full_wcov0/` |
-| `fhs_j1` | `wcov1` | pending; output dir name predates coverage suffix cleanup | `20466299` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_j1_full_exact/` |
-| `fhs_no_verifier` | `wcov0` | pending | `20474738` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_no_verifier_full_wcov0/` |
-| `fhs_no_verifier` | `wcov1` | pending; output dir name predates coverage suffix cleanup | `20466300` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_no_verifier_full_exact/` |
+| `one_pass_grounding` | `wcov0` | pending in clean restart | `20488828` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov0/` |
+| `one_pass_grounding` | `wcov1` | pending in clean restart | `20488829` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov1/` |
+| `one_pass_structured` | `wcov0` | pending in clean restart | `20488830` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov0/` |
+| `one_pass_structured` | `wcov1` | pending in clean restart | `20488831` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov1/` |
+| `parallel_sampling`, N=2 | `wcov0` | pending in clean restart; comparison baseline, not an FHS ablation | `20489123` | `runs_codiesp_grounding_baseline/qwen3_32b_parallel_sampling_n2_full_wcov0/` |
+| `parallel_sampling`, N=2 | `wcov1` | pending in clean restart; comparison baseline, not an FHS ablation | `20489162` | `runs_codiesp_grounding_baseline/qwen3_32b_parallel_sampling_n2_full_wcov1/` |
+| `frozen_ags` / FHS full | `wcov0` | pending in clean restart | `20488832` | `runs_codiesp_grounding_baseline/qwen3_32b_frozen_ags_full_wcov0/` |
+| `frozen_ags` / FHS full | `wcov1` | pending in clean restart | `20488833` | `runs_codiesp_grounding_baseline/qwen3_32b_frozen_ags_full_wcov1/` |
+| `fhs_j1` | `wcov0` | pending in clean restart; FHS-family ablation | `20489164` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_j1_full_wcov0/` |
+| `fhs_j1` | `wcov1` | pending in clean restart; FHS-family ablation | `20489165` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_j1_full_wcov1/` |
+| `fhs_no_verifier` | `wcov0` | pending in clean restart; FHS-family ablation | `20489163` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_no_verifier_full_wcov0/` |
+| `fhs_no_verifier` | `wcov1` | pending in clean restart; FHS-family ablation | `20489166` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_no_verifier_full_wcov1/` |
 
-Completed metrics so far:
+Completed current-code CPU metrics so far:
 
-- #1 direct retrieval:
-  - BM25 top-1 `0.027990`, MRR `0.055777`, Recall@10 `0.111641`, Recall@50 `0.226145`, Recall@200 `0.392812`.
-  - Qwen rerank top-1 `0.175254`, MRR `0.214049`, Recall@10 `0.286896`, Recall@50 `0.326018`, parse success `1.0`.
-  - Files are complete: 3144 candidates and 3144 rerank predictions.
 - #2 oracle retrieval:
   - BM25 top-1 `0.998410`, MRR `0.999205`, Recall@10/50/200 `1.0`.
 - Direct retrieval `wcov1` BM25/candidates:
   - BM25 top-1 `0.046120`, MRR `0.087444`, Recall@10 `0.174300`, Recall@50 `0.314249`, Recall@200 `0.466603`.
-  - GPU rerank is pending as job `20474170`.
+  - GPU rerank is pending as job `20488827`.
 
 Current partial outputs at handoff:
 
-- `one_pass_grounding wcov0`: `query_descriptions.jsonl` has 3144 rows;
-  `bm25_candidates.jsonl` and `qwen_rerank_predictions.jsonl` exist and are
-  growing under `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov0/`.
-- `one_pass_structured wcov0`: `grounding_traces.jsonl` exists and is growing
-  under `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov0/`.
-- Both running jobs showed vLLM/Qwen progress in logs, not GPU-idle CPU prework.
+- `direct_retrieval wcov1`: current-code `bm25_candidates.jsonl` and
+  `bm25_metrics.json` exist.
+- `gold_label_definition_retrieval`: current-code `bm25_candidates.jsonl` and
+  `bm25_metrics.json` exist.
+- No current-code GPU outputs have been written yet; all GPU jobs are pending.
 
 Old revised-out `wcov1` duplicate jobs were cancelled:
 
@@ -80,7 +93,8 @@ Submission scripts now reflect this split:
   for `wcov0` and `wcov1`; direct retrieval `wcov1` generates candidates locally
   before GPU rerank to avoid GPU idle.
 - `submit_codiesp_new_requirements.sh`: runs gold oracle once locally and submits
-  parallel/FHS ablations for both `wcov0` and `wcov1`, with explicit GPU resources.
+  the independent `parallel_sampling_n2` comparison plus FHS-family ablations
+  for both `wcov0` and `wcov1`, with explicit GPU resources.
 
 ## Current Goal
 
@@ -300,14 +314,18 @@ structured `4:00:00`, frozen_ags/FHS `6:00:00`.
 ## Revised Experiment Matrix Additions
 
 The revised CodiEsp matrix added four configurations. They were implemented inside this
-package only:
+package only. Only the FHS-family variants are ablations; `parallel_sampling` is an
+independent comparison baseline.
 
 - `gold_label_definition_retrieval`: CPU-only oracle diagnostic that queries BM25 with the
   gold ICD-10-CM code, label, and generated definition text.
-- `parallel_sampling`: CodiEsp free-text prompt override added; submitted with
-  `RETRIEVAL_ROUNDS=2`, which means two independent free-text samples, not iterative rounds.
-- `fhs_j1`: FHS with `J=1`, `beta=0.6`, candidate-level verifier retained.
-- `fhs_no_verifier`: FHS with `J=2`, `beta=0.0`, candidate-level verifier disabled.
+- `parallel_sampling`: independent free-text comparison baseline. CodiEsp
+  prompt override added; submitted with `RETRIEVAL_ROUNDS=2`, which means two
+  independent free-text samples, not iterative rounds.
+- `fhs_j1`: FHS-family ablation with `J=1`, `beta=0.6`, candidate-level
+  verifier retained.
+- `fhs_no_verifier`: FHS-family ablation with `J=2`, `beta=0.0`,
+  candidate-level verifier disabled.
 
 The oracle diagnostic was run locally on
 `data/codiesp/facts_test_full_exact.jsonl` and wrote

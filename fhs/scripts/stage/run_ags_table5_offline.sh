@@ -48,4 +48,4 @@ echo "LIMIT=${LIMIT:-<none>}"
 echo "SKIP_BETA_SWEEP=${SKIP_BETA_SWEEP}"
 echo "============================================================"
 
-python ags_table5_ablation/run_all_offline.py --output-dir "${OUTPUT_DIR}" "${LIMIT_ARGS[@]}" "${SKIP_BETA_SWEEP_ARGS[@]}"
+python src/verifier/run_all_offline.py --output-dir "${OUTPUT_DIR}" "${LIMIT_ARGS[@]}" "${SKIP_BETA_SWEEP_ARGS[@]}"

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Run/submit the oracle plus the three CodiEsp arms added by the revised
-# experiment matrix. Gold oracle is run once; the GPU arms are submitted for
-# both coverage settings.
+# Run/submit the oracle plus the extra CodiEsp arms added by the revised
+# experiment matrix. Gold oracle is run once; GPU arms are submitted for both
+# coverage settings.
+#
+# Keep the interpretation clean:
+# - `parallel_sampling` is an independent comparison baseline, not an ablation.
+# - Ablations are only the FHS-family variants, all backed by
+#   ags_frozen_grounding.build_frozen_ags_method_record.
 set -euo pipefail
 
 DOMAIN_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/second_domain"
@@ -57,14 +62,31 @@ submit_gpu_arm () {
     "${DOMAIN_ROOT}/apply_server_codiesp_shared.sh"
 }
 
-# #5: two independent free-text samples, matching FHS J=2.
+submit_fhs_ablation () {
+  local query_mode="$1"
+  case "${query_mode}" in
+    fhs_j1|fhs_no_verifier) ;;
+    *)
+      echo "FHS ablation submitter received non-FHS query_mode=${query_mode}" >&2
+      exit 1
+      ;;
+  esac
+  submit_gpu_arm "$@"
+}
+
+# #5: independent comparison baseline: two free-text samples, matching FHS J=2
+# only in sample count. This is not an FHS ablation.
 submit_gpu_arm parallel_sampling qwen3_32b_parallel_sampling_n2_full_wcov0 05:00:00 0.0 wcov0 "RETRIEVAL_ROUNDS=2,RUN_RERANK=1"
 submit_gpu_arm parallel_sampling qwen3_32b_parallel_sampling_n2_full_wcov1 05:00:00 1.0 wcov1 "RETRIEVAL_ROUNDS=2,RUN_RERANK=1"
 
+# FHS-family ablations. These share frozen_ags's structured hypothesis,
+# retrieval/fusion, and candidate record builder; only the frozen constants
+# below differ.
+
 # #7: FHS with J=1, candidate-level verifier retained.
-submit_gpu_arm fhs_j1 qwen3_32b_fhs_j1_full_wcov0 05:00:00 0.0 wcov0 "RUN_RERANK=1"
-submit_gpu_arm fhs_j1 qwen3_32b_fhs_j1_full_wcov1 05:00:00 1.0 wcov1 "RUN_RERANK=1"
+submit_fhs_ablation fhs_j1 qwen3_32b_fhs_j1_full_wcov0 05:00:00 0.0 wcov0 "RUN_RERANK=1"
+submit_fhs_ablation fhs_j1 qwen3_32b_fhs_j1_full_wcov1 05:00:00 1.0 wcov1 "RUN_RERANK=1"
 
 # #8: FHS with J=2 and candidate-level verifier disabled.
-submit_gpu_arm fhs_no_verifier qwen3_32b_fhs_no_verifier_full_wcov0 04:00:00 0.0 wcov0 "RUN_RERANK=1"
-submit_gpu_arm fhs_no_verifier qwen3_32b_fhs_no_verifier_full_wcov1 04:00:00 1.0 wcov1 "RUN_RERANK=1"
+submit_fhs_ablation fhs_no_verifier qwen3_32b_fhs_no_verifier_full_wcov0 04:00:00 0.0 wcov0 "RUN_RERANK=1"
+submit_fhs_ablation fhs_no_verifier qwen3_32b_fhs_no_verifier_full_wcov1 04:00:00 1.0 wcov1 "RUN_RERANK=1"

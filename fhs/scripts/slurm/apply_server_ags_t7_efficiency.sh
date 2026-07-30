@@ -105,6 +105,6 @@ echo "LIMIT=${LIMIT:-<none>}"
 echo "REPORT_WALLCLOCK=${REPORT_WALLCLOCK:-0}"
 echo "============================================================"
 
-python -m py_compile ags_t7_t28/efficiency.py ags_t7_t28/run_t7_efficiency.py
+python -m py_compile src/efficiency/efficiency.py src/efficiency/run_t7_efficiency.py
 
-python ags_t7_t28/run_t7_efficiency.py --output-dir "${OUTPUT_DIR}" "${EXTRA_ARGS[@]}"
+python src/efficiency/run_t7_efficiency.py --output-dir "${OUTPUT_DIR}" "${EXTRA_ARGS[@]}"

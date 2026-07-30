@@ -152,7 +152,14 @@ export QUERY_GENERATION_MODEL="${QUERY_GENERATION_MODEL:-Qwen/Qwen3-32B}"
 export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
 export QUERY_CONTEXT_MAX_CHARS="${QUERY_CONTEXT_MAX_CHARS:-12000}"
 export QUERY_MAX_INPUT_TOKENS="${QUERY_MAX_INPUT_TOKENS:-16000}"
-export QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-128}"
+# THE SHARED GENERATION BUDGET, and the only place it is set. Every method's wrapper delegates
+# to this file, so a value here reaches all of them -- which is why it must not be method-specific.
+# It was 128 until 2026-07-30, and the pipeline shell then bumped it to 512 for the frozen family
+# only: measured consequence at 128, one_pass_structured truncated 8.5% of its generations,
+# parallel_sampling_diversity 33.1%, intrinsic 5.9%, feedback 4.2%, while FHS at 512 never came
+# near its cap (longest output 161). Two wrappers additionally overrode it to 384 (decomposed) and
+# 512 (operator, memory), so the comparison ran under four different output budgets.
+export QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-2048}"
 export QUERY_TEMPERATURE="${QUERY_TEMPERATURE:-0.0}"
 export QUERY_TOP_P="${QUERY_TOP_P:-1.0}"
 export BF16="${BF16:-1}"

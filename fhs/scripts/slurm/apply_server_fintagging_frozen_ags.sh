@@ -14,7 +14,8 @@ set -euo pipefail
 # Frozen AGS single-pass grounding comparison (gold-input grounding experiment):
 #   J=2 structured hypotheses -> def/lab render -> coverage retrieval -> sum-RRF ->
 #   range-normalize -> agree rerank. Runs on the gold FinTagging grounding test JSONL
-#   (no extractor); the fulltagging variant is apply_server_fintagging_fulltagging_frozen_ags.sh.
+#   (no extractor). The extractor-driven variant fed the end-to-end table, which the paper
+#   does not report, so it is not part of this release.
 #   The listwise rerank runs on the AGS ranking so the method is scored at the same stage as
 #   every other query mode (bm25_retrieval + qwen_reranked in metrics.json).
 
