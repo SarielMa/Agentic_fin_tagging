@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Validate full CodiEsp relocation outputs locally, then submit the eight GPU
-# grounding jobs.
+# Validate full CodiEsp exact-only inputs locally, then submit the base GPU
+# grounding jobs for both coverage settings. The oracle and three extra
+# ablations are handled by submit_codiesp_new_requirements.sh.
 set -euo pipefail
 
 DOMAIN_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/second_domain"
@@ -41,6 +42,18 @@ submit_arm () {
 }
 
 submit_arm direct_retrieval apply_server_codiesp_direct_retrieval.sh 0.0 wcov0 03:00:00
+
+# Direct retrieval with label coverage has a CPU-only candidate generation
+# phase. Run that locally first so the GPU job starts at reranking.
+QUERY_MODE=direct_retrieval \
+TEST_JSONL="${TEST_JSONL}" \
+OUTPUT_DIR="${RUNS_ROOT}/qwen3_32b_direct_retrieval_full_wcov1" \
+LABEL_COVERAGE_WEIGHT=1.0 \
+LABEL_COVERAGE_POOL_MULTIPLIER=10 \
+RUN_RERANK=0 \
+REUSE_CANDIDATES=0 \
+bash "${DOMAIN_ROOT}/run_codiesp_grounding_baseline.sh"
+
 submit_arm direct_retrieval apply_server_codiesp_direct_retrieval.sh 1.0 wcov1 03:00:00
 submit_arm one_pass_grounding apply_server_codiesp_one_pass_grounding.sh 0.0 wcov0 04:00:00
 submit_arm one_pass_grounding apply_server_codiesp_one_pass_grounding.sh 1.0 wcov1 04:00:00

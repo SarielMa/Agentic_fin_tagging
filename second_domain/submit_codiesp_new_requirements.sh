@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run/submit the four CodiEsp arms added by the revised experiment matrix.
+# Run/submit the oracle plus the three CodiEsp arms added by the revised
+# experiment matrix. Gold oracle is run once; the GPU arms are submitted for
+# both coverage settings.
 set -euo pipefail
 
 DOMAIN_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/second_domain"
@@ -38,21 +40,31 @@ submit_gpu_arm () {
   local query_mode="$1"
   local output_name="$2"
   local time_limit="$3"
-  shift 3
+  local label_coverage_weight="$4"
+  local suffix="$5"
+  shift 5
 
   sbatch \
+    --partition=gpu_b200 \
+    --gpus=b200:1 \
+    --nodes=1 \
+    --cpus-per-task=8 \
+    --mem=256G \
     --time="${time_limit}" \
-    --job-name="codiesp_${query_mode}_full_exact" \
-    --output="${DOMAIN_ROOT}/logs/%j_codiesp_${query_mode}_full_exact.txt" \
-    --export="ALL,TEST_JSONL=${TEST_JSONL},QUERY_MODE=${query_mode},OUTPUT_DIR=${RUNS_ROOT}/${output_name},LABEL_COVERAGE_WEIGHT=1.0,RESUME=1,REUSE_CANDIDATES=1,$*" \
+    --job-name="codiesp_${query_mode}_full_${suffix}" \
+    --output="${DOMAIN_ROOT}/logs/%j_codiesp_${query_mode}_full_${suffix}.txt" \
+    --export="ALL,TEST_JSONL=${TEST_JSONL},QUERY_MODE=${query_mode},OUTPUT_DIR=${RUNS_ROOT}/${output_name},LABEL_COVERAGE_WEIGHT=${label_coverage_weight},RESUME=1,REUSE_CANDIDATES=1,$*" \
     "${DOMAIN_ROOT}/apply_server_codiesp_shared.sh"
 }
 
 # #5: two independent free-text samples, matching FHS J=2.
-submit_gpu_arm parallel_sampling qwen3_32b_parallel_sampling_n2_full_exact 05:00:00 "RETRIEVAL_ROUNDS=2,RUN_RERANK=1"
+submit_gpu_arm parallel_sampling qwen3_32b_parallel_sampling_n2_full_wcov0 05:00:00 0.0 wcov0 "RETRIEVAL_ROUNDS=2,RUN_RERANK=1"
+submit_gpu_arm parallel_sampling qwen3_32b_parallel_sampling_n2_full_wcov1 05:00:00 1.0 wcov1 "RETRIEVAL_ROUNDS=2,RUN_RERANK=1"
 
 # #7: FHS with J=1, candidate-level verifier retained.
-submit_gpu_arm fhs_j1 qwen3_32b_fhs_j1_full_exact 05:00:00 "RUN_RERANK=1"
+submit_gpu_arm fhs_j1 qwen3_32b_fhs_j1_full_wcov0 05:00:00 0.0 wcov0 "RUN_RERANK=1"
+submit_gpu_arm fhs_j1 qwen3_32b_fhs_j1_full_wcov1 05:00:00 1.0 wcov1 "RUN_RERANK=1"
 
 # #8: FHS with J=2 and candidate-level verifier disabled.
-submit_gpu_arm fhs_no_verifier qwen3_32b_fhs_no_verifier_full_exact 04:00:00 "RUN_RERANK=1"
+submit_gpu_arm fhs_no_verifier qwen3_32b_fhs_no_verifier_full_wcov0 04:00:00 0.0 wcov0 "RUN_RERANK=1"
+submit_gpu_arm fhs_no_verifier qwen3_32b_fhs_no_verifier_full_wcov1 04:00:00 1.0 wcov1 "RUN_RERANK=1"

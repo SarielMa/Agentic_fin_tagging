@@ -1,6 +1,86 @@
 # CodiEsp Second-Domain Experiment State
 
-Last updated: 2026-07-29 22:06 America/New_York.
+Last updated: 2026-07-30 01:25 America/New_York.
+
+This top section is the handoff for the next session. Lower sections contain
+older history and are not the authoritative current queue state.
+
+Operational guardrails:
+
+- Only touch jobs from this CodiEsp experiment, job names beginning `codiesp_`.
+- Do not cancel or modify unrelated jobs such as `vf6_*`, `b_*`, `seqvf_*`, or
+  Jupyter/other user jobs.
+- CPU-only work should run locally in this package; do not use `sbatch` for pure
+  CPU validation/submission wrappers.
+
+## Current Revised-Matrix Status
+
+Active input set is the exact-only full CodiEsp diagnosis slice:
+
+- `data/codiesp/facts_test_full_exact.jsonl`: 3144 facts.
+- `data/codiesp/evidence_relocations_full_exact.jsonl`: 3144 relocation rows.
+- `data/codiesp/stats_full_exact.json`: exact rate 1.0, parse rate 1.0.
+- `data/codiesp/test_docs_full_exact.txt`: 250 docs.
+
+Current coverage-expanded matrix. Gold oracle is run once; the other seven
+methods are run with both `wcov0` and `wcov1`, for 15 final result units total.
+
+| Method | Coverage | Status | Job | Output |
+|---|---|---|---|---|
+| `direct_retrieval` | `wcov0` | final done; Slurm job exited `FAILED` only because of a post-result shell syntax error from the submitted script copy | `20459406` | `runs_codiesp_grounding_baseline/qwen3_32b_direct_retrieval_full_wcov0/` |
+| `direct_retrieval` | `wcov1` | BM25/candidates done locally; GPU rerank pending | `20474170` | `runs_codiesp_grounding_baseline/qwen3_32b_direct_retrieval_full_wcov1/` |
+| `gold_label_definition_retrieval` | single oracle | final done locally, CPU-only | local | `runs_codiesp_grounding_baseline/qwen3_32b_gold_label_definition_retrieval_full_exact/` |
+| `one_pass_grounding` | `wcov0` | running; query generation complete, candidates and rerank predictions are being written | `20459408` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov0/` |
+| `one_pass_grounding` | `wcov1` | pending | `20473790` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov1/` |
+| `one_pass_structured` | `wcov0` | running; Qwen3-32B loaded on GPU and structured traces are being written | `20459410` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov0/` |
+| `one_pass_structured` | `wcov1` | pending | `20473792` | `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov1/` |
+| `parallel_sampling`, N=2 | `wcov0` | pending | `20474745` | `runs_codiesp_grounding_baseline/qwen3_32b_parallel_sampling_n2_full_wcov0/` |
+| `parallel_sampling`, N=2 | `wcov1` | pending; output dir name predates coverage suffix cleanup | `20466298` | `runs_codiesp_grounding_baseline/qwen3_32b_parallel_sampling_n2_full_exact/` |
+| `frozen_ags` / FHS full | `wcov0` | pending | `20459412` | `runs_codiesp_grounding_baseline/qwen3_32b_frozen_ags_full_wcov0/` |
+| `frozen_ags` / FHS full | `wcov1` | pending | `20473791` | `runs_codiesp_grounding_baseline/qwen3_32b_frozen_ags_full_wcov1/` |
+| `fhs_j1` | `wcov0` | pending | `20474744` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_j1_full_wcov0/` |
+| `fhs_j1` | `wcov1` | pending; output dir name predates coverage suffix cleanup | `20466299` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_j1_full_exact/` |
+| `fhs_no_verifier` | `wcov0` | pending | `20474738` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_no_verifier_full_wcov0/` |
+| `fhs_no_verifier` | `wcov1` | pending; output dir name predates coverage suffix cleanup | `20466300` | `runs_codiesp_grounding_baseline/qwen3_32b_fhs_no_verifier_full_exact/` |
+
+Completed metrics so far:
+
+- #1 direct retrieval:
+  - BM25 top-1 `0.027990`, MRR `0.055777`, Recall@10 `0.111641`, Recall@50 `0.226145`, Recall@200 `0.392812`.
+  - Qwen rerank top-1 `0.175254`, MRR `0.214049`, Recall@10 `0.286896`, Recall@50 `0.326018`, parse success `1.0`.
+  - Files are complete: 3144 candidates and 3144 rerank predictions.
+- #2 oracle retrieval:
+  - BM25 top-1 `0.998410`, MRR `0.999205`, Recall@10/50/200 `1.0`.
+- Direct retrieval `wcov1` BM25/candidates:
+  - BM25 top-1 `0.046120`, MRR `0.087444`, Recall@10 `0.174300`, Recall@50 `0.314249`, Recall@200 `0.466603`.
+  - GPU rerank is pending as job `20474170`.
+
+Current partial outputs at handoff:
+
+- `one_pass_grounding wcov0`: `query_descriptions.jsonl` has 3144 rows;
+  `bm25_candidates.jsonl` and `qwen_rerank_predictions.jsonl` exist and are
+  growing under `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_grounding_full_wcov0/`.
+- `one_pass_structured wcov0`: `grounding_traces.jsonl` exists and is growing
+  under `runs_codiesp_grounding_baseline/qwen3_32b_one_pass_structured_full_wcov0/`.
+- Both running jobs showed vLLM/Qwen progress in logs, not GPU-idle CPU prework.
+
+Old revised-out `wcov1` duplicate jobs were cancelled:
+
+- `20459407`: direct retrieval `wcov1`, cancelled after GPU-idle warning before writing candidates.
+- `20459409`: one-pass free-text `wcov1`, cancelled while pending.
+- `20459411`: one-pass structured `wcov1`, cancelled while pending.
+- `20459413`: FHS full `wcov1`, cancelled while pending.
+- `20473793`: parallel sampling `wcov0`, cancelled while pending because it was submitted without GPU resources.
+- `20473794`: FHS J=1 `wcov0`, cancelled while pending because it was submitted without GPU resources.
+- `20473795`: FHS no-verifier `wcov0`, failed before work because it was submitted without GPU resources; replaced by `20474738`.
+
+Submission scripts now reflect this split:
+
+- `submit_codiesp_full_local.sh`: validates exact-only data and submits base methods
+  for `wcov0` and `wcov1`; direct retrieval `wcov1` generates candidates locally
+  before GPU rerank to avoid GPU idle.
+- `submit_codiesp_new_requirements.sh`: runs gold oracle once locally and submits
+  parallel/FHS ablations for both `wcov0` and `wcov1`, with explicit GPU resources.
 
 ## Current Goal
 
@@ -202,7 +282,10 @@ This validates:
 The validation gate passed on the exact-only data, and these 8 GPU jobs were submitted:
 
 - `20459406`: `codiesp_direct_retrieval_full_wcov0`
-- `20459407`: `codiesp_direct_retrieval_full_wcov1`
+- `20459407`: `codiesp_direct_retrieval_full_wcov1` was cancelled after a GPU-idle warning.
+  It was still in CPU candidate generation with `LABEL_COVERAGE_WEIGHT=1.0` and had not
+  written candidates. The revised matrix does not require this wcov1 duplicate; if revived,
+  split it into CPU candidate generation followed by a GPU rerank-only job.
 - `20459408`: `codiesp_one_pass_grounding_full_wcov0`
 - `20459409`: `codiesp_one_pass_grounding_full_wcov1`
 - `20459410`: `codiesp_one_pass_structured_full_wcov0`
