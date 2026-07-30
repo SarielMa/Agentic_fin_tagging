@@ -3,7 +3,7 @@
 
 This script intentionally writes only under second_domain.  It adapts the
 downloaded CodiEsp and ICD-10-CM FY2018 artifacts into the narrow JSONL/index
-interfaces consumed by ../data_whole_pipeline/run_fintagging_grounding_baseline.py.
+interfaces consumed by codiesp_pipeline/run_fintagging_grounding_baseline.py.
 """
 
 from __future__ import annotations

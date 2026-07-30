@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Run/submit the four CodiEsp arms added by the revised experiment matrix.
+set -euo pipefail
+
+DOMAIN_ROOT="/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/second_domain"
+RUNS_ROOT="${RUNS_ROOT:-${DOMAIN_ROOT}/runs_codiesp_grounding_baseline}"
+TEST_JSONL="${TEST_JSONL:-${DOMAIN_ROOT}/data/codiesp/facts_test_full_exact.jsonl}"
+STATS_JSON="${STATS_JSON:-${DOMAIN_ROOT}/data/codiesp/stats_full_exact.json}"
+RELOCATIONS_JSONL="${RELOCATIONS_JSONL:-${DOMAIN_ROOT}/data/codiesp/evidence_relocations_full_exact.jsonl}"
+SPOTCHECK_TSV="${SPOTCHECK_TSV:-${DOMAIN_ROOT}/data/codiesp/spotcheck_50_full_exact.tsv}"
+DOCS_TXT="${DOCS_TXT:-${DOMAIN_ROOT}/data/codiesp/test_docs_full_exact.txt}"
+EXPECTED_FACTS="${EXPECTED_FACTS:-3144}"
+
+cd "${DOMAIN_ROOT}"
+mkdir -p logs "${RUNS_ROOT}"
+
+python scripts/validate_codiesp_full_outputs.py \
+  --facts-jsonl "${TEST_JSONL}" \
+  --stats-json "${STATS_JSON}" \
+  --relocations-jsonl "${RELOCATIONS_JSONL}" \
+  --spotcheck-tsv "${SPOTCHECK_TSV}" \
+  --docs-txt "${DOCS_TXT}" \
+  --expected-facts "${EXPECTED_FACTS}" \
+  --min-exact-rate 1.0 \
+  --min-parse-rate 1.0
+
+# #2: oracle retrieval diagnostic. CPU-only: no Slurm and no LLM rerank.
+MODE=retrieval \
+QUERY_MODE=gold_label_definition_retrieval \
+TEST_JSONL="${TEST_JSONL}" \
+OUTPUT_DIR="${RUNS_ROOT}/qwen3_32b_gold_label_definition_retrieval_full_exact" \
+LABEL_COVERAGE_WEIGHT=0.0 \
+RUN_RERANK=0 \
+REUSE_CANDIDATES=0 \
+bash "${DOMAIN_ROOT}/run_codiesp_grounding_baseline.sh"
+
+submit_gpu_arm () {
+  local query_mode="$1"
+  local output_name="$2"
+  local time_limit="$3"
+  shift 3
+
+  sbatch \
+    --time="${time_limit}" \
+    --job-name="codiesp_${query_mode}_full_exact" \
+    --output="${DOMAIN_ROOT}/logs/%j_codiesp_${query_mode}_full_exact.txt" \
+    --export="ALL,TEST_JSONL=${TEST_JSONL},QUERY_MODE=${query_mode},OUTPUT_DIR=${RUNS_ROOT}/${output_name},LABEL_COVERAGE_WEIGHT=1.0,RESUME=1,REUSE_CANDIDATES=1,$*" \
+    "${DOMAIN_ROOT}/apply_server_codiesp_shared.sh"
+}
+
+# #5: two independent free-text samples, matching FHS J=2.
+submit_gpu_arm parallel_sampling qwen3_32b_parallel_sampling_n2_full_exact 05:00:00 "RETRIEVAL_ROUNDS=2,RUN_RERANK=1"
+
+# #7: FHS with J=1, candidate-level verifier retained.
+submit_gpu_arm fhs_j1 qwen3_32b_fhs_j1_full_exact 05:00:00 "RUN_RERANK=1"
+
+# #8: FHS with J=2 and candidate-level verifier disabled.
+submit_gpu_arm fhs_no_verifier qwen3_32b_fhs_no_verifier_full_exact 04:00:00 "RUN_RERANK=1"

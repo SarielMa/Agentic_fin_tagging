@@ -113,5 +113,8 @@ if [[ -n "${LIMIT}" ]]; then
   ARGS+=(--limit "${LIMIT}")
 fi
 
-python -m py_compile scripts/relocate_codiesp_evidence.py scripts/prepare_codiesp_domain.py
+python -m py_compile \
+  scripts/relocate_codiesp_evidence.py \
+  scripts/prepare_codiesp_domain.py \
+  codiesp_pipeline/run_fintagging_grounding_baseline.py
 python scripts/relocate_codiesp_evidence.py "${ARGS[@]}"

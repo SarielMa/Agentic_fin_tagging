@@ -26,7 +26,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PIPELINE_ROOT = ROOT.parent / "data_whole_pipeline"
+PIPELINE_ROOT = ROOT / "codiesp_pipeline"
 SHARED_RUNNER = PIPELINE_ROOT / "run_fintagging_grounding_baseline.py"
 DATA_DIR = ROOT / "data" / "codiesp"
 INDEX_JSONL = ROOT / "index" / "icd10cm_fy2018" / "icd10cm_fy2018_retrieval.jsonl"

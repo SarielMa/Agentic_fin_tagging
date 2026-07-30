@@ -44,4 +44,4 @@ ICD-10-CM lacks a US-GAAP-style per-code definition paragraph. The `documentatio
 
 - Gold-concept self-retrieval probe: 158 checked, 6 top-1 failures, failure rate 0.037975.
 - Probe path: `index/icd10cm_fy2018/self_retrieval_probe.json`.
-- Retrieval implementation: shared `TaxonomyRetriever` / `BM25Index` from `../data_whole_pipeline/run_fintagging_grounding_baseline.py`; no alternate BM25 engine was used.
+- Retrieval implementation: vendored `TaxonomyRetriever` / `BM25Index` from `codiesp_pipeline/run_fintagging_grounding_baseline.py`; no alternate BM25 engine was used.

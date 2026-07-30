@@ -15,7 +15,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PIPELINE_ROOT = ROOT.parent / "data_whole_pipeline"
+PIPELINE_ROOT = ROOT / "codiesp_pipeline"
 SHARED_RUNNER = PIPELINE_ROOT / "run_fintagging_grounding_baseline.py"
 
 
@@ -31,6 +31,12 @@ def load_shared_runner() -> Any:
 
 
 def install_codiesp_prompts(runner: Any) -> None:
+    def normalize_tag(tag: Any) -> str:
+        return runner.normalize_space(tag)
+
+    def raw_tag(tag: Any) -> str:
+        return runner.normalize_space(tag)
+
     def build_rerank_messages(
         record: dict[str, Any],
         context_max_chars: int,
@@ -116,9 +122,44 @@ Evidence:
             {"role": "user", "content": user},
         ]
 
+    def build_parallel_sampling_messages(
+        example: Any,
+        sample_idx: int,
+        total_samples: int,
+        context_max_chars: int,
+    ) -> list[dict[str, str]]:
+        evidence = runner.serialize_evidence(example, context_max_chars)
+        user = f"""Generate a semantic interpretation of clinical evidence for retrieving the correct ICD-10-CM diagnosis code.
+
+This is interpretation {sample_idx} of {total_samples}. Explore a different plausible reading of the evidence. Consider varying:
+- The diagnosis family or code class
+- The specific condition, symptom, finding, injury, or health-status factor
+- Qualifiers such as acute/chronic, severity, complication status, type, or specified/unspecified
+- Laterality or encounter/extension status when supported
+
+Return JSON only with this schema:
+{{"query": "distinct diagnosis retrieval description"}}
+
+Evidence:
+{evidence}
+
+Rules:
+- Make this interpretation meaningfully distinct.
+- Use wording likely to appear in ICD-10-CM labels, descriptions, or index text.
+- Do not name a specific ICD-10-CM code unless it is explicitly present in the source context.
+- Do not include explanations or markdown."""
+        return [
+            {"role": "system", "content": "You generate diverse ICD-10-CM retrieval hypotheses."},
+            {"role": "user", "content": user},
+        ]
+
+    runner.TAG_PREFIX = ""
+    runner.normalize_tag = normalize_tag
+    runner.raw_tag = raw_tag
     runner.build_rerank_messages = build_rerank_messages
     runner.build_query_description_messages = build_query_description_messages
     runner.build_operator_initial_messages = build_operator_initial_messages
+    runner.build_parallel_sampling_messages = build_parallel_sampling_messages
 
 
 def requested_label_coverage_weight() -> float | None:
@@ -131,17 +172,45 @@ def requested_label_coverage_weight() -> float | None:
     return None
 
 
-def install_frozen_family_coverage_ablation() -> None:
-    weight = requested_label_coverage_weight()
-    if weight is None or weight > 0.0:
+def requested_query_mode() -> str | None:
+    argv = sys.argv[1:]
+    for idx, arg in enumerate(argv):
+        if arg == "--query-mode" and idx + 1 < len(argv):
+            return argv[idx + 1]
+        if arg.startswith("--query-mode="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def install_codiesp_frozen_family_overrides() -> None:
+    mode = requested_query_mode()
+    if mode not in {
+        "ags",
+        "fhs",
+        "frozen_ags",
+        "frozen_ags_grounding",
+        "fhs_j1",
+        "frozen_ags_j1",
+        "fhs_no_verifier",
+        "frozen_ags_no_verifier",
+        "ags_j1",
+        "one_pass_structured",
+        "one_pass_grounding_structured",
+    }:
         return
+
+    weight = requested_label_coverage_weight()
+    if weight is None:
+        weight = 1.0
+    is_fhs = mode in {"ags", "fhs", "frozen_ags", "frozen_ags_grounding", "fhs_j1", "frozen_ags_j1"}
 
     import ags_frozen_grounding as ags
 
     original_config = ags.FrozenAgsConfig
 
     def frozen_ags_config_factory(*args: Any, **kwargs: Any) -> Any:
-        kwargs.setdefault("label_coverage_weight", weight)
+        kwargs["label_coverage_weight"] = weight
+        kwargs["rerank_beta"] = 0.6 if is_fhs else 0.0
         return original_config(*args, **kwargs)
 
     def one_pass_structured_config() -> Any:
@@ -153,8 +222,35 @@ def install_frozen_family_coverage_ablation() -> None:
             variant=ags.ONE_PASS_STRUCTURED_QUERY_MODE,
         )
 
-    for variant in (ags.FROZEN_AGS_QUERY_MODE, ags.ONE_PASS_STRUCTURED_QUERY_MODE):
+    def fhs_j1_config() -> Any:
+        return original_config(
+            hypotheses=1,
+            rerank_beta=0.6,
+            label_coverage_weight=weight,
+            temperature=0.8,
+            variant=ags.FHS_J1_QUERY_MODE,
+        )
+
+    def fhs_no_verifier_config() -> Any:
+        return original_config(
+            hypotheses=2,
+            rerank_beta=0.0,
+            label_coverage_weight=weight,
+            temperature=0.8,
+            variant=ags.FHS_NO_VERIFIER_QUERY_MODE,
+        )
+
+    for variant in (
+        ags.FROZEN_AGS_QUERY_MODE,
+        ags.FHS_J1_QUERY_MODE,
+        ags.FHS_NO_VERIFIER_QUERY_MODE,
+        ags.ONE_PASS_STRUCTURED_QUERY_MODE,
+    ):
         ags._FROZEN_VARIANTS[variant]["label_coverage_weight"] = weight
+    ags._FROZEN_VARIANTS[ags.FROZEN_AGS_QUERY_MODE]["rerank_beta"] = 0.6
+    ags._FROZEN_VARIANTS[ags.FHS_J1_QUERY_MODE]["rerank_beta"] = 0.6
+    ags._FROZEN_VARIANTS[ags.FHS_NO_VERIFIER_QUERY_MODE]["rerank_beta"] = 0.0
+    ags._FROZEN_VARIANTS[ags.ONE_PASS_STRUCTURED_QUERY_MODE]["rerank_beta"] = 0.0
 
     def startup_assertions_without_coverage(
         retriever: Any,
@@ -176,8 +272,10 @@ def install_frozen_family_coverage_ablation() -> None:
                     f"frozen_ags expects no controlled vocabulary for '{dimension}' (token branch only)"
                 )
         return {
-            "label_coverage_ablation": True,
+            "label_coverage_ablation": weight <= 0.0,
             "label_coverage_weight": weight,
+            "codiesp_fhs_verifier_enabled": is_fhs,
+            "fhs_verifier_dimensions": list(getattr(ags, "FHS_VERIFIER_DIMENSIONS", ())),
             "vocabulary_ok": True,
             "config_frozen_ok": True,
             "coverage_regression_checked": [],
@@ -186,13 +284,15 @@ def install_frozen_family_coverage_ablation() -> None:
 
     ags.FrozenAgsConfig = frozen_ags_config_factory
     ags.one_pass_structured_config = one_pass_structured_config
+    ags.fhs_j1_config = fhs_j1_config
+    ags.fhs_no_verifier_config = fhs_no_verifier_config
     ags.frozen_ags_startup_assertions = startup_assertions_without_coverage
 
 
 def main() -> None:
     runner = load_shared_runner()
     install_codiesp_prompts(runner)
-    install_frozen_family_coverage_ablation()
+    install_codiesp_frozen_family_overrides()
     runner.main()
 
 

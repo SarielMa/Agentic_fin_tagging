@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DOMAIN_ROOT="$(readlink -f "$(dirname "$0")")"
-SHARED_ROOT="$(readlink -f "${DOMAIN_ROOT}/../data_whole_pipeline")"
+SHARED_ROOT="$(readlink -f "${DOMAIN_ROOT}/codiesp_pipeline")"
 
 TEST_JSONL="${TEST_JSONL:-${DOMAIN_ROOT}/data/codiesp/facts_test.jsonl}"
 TAXONOMY_JSONL="${TAXONOMY_JSONL:-${DOMAIN_ROOT}/index/icd10cm_fy2018/icd10cm_fy2018_retrieval.jsonl}"
@@ -23,14 +23,26 @@ case "${QUERY_MODE}" in
   llm_description|one_pass_grounding)
     DEFAULT_METHOD_DIR="qwen3_32b_one_pass_grounding"
     ;;
+  gold_label_definition|gold_label_definition_retrieval|oracle_definition|oracle_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_gold_label_definition_retrieval"
+    ;;
+  parallel|parallel_sampling)
+    DEFAULT_METHOD_DIR="qwen3_32b_parallel_sampling"
+    ;;
   ags_j1|one_pass_structured|one_pass_grounding_structured)
     DEFAULT_METHOD_DIR="qwen3_32b_one_pass_structured"
     ;;
   ags|frozen_ags|frozen_ags_grounding)
     DEFAULT_METHOD_DIR="qwen3_32b_frozen_ags"
     ;;
+  fhs_j1|frozen_ags_j1)
+    DEFAULT_METHOD_DIR="qwen3_32b_fhs_j1"
+    ;;
+  fhs_no_verifier|frozen_ags_no_verifier)
+    DEFAULT_METHOD_DIR="qwen3_32b_fhs_no_verifier"
+    ;;
   *)
-    echo "Unsupported CodiEsp QUERY_MODE=${QUERY_MODE}. Expected direct_retrieval|one_pass_grounding|one_pass_structured|frozen_ags." >&2
+    echo "Unsupported CodiEsp QUERY_MODE=${QUERY_MODE}. Expected direct_retrieval|gold_label_definition_retrieval|one_pass_grounding|parallel_sampling|one_pass_structured|frozen_ags|fhs_j1|fhs_no_verifier." >&2
     exit 1
     ;;
 esac
@@ -60,6 +72,7 @@ QUERY_DESCRIPTION_PATH="${QUERY_DESCRIPTION_PATH:-}"
 QUERY_CONTEXT_MAX_CHARS="${QUERY_CONTEXT_MAX_CHARS:-12000}"
 QUERY_MAX_INPUT_TOKENS="${QUERY_MAX_INPUT_TOKENS:-16000}"
 QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-128}"
+FHS_VERIFIER_MAX_NEW_TOKENS="${FHS_VERIFIER_MAX_NEW_TOKENS:-3072}"
 QUERY_TEMPERATURE="${QUERY_TEMPERATURE:-0.0}"
 QUERY_TOP_P="${QUERY_TOP_P:-1.0}"
 BF16="${BF16:-1}"
@@ -74,7 +87,7 @@ CONTEXT_MAX_CHARS="${CONTEXT_MAX_CHARS:-12000}"
 CANDIDATE_DOC_MAX_CHARS="${CANDIDATE_DOC_MAX_CHARS:-320}"
 RERANK_LIST_SIZE="${RERANK_LIST_SIZE:-20}"
 MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-30000}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-1.0}"
 RESUME="${RESUME:-1}"
@@ -84,7 +97,7 @@ LABEL_COVERAGE_WEIGHT="${LABEL_COVERAGE_WEIGHT:-}"
 FROZEN_AGS_TOP_P="${FROZEN_AGS_TOP_P:-1.0}"
 
 case "${QUERY_MODE}" in
-  ags|frozen_ags|frozen_ags_grounding|ags_j1|one_pass_structured|one_pass_grounding_structured)
+  ags|frozen_ags|frozen_ags_grounding|fhs_j1|frozen_ags_j1|fhs_no_verifier|frozen_ags_no_verifier|ags_j1|one_pass_structured|one_pass_grounding_structured)
     if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" ]]; then
       QUERY_MAX_NEW_TOKENS=512
     fi
@@ -101,7 +114,7 @@ require_path () {
 }
 
 require_path "${DOMAIN_ROOT}/scripts/run_codiesp_grounding.py" "CodiEsp prompt shim"
-require_path "${SHARED_ROOT}/run_fintagging_grounding_baseline.py" "shared grounding runner"
+require_path "${SHARED_ROOT}/run_fintagging_grounding_baseline.py" "vendored grounding runner"
 require_path "${TEST_JSONL}" "CodiEsp grounding JSONL"
 require_path "${TAXONOMY_JSONL}" "ICD-10-CM retrieval taxonomy"
 require_path "${NORMALIZATION_MAP}" "ICD-10-CM symbolic normalization map"
@@ -132,6 +145,7 @@ ARGS=(
   --query-context-max-chars "${QUERY_CONTEXT_MAX_CHARS}"
   --query-max-input-tokens "${QUERY_MAX_INPUT_TOKENS}"
   --query-max-new-tokens "${QUERY_MAX_NEW_TOKENS}"
+  --fhs-verifier-max-new-tokens "${FHS_VERIFIER_MAX_NEW_TOKENS}"
   --query-temperature "${QUERY_TEMPERATURE}"
   --query-top-p "${QUERY_TOP_P}"
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}"
@@ -208,6 +222,9 @@ echo "NORMALIZATION_MAP     : ${NORMALIZATION_MAP}"
 echo "OUTPUT_DIR            : ${OUTPUT_DIR}"
 echo "QUERY_MODE            : ${QUERY_MODE}"
 echo "RUN_RERANK            : ${RUN_RERANK}"
+echo "QUERY_MAX_NEW_TOKENS  : ${QUERY_MAX_NEW_TOKENS}"
+echo "FHS_MAX_NEW_TOKENS    : ${FHS_VERIFIER_MAX_NEW_TOKENS}"
+echo "MAX_NEW_TOKENS        : ${MAX_NEW_TOKENS}"
 echo "TOP_K                 : ${TOP_K}"
 echo "RRF_KAPPA             : ${RRF_KAPPA}"
 echo "TYPE_FILTER           : ${TYPE_FILTER}"

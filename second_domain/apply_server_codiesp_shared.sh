@@ -87,6 +87,7 @@ export QUERY_GENERATION_BACKEND="${QUERY_GENERATION_BACKEND:-vllm}"
 export QUERY_CONTEXT_MAX_CHARS="${QUERY_CONTEXT_MAX_CHARS:-12000}"
 export QUERY_MAX_INPUT_TOKENS="${QUERY_MAX_INPUT_TOKENS:-16000}"
 export QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-128}"
+export FHS_VERIFIER_MAX_NEW_TOKENS="${FHS_VERIFIER_MAX_NEW_TOKENS:-3072}"
 export QUERY_TEMPERATURE="${QUERY_TEMPERATURE:-0.0}"
 export QUERY_TOP_P="${QUERY_TOP_P:-1.0}"
 export BF16="${BF16:-1}"
@@ -100,7 +101,7 @@ export CONTEXT_MAX_CHARS="${CONTEXT_MAX_CHARS:-12000}"
 export CANDIDATE_DOC_MAX_CHARS="${CANDIDATE_DOC_MAX_CHARS:-320}"
 export RERANK_LIST_SIZE="${RERANK_LIST_SIZE:-20}"
 export MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-30000}"
-export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 export TEMPERATURE="${TEMPERATURE:-0.0}"
 export TOP_P="${TOP_P:-1.0}"
 export RESUME="${RESUME:-1}"
@@ -136,5 +137,12 @@ echo "RUN_RERANK=${RUN_RERANK}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "============================================================"
 
-python -m py_compile "${DOMAIN_ROOT}/scripts/run_codiesp_grounding.py" "${DOMAIN_ROOT}/scripts/prepare_codiesp_domain.py"
+python -m py_compile \
+  "${DOMAIN_ROOT}/scripts/run_codiesp_grounding.py" \
+  "${DOMAIN_ROOT}/scripts/prepare_codiesp_domain.py" \
+  "${DOMAIN_ROOT}/codiesp_pipeline/run_fintagging_grounding_baseline.py" \
+  "${DOMAIN_ROOT}/codiesp_pipeline/ags_frozen_grounding.py" \
+  "${DOMAIN_ROOT}/codiesp_pipeline/ags_configuration_scoring.py" \
+  "${DOMAIN_ROOT}/codiesp_pipeline/ags_symbolic_agreement.py" \
+  "${DOMAIN_ROOT}/codiesp_pipeline/run_ags_component_validation.py"
 bash "${PIPELINE_SH}"

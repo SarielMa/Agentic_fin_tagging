@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PIPELINE_ROOT = ROOT.parent / "data_whole_pipeline"
+PIPELINE_ROOT = ROOT / "codiesp_pipeline"
 sys.path.insert(0, str(PIPELINE_ROOT))
 
 from run_fintagging_grounding_baseline import TaxonomyRetriever, load_taxonomy, normalize_tag  # noqa: E402
