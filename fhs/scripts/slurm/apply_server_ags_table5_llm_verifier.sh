@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_ags_table5_llm_verifier_qwen3_b200.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_ags_table5_llm_verifier_qwen3_b200.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -29,7 +29,7 @@ set -euo pipefail
 #   sbatch apply_server_ags_table5_llm_verifier.sh
 #   sbatch --export=ALL,LIMIT=20 apply_server_ags_table5_llm_verifier.sh   # smoke test
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 
 for var in CONDA_EXE CONDA_PREFIX CONDA_PREFIX_1 CONDA_PREFIX_2 CONDA_DEFAULT_ENV CONDA_PROMPT_MODIFIER CONDA_SHLVL CONDA_PYTHON_EXE CONDA_PKGS_DIRS CONDA_ENVS_PATH _CE_CONDA _CE_M _CONDA_EXE _CONDA_ROOT; do

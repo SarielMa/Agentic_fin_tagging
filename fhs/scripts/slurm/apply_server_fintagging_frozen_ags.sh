@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_fintag_frozen_ags_qwen3_b200.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_fintag_frozen_ags_qwen3_b200.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -19,7 +19,7 @@ set -euo pipefail
 #   The listwise rerank runs on the AGS ranking so the method is scored at the same stage as
 #   every other query mode (bm25_retrieval + qwen_reranked in metrics.json).
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 
 export SCRATCH_ROOT="${SCRATCH_ROOT:-/nfs/roberts/scratch/pi_sjf37/lm2445}"

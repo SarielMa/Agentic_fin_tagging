@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_fintag_parallel_sampling_diversity_qwen3_b200.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_fintag_parallel_sampling_diversity_qwen3_b200.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -15,7 +15,7 @@ set -euo pipefail
 #   B sequential-exclusion grounding hypotheses, each retrieved with q_lab/q_def
 #   dual surfaces and fused with the same RRF path as other grounding methods.
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 export SCRATCH_ROOT="${SCRATCH_ROOT:-/nfs/roberts/scratch/pi_sjf37/lm2445}"
 export RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs/runs_fintagging_grounding_baseline}"

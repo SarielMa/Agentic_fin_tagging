@@ -41,8 +41,11 @@ case "${QUERY_MODE}" in
   fhs_no_verifier|frozen_ags_no_verifier)
     DEFAULT_METHOD_DIR="qwen3_32b_fhs_no_verifier"
     ;;
+  fhs_j3_wcov0|fhs_j3_wcov1|fhs_j4_wcov0|fhs_j4_wcov1)
+    DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
+    ;;
   *)
-    echo "Unsupported CodiEsp QUERY_MODE=${QUERY_MODE}. Expected direct_retrieval|gold_label_definition_retrieval|one_pass_grounding|parallel_sampling|one_pass_structured|frozen_ags|fhs_j1|fhs_no_verifier." >&2
+    echo "Unsupported CodiEsp QUERY_MODE=${QUERY_MODE}. Expected direct_retrieval|gold_label_definition_retrieval|one_pass_grounding|parallel_sampling|one_pass_structured|frozen_ags|fhs_j1|fhs_no_verifier|fhs_j3_wcov0|fhs_j3_wcov1|fhs_j4_wcov0|fhs_j4_wcov1." >&2
     exit 1
     ;;
 esac
@@ -97,7 +100,7 @@ LABEL_COVERAGE_WEIGHT="${LABEL_COVERAGE_WEIGHT:-}"
 FROZEN_AGS_TOP_P="${FROZEN_AGS_TOP_P:-1.0}"
 
 case "${QUERY_MODE}" in
-  ags|frozen_ags|frozen_ags_grounding|fhs_j1|frozen_ags_j1|fhs_no_verifier|frozen_ags_no_verifier|ags_j1|one_pass_structured|one_pass_grounding_structured)
+  ags|frozen_ags|frozen_ags_grounding|fhs_j1|frozen_ags_j1|fhs_no_verifier|frozen_ags_no_verifier|fhs_j3_wcov0|fhs_j3_wcov1|fhs_j4_wcov0|fhs_j4_wcov1|ags_j1|one_pass_structured|one_pass_grounding_structured)
     if [[ "${QUERY_MAX_NEW_TOKENS}" == "128" ]]; then
       QUERY_MAX_NEW_TOKENS=512
     fi

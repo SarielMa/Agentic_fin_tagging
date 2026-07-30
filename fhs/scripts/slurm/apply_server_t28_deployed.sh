@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_t28_deployed_%x.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_t28_deployed_%x.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -35,7 +35,7 @@ set -euo pipefail
 # w_cov=1.0, one-pass at w_cov=0.0. That is what the main table's methods are. It is recorded
 # in the stage-1 manifest.
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 
 RETRIEVER="${RETRIEVER:?set RETRIEVER=dense|hybrid}"

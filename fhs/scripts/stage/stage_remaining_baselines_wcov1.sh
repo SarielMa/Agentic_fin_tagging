@@ -38,7 +38,7 @@
 # in runs_ags_probe_queryform/qwen3_32b_pooled/query_form_metrics.csv.
 set -uo pipefail
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO="${FHS_ROOT}"
 RUNS="${REPO}/runs/runs_fintagging_grounding_baseline"
 LOG="${REPO}/scripts/stage/stage_remaining_baselines_wcov1.log"

@@ -84,6 +84,10 @@ QUERY_MODE_ALIASES = {
     "frozen_ags_j1": "fhs_j1",
     "fhs_no_verifier": "fhs_no_verifier",
     "frozen_ags_no_verifier": "fhs_no_verifier",
+    "fhs_j3_wcov0": "fhs_j3_wcov0",
+    "fhs_j3_wcov1": "fhs_j3_wcov1",
+    "fhs_j4_wcov0": "fhs_j4_wcov0",
+    "fhs_j4_wcov1": "fhs_j4_wcov1",
     "gold_label_definition": "gold_label_definition_retrieval",
     "gold_label_definition_retrieval": "gold_label_definition_retrieval",
     "oracle_definition": "gold_label_definition_retrieval",
@@ -111,6 +115,10 @@ MULTI_ROUND_QUERY_MODES = {
     "frozen_ags",
     "fhs_j1",
     "fhs_no_verifier",
+    "fhs_j3_wcov0",
+    "fhs_j3_wcov1",
+    "fhs_j4_wcov0",
+    "fhs_j4_wcov1",
     "ags_seq",
     "ags_seq_random",
     "seq_verifier",
@@ -123,6 +131,7 @@ STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
 FROZEN_AGS_QUERY_MODES = {"frozen_ags"}
 FHS_J1_QUERY_MODES = {"fhs_j1"}
 FHS_NO_VERIFIER_QUERY_MODES = {"fhs_no_verifier"}
+FHS_J_SWEEP_QUERY_MODES = {"fhs_j3_wcov0", "fhs_j3_wcov1", "fhs_j4_wcov0", "fhs_j4_wcov1"}
 # "One-pass grounding (structured)" = AGS with J=1: the identical frozen code path with one
 # greedy hypothesis and beta=0, so the consensus term drops out and the ranking is the
 # range-normalized sum-RRF score alone. Shares frozen_ags's startup assertions and record
@@ -133,6 +142,7 @@ FROZEN_AGS_FAMILY_QUERY_MODES = (
     FROZEN_AGS_QUERY_MODES
     | FHS_J1_QUERY_MODES
     | FHS_NO_VERIFIER_QUERY_MODES
+    | FHS_J_SWEEP_QUERY_MODES
     | ONE_PASS_STRUCTURED_QUERY_MODES
 )
 # The two sequential negative-control arms start from frozen_ags's round one and differ
@@ -3494,9 +3504,14 @@ def build_comparison_candidate_records(
             FrozenAgsConfig,
             build_frozen_ags_method_record,
             fhs_j1_config,
+            fhs_j3_wcov0_config,
+            fhs_j3_wcov1_config,
+            fhs_j4_wcov0_config,
+            fhs_j4_wcov1_config,
             fhs_no_verifier_config,
             frozen_ags_startup_assertions,
             one_pass_structured_config,
+            with_label_coverage_weight,
         )
         from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map
 
@@ -3509,8 +3524,21 @@ def build_comparison_candidate_records(
             frozen_ags_config = fhs_j1_config()
         elif query_mode in FHS_NO_VERIFIER_QUERY_MODES:
             frozen_ags_config = fhs_no_verifier_config()
+        elif query_mode == "fhs_j3_wcov0":
+            frozen_ags_config = fhs_j3_wcov0_config()
+        elif query_mode == "fhs_j3_wcov1":
+            frozen_ags_config = fhs_j3_wcov1_config()
+        elif query_mode == "fhs_j4_wcov0":
+            frozen_ags_config = fhs_j4_wcov0_config()
+        elif query_mode == "fhs_j4_wcov1":
+            frozen_ags_config = fhs_j4_wcov1_config()
         else:
             frozen_ags_config = FrozenAgsConfig()
+        if args.label_coverage_weight is not None:
+            frozen_ags_config = with_label_coverage_weight(
+                frozen_ags_config,
+                args.label_coverage_weight,
+            )
         retriever.label_coverage_weight = frozen_ags_config.label_coverage_weight
         retriever.label_coverage_pool_multiplier = args.label_coverage_pool_multiplier
         frozen_ags_normalization_map = load_normalization_map(
@@ -4098,7 +4126,8 @@ def parse_args() -> argparse.Namespace:
             "intrinsic_self_refinement, retrieval_feedback_refinement, parallel_sampling, "
             "parallel_sampling_diversity, decomposed_retrieval, operator_refinement, "
             "memory_guided_refinement, bandit_freeform, bandit_freeform_10arm, frozen_ags, "
-            "fhs_j1, fhs_no_verifier, one_pass_structured (= AGS with J=1; alias ags_j1), "
+            "fhs_j1, fhs_no_verifier, fhs_j3_wcov0, fhs_j3_wcov1, fhs_j4_wcov0, "
+            "fhs_j4_wcov1, one_pass_structured (= AGS with J=1; alias ags_j1), "
             "ags_seq, ags_seq_random, and gold_label_definition_retrieval."
         ),
     )
@@ -4158,7 +4187,7 @@ def main() -> None:
     args = parse_args()
     args.query_mode = canonical_query_mode(args.query_mode)
     run_final_listwise_rerank = args.run_rerank and args.query_mode not in (
-        FROZEN_AGS_QUERY_MODES | FHS_J1_QUERY_MODES | FHS_NO_VERIFIER_QUERY_MODES
+        FROZEN_AGS_QUERY_MODES | FHS_J1_QUERY_MODES | FHS_NO_VERIFIER_QUERY_MODES | FHS_J_SWEEP_QUERY_MODES
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -14,7 +14,7 @@ set -euo pipefail
 #   OUTPUT_DIR=runs_ags_table5_ablation/qwen3_32b_2026-07-24 ./run_ags_table5_offline.sh
 #   LIMIT=50 ./run_ags_table5_offline.sh   # smoke test
 
-REPO_ROOT="$(readlink -f "$(dirname "$0")")"
+REPO_ROOT="${FHS_ROOT:-$(readlink -f "$(dirname "$0")/../..")}"
 cd "${REPO_ROOT}"
 
 BASE_OUTPUT_DIR="${REPO_ROOT}/runs/runs_ags_table5_ablation/qwen3_32b"

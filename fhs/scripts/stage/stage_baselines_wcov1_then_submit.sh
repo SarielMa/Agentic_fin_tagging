@@ -27,7 +27,7 @@
 # different retrieval configuration -- a worse inconsistency than the one being fixed.
 set -uo pipefail
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO="${FHS_ROOT}"
 RUNS="${REPO}/runs/runs_fintagging_grounding_baseline"
 SCRATCH="/nfs/roberts/scratch/pi_sjf37/lm2445/runs_fintagging_grounding_baseline"

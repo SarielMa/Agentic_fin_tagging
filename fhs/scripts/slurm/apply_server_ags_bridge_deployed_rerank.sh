@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_ags_bridge_deployed_rerank.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_ags_bridge_deployed_rerank.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -44,7 +44,7 @@ set -euo pipefail
 #   The reranked ranking must exist. This script fails fast if it does not, naming the step
 #   that produces it, rather than silently reranking the un-reranked pool and reporting a null.
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 
 RERANKED_RANKING="${RERANKED_RANKING:-${REPO_ROOT}/runs/runs_ags_verifier_bridge/qwen3_32b/candidate_level_reranked_candidates.jsonl}"

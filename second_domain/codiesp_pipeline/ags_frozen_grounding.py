@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ags_configuration_scoring import FactContext
@@ -86,6 +86,10 @@ FHS_VERIFIER_DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEM
 VERDICT_TO_SUPPORT = {"support": 1.0, "contradict": 0.0, "unresolved": 0.0}
 FHS_J1_QUERY_MODE = "fhs_j1"
 FHS_NO_VERIFIER_QUERY_MODE = "fhs_no_verifier"
+FHS_J3_WCOV0_QUERY_MODE = "fhs_j3_wcov0"
+FHS_J3_WCOV1_QUERY_MODE = "fhs_j3_wcov1"
+FHS_J4_WCOV0_QUERY_MODE = "fhs_j4_wcov0"
+FHS_J4_WCOV1_QUERY_MODE = "fhs_j4_wcov1"
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,7 @@ class FrozenAgsConfig:
     agreement_top_m: int = 10
     dual_rendering_modalities: tuple[str, ...] = ("table",)  # text uses def only
     variant: str = FROZEN_AGS_QUERY_MODE
+    label_coverage_ablation: bool = False
 
 
 # Each variant is frozen just as hard as the original; they differ only in the constants the
@@ -136,6 +141,34 @@ _FROZEN_VARIANTS: dict[str, dict[str, Any]] = {
     ONE_PASS_STRUCTURED_QUERY_MODE: {
         "hypotheses": 1,
         "rerank_beta": 0.0,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 1.0,
+        "top_k": 200,
+    },
+    FHS_J3_WCOV0_QUERY_MODE: {
+        "hypotheses": 3,
+        "rerank_beta": 0.6,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 0.0,
+        "top_k": 200,
+    },
+    FHS_J3_WCOV1_QUERY_MODE: {
+        "hypotheses": 3,
+        "rerank_beta": 0.6,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 1.0,
+        "top_k": 200,
+    },
+    FHS_J4_WCOV0_QUERY_MODE: {
+        "hypotheses": 4,
+        "rerank_beta": 0.6,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 0.0,
+        "top_k": 200,
+    },
+    FHS_J4_WCOV1_QUERY_MODE: {
+        "hypotheses": 4,
+        "rerank_beta": 0.6,
         "rrf_kappa": 60,
         "label_coverage_weight": 1.0,
         "top_k": 200,
@@ -173,6 +206,50 @@ def fhs_no_verifier_config() -> FrozenAgsConfig:
     )
 
 
+def fhs_j3_wcov0_config() -> FrozenAgsConfig:
+    """FHS J=3 sweep cell with label coverage disabled."""
+    return FrozenAgsConfig(
+        hypotheses=3,
+        rerank_beta=0.6,
+        label_coverage_weight=0.0,
+        temperature=0.8,
+        variant=FHS_J3_WCOV0_QUERY_MODE,
+    )
+
+
+def fhs_j3_wcov1_config() -> FrozenAgsConfig:
+    """FHS J=3 sweep cell with label coverage enabled."""
+    return FrozenAgsConfig(
+        hypotheses=3,
+        rerank_beta=0.6,
+        label_coverage_weight=1.0,
+        temperature=0.8,
+        variant=FHS_J3_WCOV1_QUERY_MODE,
+    )
+
+
+def fhs_j4_wcov0_config() -> FrozenAgsConfig:
+    """FHS J=4 sweep cell with label coverage disabled."""
+    return FrozenAgsConfig(
+        hypotheses=4,
+        rerank_beta=0.6,
+        label_coverage_weight=0.0,
+        temperature=0.8,
+        variant=FHS_J4_WCOV0_QUERY_MODE,
+    )
+
+
+def fhs_j4_wcov1_config() -> FrozenAgsConfig:
+    """FHS J=4 sweep cell with label coverage enabled."""
+    return FrozenAgsConfig(
+        hypotheses=4,
+        rerank_beta=0.6,
+        label_coverage_weight=1.0,
+        temperature=0.8,
+        variant=FHS_J4_WCOV1_QUERY_MODE,
+    )
+
+
 def _assert_frozen(cfg: FrozenAgsConfig) -> None:
     """Spec 9.2 assertion 4: config frozen."""
     expected = _FROZEN_VARIANTS.get(cfg.variant)
@@ -185,6 +262,7 @@ def _assert_frozen(cfg: FrozenAgsConfig) -> None:
         field: (getattr(cfg, field), value)
         for field, value in expected.items()
         if getattr(cfg, field) != value
+        and not (field == "label_coverage_weight" and cfg.label_coverage_ablation)
     }
     if drifted:
         detail = ", ".join(f"{field}={got!r} (expected {want!r})" for field, (got, want) in sorted(drifted.items()))
@@ -194,6 +272,15 @@ def _assert_frozen(cfg: FrozenAgsConfig) -> None:
             "one_pass_structured decodes greedily (temperature 0); got "
             f"temperature={cfg.temperature}"
         )
+
+
+def with_label_coverage_weight(cfg: FrozenAgsConfig, label_coverage_weight: float) -> FrozenAgsConfig:
+    """Keep the frozen variant fixed while changing only w_cov for an ablation cell."""
+    return replace(
+        cfg,
+        label_coverage_weight=label_coverage_weight,
+        label_coverage_ablation=True,
+    )
 
 
 def range_normalize(scores: dict[str, float]) -> dict[str, float]:
@@ -234,7 +321,8 @@ def frozen_ags_startup_assertions(
     """
     _assert_frozen(cfg)
 
-    if retriever.label_coverage_weight <= 0.0:
+    coverage_enabled = cfg.label_coverage_weight > 0.0
+    if coverage_enabled and retriever.label_coverage_weight <= 0.0:
         raise AssertionError(
             "frozen_ags requires the retriever's label_coverage_weight > 0 (w_cov=1.0); "
             f"got {retriever.label_coverage_weight}"
@@ -274,15 +362,16 @@ def frozen_ags_startup_assertions(
     by_raw = {normalize_tag(concept.tag).split(":")[-1]: concept for concept in taxonomy}
     coverage_failures: list[str] = []
     coverage_checked: list[str] = []
-    for label in COVERAGE_REGRESSION_LABELS:
-        concept = by_label.get(label) or by_raw.get(label)
-        if concept is None:
-            continue
-        coverage_checked.append(concept.tag)
-        query_label = getattr(concept, "standard_label", "") or label
-        ranked = retrieve_candidates(retriever, query_label, concept.entity_type, 10)
-        if not ranked or normalize_tag(ranked[0]["tag"]) != normalize_tag(concept.tag):
-            coverage_failures.append(concept.tag)
+    if coverage_enabled:
+        for label in COVERAGE_REGRESSION_LABELS:
+            concept = by_label.get(label) or by_raw.get(label)
+            if concept is None:
+                continue
+            coverage_checked.append(concept.tag)
+            query_label = getattr(concept, "standard_label", "") or label
+            ranked = retrieve_candidates(retriever, query_label, concept.entity_type, 10)
+            if not ranked or normalize_tag(ranked[0]["tag"]) != normalize_tag(concept.tag):
+                coverage_failures.append(concept.tag)
 
     self_retrieval_failure_rate = len(self_retrieval_failures) / checked if checked else 0.0
     report = {

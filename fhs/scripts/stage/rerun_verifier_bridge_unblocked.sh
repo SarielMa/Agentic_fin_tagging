@@ -10,7 +10,7 @@
 # Waits for the ablation re-run first; 4 cores at load ~60.
 
 set -uo pipefail
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 
 while pgrep -f run_ags_verifier_ablation.py > /dev/null; do

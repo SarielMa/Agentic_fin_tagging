@@ -23,7 +23,7 @@
 # its input is on disk.
 set -uo pipefail
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO="${FHS_ROOT}"
 RUN="${REPO}/runs/runs_ags_verifier_ablation/qwen3_32b"
 VERDICTS="${RUN}/verdicts_k10_hint/llm_verifier_verdicts.json"

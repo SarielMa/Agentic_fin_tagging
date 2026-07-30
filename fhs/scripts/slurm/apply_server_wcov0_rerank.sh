@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_abl_wcov0.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_abl_wcov0.txt
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=linhai.ma@yale.edu
 
@@ -19,7 +19,7 @@ set -euo pipefail
 # Stage 1 therefore re-retrieves the whole split at w_cov=0 (CPU, slow) before stage 2 applies
 # the same listwise reranker the other arms use.
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 cd "${REPO_ROOT}"
 

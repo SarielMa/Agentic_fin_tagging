@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_bl_wcov1.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_bl_wcov1.txt
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=linhai.ma@yale.edu
 
@@ -22,7 +22,7 @@ set -euo pipefail
 QUERY_MODE="${1:?usage: $0 <query_mode> <output_dir>}"
 OUTPUT_DIR="${2:?usage: $0 <query_mode> <output_dir>}"
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 CONDA_ENV="${CONDA_ENV:-finben_b200}"
 TEST_JSONL="${TEST_JSONL:-${REPO_ROOT}/data/test/test.jsonl}"

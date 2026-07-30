@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 RUN_DIR="${REPO_ROOT}/runs/runs_ags_verifier_ablation/qwen3_32b"
 

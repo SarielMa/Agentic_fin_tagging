@@ -4,7 +4,7 @@ set -euo pipefail
 # Grounding experiments:
 #   Method-specific query generation -> BM25 candidates -> shared Qwen reranking/eval.
 
-REPO_ROOT="$(readlink -f "$(dirname "$0")")"
+REPO_ROOT="${FHS_ROOT:-$(readlink -f "$(dirname "$0")/..")}"
 PROJECT_ROOT="$(readlink -f "${REPO_ROOT}/..")"
 
 TEST_JSONL="${TEST_JSONL:-${REPO_ROOT}/data/test/test.jsonl}"

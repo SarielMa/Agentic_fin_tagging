@@ -27,6 +27,7 @@ stage is disabled for this mode (see the shell wiring) and the evaluator scores 
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,6 +65,15 @@ FROZEN_AGS_QUERY_MODE = "frozen_ags"
 # *independent* draws; with J=1 there is nothing to decorrelate, so sampling noise would only
 # add variance to a baseline whose whole job is to be a clean reference point.
 ONE_PASS_STRUCTURED_QUERY_MODE = "one_pass_structured"
+
+# Ensemble-size arms. The deployed J is 2; these exist to measure whether the fused ranking keeps
+# improving with more independent hypotheses on the TEST split, which the deployed trace cannot
+# answer because it stores only two. Everything except `hypotheses` is the deployed constant, so
+# the contrast is the ensemble size alone. Note the comparison is only paired WITHIN a run of one
+# of these modes: temperature-0.8 sampling is not reproducible, so a J=3 run's first two
+# hypotheses are not the deployed run's two, and its J=2 subset is not tab:ablation's FHS row.
+FROZEN_AGS_J3_QUERY_MODE = "frozen_ags_j3"
+FROZEN_AGS_J4_QUERY_MODE = "frozen_ags_j4"
 
 # Concepts whose own label must self-retrieve at rank 1 only when the coverage term is
 # active and correctly scaled (spec 9.2, assertion 2). Short generic labels that lose to
@@ -116,6 +126,27 @@ _FROZEN_VARIANTS: dict[str, dict[str, Any]] = {
         "label_coverage_weight": 1.0,
         "top_k": 200,
     },
+    # Pinned exactly like frozen_ags except for J. Adding these does not touch the two entries
+    # above, so the deployed variants stay asserted against the same constants they always were.
+    FROZEN_AGS_J3_QUERY_MODE: {
+        "hypotheses": 3,
+        "rerank_beta": 0.6,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 1.0,
+        "top_k": 200,
+    },
+    FROZEN_AGS_J4_QUERY_MODE: {
+        "hypotheses": 4,
+        "rerank_beta": 0.6,
+        "rrf_kappa": 60,
+        "label_coverage_weight": 1.0,
+        "top_k": 200,
+    },
+}
+
+_ENSEMBLE_SIZE_VARIANTS: dict[str, int] = {
+    FROZEN_AGS_J3_QUERY_MODE: 3,
+    FROZEN_AGS_J4_QUERY_MODE: 4,
 }
 
 
@@ -127,6 +158,17 @@ def one_pass_structured_config() -> FrozenAgsConfig:
         temperature=0.0,  # greedy, single sample
         variant=ONE_PASS_STRUCTURED_QUERY_MODE,
     )
+
+
+def ensemble_size_config(variant: str) -> FrozenAgsConfig:
+    """FHS with J changed and nothing else: same temperature 0.8, beta 0.6, kappa, K, w_cov."""
+    hypotheses = _ENSEMBLE_SIZE_VARIANTS.get(variant)
+    if hypotheses is None:
+        raise AssertionError(
+            f"{variant!r} is not an ensemble-size variant; expected one of "
+            f"{sorted(_ENSEMBLE_SIZE_VARIANTS)}"
+        )
+    return FrozenAgsConfig(hypotheses=hypotheses, variant=variant)
 
 
 def _assert_frozen(cfg: FrozenAgsConfig) -> None:
@@ -296,32 +338,78 @@ def sample_hypotheses(
     # At temperature 0 the decode is greedy and a nucleus cutoff is meaningless; pin top_p to
     # 1.0 so a stray --frozen-ags-top-p on the command line cannot make "greedy" ambiguous.
     generator.args.query_top_p = 1.0 if cfg.temperature == 0.0 else getattr(args, "frozen_ags_top_p", 1.0)
+    # The J samples share one prompt and one SamplingParams, so they can be issued as one batch
+    # instead of J calls of batch size 1. generate_many already chunks by vllm_batch_size (32 by
+    # default, so J<=4 is a single batch) and the engine runs with prefix caching, which makes the
+    # repeated prefill nearly free. Distributionally identical -- same prompt, same temperature,
+    # independent sequences -- but NOT token-identical to a serial run, because the two consume
+    # the sampler's randomness differently. FHS_BATCH_HYPOTHESES=0 restores the serial path so the
+    # two can be compared on the same code.
+    batched = os.environ.get("FHS_BATCH_HYPOTHESES", "1") == "1"
     try:
-        for sample_idx in range(cfg.hypotheses):
-            raw_output = generator.generate_one(prompt)
-            hypothesis, parse_ok = parse_hypothesis(raw_output, fallback)
-            if not parse_ok:
-                # Retry once, then drop.
+        if batched:
+            # ARM: issue the J samples as one batch instead of J calls of batch size 1. They share
+            # one prompt and one SamplingParams, generate_many already chunks by vllm_batch_size
+            # (32 by default, so J<=4 is one batch), and the engine runs with prefix caching, so
+            # the repeated prefill is nearly free. Distributionally identical to the serial arm --
+            # same prompt, same temperature, independent sequences -- but NOT token-identical,
+            # because the two consume the sampler's randomness differently.
+            raw_outputs = list(generator.generate_many([prompt] * cfg.hypotheses))
+            parsed = [parse_hypothesis(raw, fallback) for raw in raw_outputs]
+            # Retry failures once, as one more batch. The serial arm logs only the retried output
+            # for a failed sample, so a retry replaces the row rather than adding one.
+            retry_slots = [i for i, (_, ok) in enumerate(parsed) if not ok]
+            if retry_slots:
+                retries = list(generator.generate_many([prompt] * len(retry_slots)))
+                for slot, raw in zip(retry_slots, retries):
+                    raw_outputs[slot] = raw
+                    parsed[slot] = parse_hypothesis(raw, fallback)
+            for sample_idx, (raw_output, (hypothesis, parse_ok)) in enumerate(zip(raw_outputs, parsed)):
+                calls.append(
+                    llm_call_record(
+                        f"{cfg.variant}_hypothesis",
+                        raw_output=raw_output,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=generator.count_text_tokens(raw_output),
+                        parse_ok=parse_ok,
+                        backend=generator.backend,
+                        model_name=generator.model_name,
+                        extra_fields={
+                            "sample_idx": sample_idx,
+                            "used_context_max_chars": used_context_chars,
+                            "batched": True,
+                        },
+                    )
+                )
+                if parse_ok:
+                    hypothesis["hypothesis_idx"] = len(hypotheses)
+                    hypotheses.append(hypothesis)
+        else:
+            for sample_idx in range(cfg.hypotheses):
                 raw_output = generator.generate_one(prompt)
                 hypothesis, parse_ok = parse_hypothesis(raw_output, fallback)
-            calls.append(
-                llm_call_record(
-                    f"{cfg.variant}_hypothesis",
-                    raw_output=raw_output,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=generator.count_text_tokens(raw_output),
-                    parse_ok=parse_ok,
-                    backend=generator.backend,
-                    model_name=generator.model_name,
-                    extra_fields={
-                        "sample_idx": sample_idx,
-                        "used_context_max_chars": used_context_chars,
-                    },
+                if not parse_ok:
+                    # Retry once, then drop.
+                    raw_output = generator.generate_one(prompt)
+                    hypothesis, parse_ok = parse_hypothesis(raw_output, fallback)
+                calls.append(
+                    llm_call_record(
+                        f"{cfg.variant}_hypothesis",
+                        raw_output=raw_output,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=generator.count_text_tokens(raw_output),
+                        parse_ok=parse_ok,
+                        backend=generator.backend,
+                        model_name=generator.model_name,
+                        extra_fields={
+                            "sample_idx": sample_idx,
+                            "used_context_max_chars": used_context_chars,
+                        },
+                    )
                 )
-            )
-            if parse_ok:
-                hypothesis["hypothesis_idx"] = len(hypotheses)
-                hypotheses.append(hypothesis)
+                if parse_ok:
+                    hypothesis["hypothesis_idx"] = len(hypotheses)
+                    hypotheses.append(hypothesis)
     finally:
         generator.args.query_temperature = original_temperature
         generator.args.query_top_p = original_top_p

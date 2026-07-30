@@ -6,7 +6,7 @@
 #SBATCH --gpus=b200:1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
-#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs%j_verifier_abl_%x.txt
+#SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/fhs/logs/%j_verifier_abl_%x.txt
 #SBATCH --mail-user=linhai.ma@yale.edu
 
 set -euo pipefail
@@ -40,7 +40,7 @@ set -euo pipefail
 #   ARM=no_llm must come back at accuracy 0.2375; anything else means this path diverges from
 #   the deployed pipeline and the other arms should not be trusted.
 
-FHS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+FHS_ROOT="${FHS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 REPO_ROOT="${FHS_ROOT}"
 # Environment, copied verbatim from apply_server_ags_bridge_deployed_rerank.sh. The B200 needs
 # the finben_b200 conda env: the default finben env's PyTorch is built for sm_50-sm_90 and
