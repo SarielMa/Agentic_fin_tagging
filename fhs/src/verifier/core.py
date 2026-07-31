@@ -14,7 +14,7 @@ agreement layer -- and writes to its own `runs_ags_table5_ablation/` output tree
 this package edits a file the rest of the pipeline depends on.
 
 Nine of eleven rows are pure re-analysis of already-logged AGS candidate lists: no new
-generation, no new retrieval (see verifier/data_prep.py for where those lists
+generation, no new retrieval (see ags_table5_ablation/data_prep.py for where those lists
 come from). Only `llm_verifier` (row 3.9) and the index ablation (row 3.10, a separate panel
 handled in run_index_ablation.py) touch anything beyond this module's own arithmetic.
 """
@@ -626,8 +626,6 @@ def _consensus_for(
             config.llm_verifier_verdicts,
             config.llm_verifier_dimensions,
             unjudged_fill=config.llm_unjudged_fill,
-            global_weights=(dict(config.llm_verifier_dimension_weights)
-                            if config.llm_verifier_dimension_weights else None),
         )
     elif mode in ("llm_drop", "llm_strict", "llm_neutral", "llm_varweight"):
         result = llm_only_consensus_scores(

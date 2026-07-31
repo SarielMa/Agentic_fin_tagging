@@ -58,7 +58,6 @@ from run_fintagging_grounding_baseline import (  # noqa: E402
     serialize_evidence,
 )
 
-
 # The six dimensions the generator actually emits. SYMBOLIC_DIMENSIONS carries a seventh name,
 # AGGREGATION, that no hypothesis ever fills (measured 0/1,200), so it is deliberately not here.
 ALL_JUDGED_DIMENSIONS = ("FAMILY", "ROLE", "EVENT", "QUALIFIER", "SCOPE", "TEMPORAL")
@@ -152,7 +151,7 @@ def parse_args() -> argparse.Namespace:
         "--window-tags",
         type=Path,
         default=None,
-        help="JSONL of per-fact windows written by analysis/stage_arm_windows.py: "
+        help="JSONL of per-fact windows written by stage_arm_windows.py: "
         '{"fact_id", "hypothesis_indices", "window_tags"}. Given, it REPLACES --window-source: '
         "the window is the listed tags in the listed order and only the listed hypotheses are "
         "judged. This is how an ablation arm gets verdicts over its OWN fused ranking instead "

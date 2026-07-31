@@ -148,7 +148,7 @@ if [[ "${JUDGE_DIMENSIONS:-llm}" == "legacy" ]]; then
   QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-1536}"
 fi
 QUERY_MAX_NEW_TOKENS="${QUERY_MAX_NEW_TOKENS:-2816}"
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs/runs_ags_table5_ablation/qwen3_32b}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs_ags_table5_ablation/qwen3_32b}"
 RESUME_ARGS=()
 if [[ "${RESUME:-1}" == "1" ]]; then
   RESUME_ARGS=(--resume)
@@ -174,17 +174,17 @@ echo "============================================================"
 # and fails in argparse a minute later, after the queue wait.
 for _flag in "--judge-dimensions ${JUDGE_DIMENSIONS:-llm}" "--hint-dimensions ${HINT_DIMENSIONS:-llm}"; do
   set -- ${_flag}
-  if ! python "${VERIFIER_PY:-${REPO_ROOT}/src/verifier/run_llm_verifier.py}" --help 2>/dev/null \
+  if ! python "${VERIFIER_PY:-${REPO_ROOT}/ags_table5_ablation/run_llm_verifier.py}" --help 2>/dev/null \
        | tr -d " \n" | grep -q "$(echo "$1" | sed 's/^--//')"; then continue; fi
-  if ! python "${VERIFIER_PY:-${REPO_ROOT}/src/verifier/run_llm_verifier.py}" "$1" "$2" --help >/dev/null 2>&1; then
+  if ! python "${VERIFIER_PY:-${REPO_ROOT}/ags_table5_ablation/run_llm_verifier.py}" "$1" "$2" --help >/dev/null 2>&1; then
     echo "FATAL: ${1} ${2} is not accepted by run_llm_verifier.py. Its choices changed; fix the wrapper." >&2
     exit 2
   fi
 done
 
-python -m py_compile src/verifier/run_llm_verifier.py
+python -m py_compile ags_table5_ablation/run_llm_verifier.py
 
-# Defaults to the gold-instance test trace. Point it at any run's
+# Defaults to the gold-instance test trace. Point it at a fulltagging run's
 # bm25_candidates.jsonl to verify the extractor-driven pipeline instead; the two traces share
 # the frozen_ags_hypotheses / final_candidates schema this script reads.
 TRACE_ARGS=()
@@ -192,20 +192,20 @@ if [[ -n "${TEST_TRACE:-}" ]]; then
   TRACE_ARGS=(--test-trace "${TEST_TRACE}")
 fi
 
-# WINDOW_TAGS points at a per-arm window file from analysis/stage_arm_windows.py. With it the
-# verifier judges that arm's OWN fused head instead of the deployed one, which is what lets an
-# ablation row be scored by the LLM-only verifier. Without it nothing changes.
+# WINDOW_TAGS points at a per-arm window file from stage_arm_windows.py. With it the verifier
+# judges that arm's OWN fused head instead of the deployed one, which is what lets an ablation
+# row be scored by the LLM-only verifier. Without it nothing changes.
 WINDOW_TAG_ARGS=()
 if [[ -n "${WINDOW_TAGS:-}" ]]; then
   if [[ ! -f "${WINDOW_TAGS}" ]]; then
-    echo "WINDOW_TAGS=${WINDOW_TAGS} does not exist; run analysis/stage_arm_windows.py first." >&2
+    echo "WINDOW_TAGS=${WINDOW_TAGS} does not exist; run stage_arm_windows.py first." >&2
     exit 1
   fi
   WINDOW_TAG_ARGS=(--window-tags "${WINDOW_TAGS}")
   echo "WINDOW_TAGS=${WINDOW_TAGS}"
 fi
 
-python src/verifier/run_llm_verifier.py \
+python ags_table5_ablation/run_llm_verifier.py \
   --output-dir "${OUTPUT_DIR}" \
   "${TRACE_ARGS[@]}" \
   --top-m "${TOP_M}" \

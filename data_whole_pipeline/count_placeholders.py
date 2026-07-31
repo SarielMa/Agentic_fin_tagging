@@ -16,10 +16,21 @@ for i, line in enumerate(lines):
     if s.startswith(r"\end{table") and stack:
         stack.pop()
 
+def is_placeholder(cell: str) -> bool:
+    """A cell holding nothing but a -- placeholder, with or without the \\ph colour wrapper.
+
+    Placeholder cells are written \\ph{--} so they show red in the draft; matching only the
+    bare -- would report 0 for a table that is entirely unfilled.
+    """
+    c = cell.strip()
+    c = re.sub(r"^\\(?:ph|upd)\{(.*)\}$", r"\1", c).strip()
+    return c == "--"
+
+
 n = 0
 for a, b in spans.values():
     for j in range(a, b):
         row = lines[j].rstrip()
-        if row.endswith(r"\\") and any(c.strip() == "--" for c in row.removesuffix(r"\\").split("&")):
+        if row.endswith(r"\\") and any(is_placeholder(c) for c in row.removesuffix(r"\\").split("&")):
             n += 1
 print(n)

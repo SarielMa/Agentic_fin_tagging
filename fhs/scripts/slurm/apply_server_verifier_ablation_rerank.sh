@@ -189,7 +189,7 @@ case "${ARM}" in
     ;;
 esac
 
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs/runs_ags_verifier_ablation/qwen3_32b/rerank_${ARM}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/runs_ags_verifier_ablation/qwen3_32b/rerank_${ARM}}"
 RANKING="${OUTPUT_DIR}/bm25_candidates.jsonl"
 
 export TEST_JSONL="${TEST_JSONL:-${REPO_ROOT}/data/test/test.jsonl}"
@@ -222,7 +222,7 @@ if [[ ! -f "${RANKING}" ]]; then
   # reranked final_candidates. Every rerank_* dir produced before 2026-07-28 used it, so the
   # Final Acc. column of the LLM-consuming arms was confounded even after the retrieval-stage
   # numbers were regenerated. Point this at verdicts_k10_fused to get a clean Final column.
-  python "${REPO_ROOT}/src/verifier/dump_reranked_ranking.py" \
+  python "${REPO_ROOT}/ags_table5_ablation/dump_reranked_ranking.py" \
     --verifier-mode "${MODE}" \
     --beta "${BETA}" \
     ${TOP_M_FLAG} \
@@ -238,7 +238,7 @@ fi
 # Stage 2 (GPU): the identical listwise reranker every other reported number uses.
 # --query-mode must match the staged file's own query_mode tag, which the dump preserves.
 echo "--- listwise rerank for ${ARM} ---"
-python "${REPO_ROOT}/src/run_fintagging_grounding_baseline.py" \
+python "${REPO_ROOT}/run_fintagging_grounding_baseline.py" \
   --test-jsonl "${TEST_JSONL}" \
   --output-dir "${OUTPUT_DIR}" \
   --query-mode frozen_ags \

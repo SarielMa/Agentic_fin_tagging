@@ -53,7 +53,7 @@ submit_gpu_arm () {
     --partition=gpu_b200 \
     --gpus=b200:1 \
     --nodes=1 \
-    --cpus-per-task=8 \
+    --cpus-per-task=1 \
     --mem=256G \
     --time="${time_limit}" \
     --job-name="codiesp_${query_mode}_full_${suffix}" \

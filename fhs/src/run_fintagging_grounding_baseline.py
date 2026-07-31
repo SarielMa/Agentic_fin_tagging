@@ -94,10 +94,6 @@ QUERY_MODE_ALIASES = {
     "ags_j1": "one_pass_structured",
     "one_pass_structured": "one_pass_structured",
     "one_pass_grounding_structured": "one_pass_structured",
-    "frozen_ags_j3": "frozen_ags_j3",
-    "fhs_j3": "frozen_ags_j3",
-    "frozen_ags_j4": "frozen_ags_j4",
-    "fhs_j4": "frozen_ags_j4",
 }
 MULTI_ROUND_QUERY_MODES = {
     "intrinsic_self_refinement",
@@ -114,10 +110,6 @@ MULTI_ROUND_QUERY_MODES = {
     "ags_seq_random",
     "seq_verifier",
     "one_pass_structured",
-    # Same code path as frozen_ags, J differs only. Must be registered here too, or the record
-    # builder is never reached and build_retrieval_query rejects the mode.
-    "frozen_ags_j3",
-    "frozen_ags_j4",
 }
 LLM_QUERY_MODES = MULTI_ROUND_QUERY_MODES | {"one_pass_grounding"}
 STRUCTURED_QUERY_MODES = {"operator_refinement", "memory_guided_refinement"}
@@ -129,13 +121,8 @@ FROZEN_AGS_QUERY_MODES = {"frozen_ags"}
 # range-normalized sum-RRF score alone. Shares frozen_ags's startup assertions and record
 # builder; only the config constants differ (ags_frozen_grounding._FROZEN_VARIANTS).
 ONE_PASS_STRUCTURED_QUERY_MODES = {"one_pass_structured"}
-# Ensemble-size arms: the deployed frozen config with J changed and nothing else. They exist to
-# measure J=3/J=4 on test, which the deployed trace cannot answer (it stores two hypotheses).
-ENSEMBLE_SIZE_QUERY_MODES = {"frozen_ags_j3", "frozen_ags_j4"}
 # Everything that runs through ags_frozen_grounding.build_frozen_ags_method_record.
-FROZEN_AGS_FAMILY_QUERY_MODES = (
-    FROZEN_AGS_QUERY_MODES | ONE_PASS_STRUCTURED_QUERY_MODES | ENSEMBLE_SIZE_QUERY_MODES
-)
+FROZEN_AGS_FAMILY_QUERY_MODES = FROZEN_AGS_QUERY_MODES | ONE_PASS_STRUCTURED_QUERY_MODES
 # The two sequential negative-control arms start from frozen_ags's round one and differ
 # from each other only in directive selection (see ags_sequential_arms).
 AGS_SEQ_QUERY_MODES = {"ags_seq", "ags_seq_random"}
@@ -3515,22 +3502,19 @@ def build_comparison_candidate_records(
         from ags_frozen_grounding import (
             FrozenAgsConfig,
             build_frozen_ags_method_record,
-            ensemble_size_config,
             frozen_ags_startup_assertions,
             one_pass_structured_config,
         )
         from ags_symbolic_agreement import DEFAULT_NORMALIZATION_MAP, load_normalization_map
 
-        # Same startup assertions for all of them: the one-pass baseline must prove the retriever,
+        # Same startup assertions for both: the one-pass baseline must prove the retriever,
         # taxonomy and vocabulary are in exactly the state AGS requires, or the "identical
-        # except J=1" claim is unverified. The J=3/J=4 arms are asserted against their own pinned
-        # constants, which differ from frozen_ags only in `hypotheses`.
-        if query_mode in ONE_PASS_STRUCTURED_QUERY_MODES:
-            frozen_ags_config = one_pass_structured_config()
-        elif query_mode in ENSEMBLE_SIZE_QUERY_MODES:
-            frozen_ags_config = ensemble_size_config(query_mode)
-        else:
-            frozen_ags_config = FrozenAgsConfig()
+        # except J=1" claim is unverified.
+        frozen_ags_config = (
+            one_pass_structured_config()
+            if query_mode in ONE_PASS_STRUCTURED_QUERY_MODES
+            else FrozenAgsConfig()
+        )
         retriever.label_coverage_weight = frozen_ags_config.label_coverage_weight
         retriever.label_coverage_pool_multiplier = args.label_coverage_pool_multiplier
         frozen_ags_normalization_map = load_normalization_map(

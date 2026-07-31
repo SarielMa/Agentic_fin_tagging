@@ -2,7 +2,7 @@
 """Table 3 / Table 13: verification quality, on the FROZEN TEST SPLIT.
 
 Replaces the development-set placeholders that
-an earlier development-set run produced (250 tabular facts from the
+`run_ags_feedback_verdict_accuracy.py` produced (250 tabular facts from the
 coverage-pilot sample, n=5,765 dimension verdicts). Same question, same
 estimator, same ground-truth definition -- different data.
 
@@ -37,7 +37,7 @@ a paired claim rather than two unrelated measurements.
   llm            read verbatim from runs_ags_table5_ablation/qwen3_32b/
                  llm_verifier_calls.jsonl -- the full-test rerun (5,018 calls =
                  2,509 facts x 2 hypotheses, parse_rate 1.0) over the SAME
-                 representatives, judging FAMILY/ROLE/EVENT only. Its
+                 representatives, judging all six dimensions. Its
                  per-candidate judgements are folded up to a dimension verdict
                  with the identical >=0.6 / <=0.25 support-fraction thresholds
                  the deterministic layer uses, so the two differ in who judges,
@@ -45,9 +45,11 @@ a paired claim rather than two unrelated measurements.
   merged         `merge_feedback_layers(deterministic, llm)`, the production
                  merge.
 
-The LLM layer abstains on QUALIFIER/SCOPE/TEMPORAL by construction. Those rows
-stay in the denominator, exactly as on dev: an abstention is a missed
-detection, and suppressing them would flatter the LLM layer.
+Both layers are scored on the same six dimensions (the deployed ask-6/score-6
+contract). Where the LLM does abstain the row stays in the denominator, exactly
+as on dev: an abstention is a missed detection, and suppressing them would
+flatter the LLM layer. --llm-dimensions legacy restores the three-dimension
+scoring the pre-2026-07-30 verdict files were generated under.
 
 Table 13's closing note -- verification quality under learned versus random
 operator selection -- is a separate pass over the two sequential arms' test
@@ -83,6 +85,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from ags_sequential_arms import cluster_representatives
+from verifier.core import LLM_VERIFIER_DIMENSIONS_DEFAULT  # noqa: E402
 from ags_symbolic_agreement import (
     DEFAULT_NORMALIZATION_MAP,
     VERDICT_CONTRADICT,
@@ -121,7 +124,16 @@ DEFAULT_SEQ_TRACES = {
 
 # The layer names the paper uses. "deterministic" is the symbolic verifier.
 SOURCES = ("deterministic", "llm", "merged")
-LLM_DIMENSIONS = ("FAMILY", "ROLE", "EVENT")
+# Deployed contract since 2026-07-30: the verifier is asked all six dimensions and scored on
+# all six, so this layer must score six too. "legacy" is the three-dimension set the older
+# verdict files were generated under and exists only to read them: scoring a six-dimension
+# file under it reports coverage 0.0 on QUALIFIER/SCOPE/TEMPORAL, which is indistinguishable
+# from the LLM abstaining.
+LLM_DIMENSION_SETS = {
+    "deployed": LLM_VERIFIER_DIMENSIONS_DEFAULT,
+    "legacy": ("FAMILY", "ROLE", "EVENT"),
+}
+LLM_DIMENSIONS = LLM_DIMENSION_SETS["deployed"]
 LAYERS = ("exact", "lexical")
 
 # Same thresholds symbolic_feedback_from_candidates applies, so the two layers
@@ -147,6 +159,17 @@ def parse_args() -> argparse.Namespace:
         choices=("compact", "full"),
         default="compact",
         help="compact mirrors the tag/label/type view the verifier scored candidates under.",
+    )
+    parser.add_argument(
+        "--llm-dimensions",
+        choices=tuple(LLM_DIMENSION_SETS),
+        default="deployed",
+        help=(
+            "Dimension set the LLM layer is scored on. 'deployed' is the six the verifier "
+            "actually judges; 'legacy' is the three the pre-2026-07-30 verdict files carry. "
+            "Reading a six-dimension file under 'legacy' reports coverage 0.0 on the three it "
+            "drops, which is indistinguishable from the LLM abstaining."
+        ),
     )
     parser.add_argument("--top-m", type=int, default=10, help="Must match the LLM verifier run's --top-m.")
     parser.add_argument("--cluster-scan-depth", type=int, default=60)
@@ -909,7 +932,10 @@ def paired_arm_bootstrap(
 
 
 def main() -> None:
+    global LLM_DIMENSIONS
     args = parse_args()
+    LLM_DIMENSIONS = LLM_DIMENSION_SETS[args.llm_dimensions]
+    print(f"LLM layer scored on {len(LLM_DIMENSIONS)} dimensions: {', '.join(LLM_DIMENSIONS)}", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     for path in (args.test_trace, args.llm_calls, args.taxonomy_jsonl):

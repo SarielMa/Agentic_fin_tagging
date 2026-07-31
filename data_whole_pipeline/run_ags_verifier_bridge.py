@@ -64,6 +64,7 @@ from run_fintagging_grounding_baseline import (
     load_taxonomy,
     normalize_tag,
 )
+from ags_table5_ablation.core import LLM_VERIFIER_DIMENSIONS_DEFAULT
 
 
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "runs_ags_verifier_bridge" / "qwen3_32b"
@@ -85,7 +86,14 @@ DEFAULT_DEPLOYED_METRICS_WITH_LLM = (
     SCRIPT_DIR / "runs_ags_verifier_bridge" / "qwen3_32b" / "deployed_rerank" / "metrics.json"
 )
 
-LLM_DIMENSIONS = ("FAMILY", "ROLE", "EVENT")
+# Deployed contract since 2026-07-30: asked six, scored six. "legacy" reads the older
+# three-dimension verdict files; under it a six-dimension file silently contributes nothing
+# on QUALIFIER/SCOPE/TEMPORAL, which is indistinguishable from the LLM abstaining.
+LLM_DIMENSION_SETS = {
+    "deployed": LLM_VERIFIER_DIMENSIONS_DEFAULT,
+    "legacy": ("FAMILY", "ROLE", "EVENT"),
+}
+LLM_DIMENSIONS = LLM_DIMENSION_SETS["deployed"]
 SWEEP_THRESHOLDS = (0.00, 0.10, 0.25, 0.40, 0.50, 0.60, 0.75, 0.90)
 RETRIEVAL_METRICS = ("recall_at_10", "recall_at_50", "recall_at_200", "mrr", "top1_accuracy")
 
@@ -114,6 +122,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taxonomy-jsonl", type=Path, default=DEFAULT_TAXONOMY_JSONL)
     parser.add_argument("--normalization-map", type=Path, default=DEFAULT_NORMALIZATION_MAP)
     parser.add_argument("--gold-candidate-fields", choices=("compact", "full"), default="compact")
+    parser.add_argument(
+        "--llm-dimensions",
+        choices=tuple(LLM_DIMENSION_SETS),
+        default="deployed",
+        help="Dimension set the LLM layer is read on. 'deployed' is the six the verifier "
+        "judges; 'legacy' is the three the pre-2026-07-30 verdict files carry.",
+    )
     parser.add_argument("--top-m", type=int, default=10)
     parser.add_argument("--cluster-scan-depth", type=int, default=60)
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
@@ -851,7 +866,10 @@ def latex_rows(a: dict[str, Any], b: dict[str, Any]) -> str:
 
 
 def main() -> None:
+    global LLM_DIMENSIONS
     args = parse_args()
+    LLM_DIMENSIONS = LLM_DIMENSION_SETS[args.llm_dimensions]
+    print(f"LLM layer read on {len(LLM_DIMENSIONS)} dimensions: {', '.join(LLM_DIMENSIONS)}", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     required = [args.test_trace, args.llm_calls, args.llm_summary, args.ablation_csv, args.reranker_row_csv, args.taxonomy_jsonl]

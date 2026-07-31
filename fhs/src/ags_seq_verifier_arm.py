@@ -45,7 +45,7 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "verifier"))
+sys.path.insert(0, str(REPO / "ags_table5_ablation"))
 
 from ags_sequential_arms import (  # noqa: E402
     DIMENSION_OPERATOR,
@@ -106,7 +106,7 @@ def verify_window(
         # generate_many takes rendered prompt strings, not chat messages, and the context has
         # to be trimmed to the token budget before it gets there -- both are what
         # build_prompt_under_query_budget does, and it is the same call the one-shot verifier
-        # in verifier/run_llm_verifier.py makes, so the two arms send identical prompts.
+        # in run_llm_verifier.py makes, so the two arms send identical prompts.
         prompt, _prompt_tokens, _used_chars = build_prompt_under_query_budget(
             generator.tokenizer,
             lambda ctx_chars, hypothesis=hypothesis: build_verifier_messages(

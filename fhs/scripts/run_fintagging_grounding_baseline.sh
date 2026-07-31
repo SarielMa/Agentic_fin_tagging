@@ -54,7 +54,7 @@ case "${QUERY_MODE}" in
     DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
     ;;
 esac
-DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs/runs_fintagging_grounding_baseline/${DEFAULT_METHOD_DIR}"
+DEFAULT_OUTPUT_DIR="${REPO_ROOT}/runs_fintagging_grounding_baseline/${DEFAULT_METHOD_DIR}"
 OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 
 TOP_K="${TOP_K:-200}"
@@ -161,7 +161,7 @@ require_path () {
   fi
 }
 
-require_path "${REPO_ROOT}/src/run_fintagging_grounding_baseline.py" "grounding baseline script"
+require_path "${REPO_ROOT}/run_fintagging_grounding_baseline.py" "grounding baseline script"
 require_path "${TEST_JSONL}" "context tagging test JSONL"
 require_path "${TAXONOMY_JSONL}" "enriched retrieval taxonomy"
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${HF_HUB_CACHE}" "${TRANSFORMERS_CACHE}"
@@ -323,4 +323,4 @@ echo "RESUME               : ${RESUME}"
 echo "LIMIT                : ${LIMIT:-<none>}"
 echo "============================================================"
 
-python "${REPO_ROOT}/src/run_fintagging_grounding_baseline.py" "${ARGS[@]}"
+python "${REPO_ROOT}/run_fintagging_grounding_baseline.py" "${ARGS[@]}"

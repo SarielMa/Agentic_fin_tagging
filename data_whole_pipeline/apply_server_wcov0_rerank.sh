@@ -82,11 +82,22 @@ export RERANK_MODEL="${RERANK_MODEL:-Qwen/Qwen3-32B}"
 export RERANK_BACKEND="${RERANK_BACKEND:-vllm}"
 export RERANK_LIST_SIZE="${RERANK_LIST_SIZE:-20}"
 
+# VERDICTS attaches this arm's OWN verdicts, generated against its OWN w_cov=0 window
+# (stage_arm_windows.py on the stage-1 dump -> run_llm_verifier.py --window-tags). Without it
+# the rerank term has no LLM support to consume and the row is a re-retrieval with no
+# candidate-level verifier, which is not comparable to the other rows of tab:ablation.
+if [[ -n "${VERDICTS:-}" && ! -f "${VERDICTS}" ]]; then
+  echo "VERDICTS=${VERDICTS} does not exist." >&2
+  exit 1
+fi
+
 if [[ ! -f "${RANKING}" ]]; then
   echo "--- re-retrieving at w_cov=0 and dumping ranking ---"
+  echo "    verdicts: ${VERDICTS:-<none: no candidate-level verifier>}"
   python "${REPO_ROOT}/ags_table5_ablation/dump_index_ablation_ranking.py" \
     --label-coverage-weight 0.0 \
     --beta 0.6 \
+    ${VERDICTS:+--llm-verifier-verdicts "${VERDICTS}"} \
     --output "${RANKING}.partial.${SLURM_JOB_ID:-$$}" \
     --summary "${OUTPUT_DIR}/ranking_summary.json" \
     ${LIMIT:+--limit "${LIMIT}"}

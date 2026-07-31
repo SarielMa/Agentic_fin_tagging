@@ -7,8 +7,8 @@ THE PROBLEM THIS SOLVES
     the deployed J=2 dual-rendering summed-RRF score. Every arm therefore inherits FHS's window,
     which is why the rendering/ensemble/fusion rows of tab:ablation could only ever be scored with
     the deterministic term: their own heads are 76-84% covered by FHS's verdicts, not 100%
-    (`analysis/check_ablation_window_coverage.py`). This script computes each arm's own top-M cluster
-    representatives from `verifier.core`, and `run_llm_verifier.py --window-tags` reads
+    (`check_ablation_window_coverage.py`). This script computes each arm's own top-M cluster
+    representatives from `ags_table5_ablation.core`, and `run_llm_verifier.py --window-tags` reads
     them, so the verifier judges the candidates that arm actually ranks first.
 
 WHAT IT GUARANTEES BEFORE ANY GPU TIME IS SPENT
@@ -27,7 +27,7 @@ CPU only, about a minute per arm.
     ./stage_arm_windows.py --arm ensemble_idx0 --arm ensemble_idx1 --arm def_only \
         --arm lab_only --arm mean_fusion
     ./stage_arm_windows.py --arm full --verify-against \
-        runs/runs_ags_verifier_ablation/qwen3_32b/verdicts_k10_fused/llm_verifier_verdicts.json
+        runs_ags_verifier_ablation/qwen3_32b/verdicts_k10_fused/llm_verifier_verdicts.json
 """
 
 from __future__ import annotations
@@ -105,6 +105,9 @@ def trace_tags(path: Path, limit: int | None) -> dict[int, set[str]]:
                 break
             record = json.loads(line)
             fact_id = int(record["example_idx"])
+            # Candidate objects live in the per-round lists as well; a fused head computed from
+            # those rounds can contain a tag that the record's own top-K final list dropped. Only
+            # looking at final_candidates lost 4.9% of the w_cov=0 arm's window.
             pool = list(record.get("final_candidates") or record.get("candidates") or [])
             for round_record in record.get("rounds") or []:
                 pool.extend(round_record.get("candidates") or [])

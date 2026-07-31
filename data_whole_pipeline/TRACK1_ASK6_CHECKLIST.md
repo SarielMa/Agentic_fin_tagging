@@ -230,3 +230,259 @@ token 分叉。这一批 phase 0 先把已发表的 `query_descriptions.jsonl` �
    另外 `selected_betas.json` 里 `raw` 这一项是 0.2,但论文的 `− score norm.` 用的是
    **β=0.6 的"deliberately untuned"那一版**(`raw_at_0.6`),wrapper 里也确实是 0.6 —— 一致,
    但别被那个 0.2 的条目误导。
+
+## 批次进度 — 2026-07-30 12:2x(26 个 job 的第一次盘点)
+
+已完成 11:`w1_direct` 20488395、`w1_freetext` 20488396、`v6_full` 20488402、`v6_def_only` 20488403、
+`v6_lab_only` 20488404、`v6_ensemble_idx0` 20488405、`v6_ensemble_idx1` 20488406、
+`v6_mean_fusion` 20488407、`v6_k5` 20488408、`r6_no_determ` 20488410,外加批次外的
+`codiesp_direct_retrieval_full_wcov0` 20488374。
+在跑/排队 10:`v6_k20` 20488409、6 个 `r6_llmonly_*` 20488411-16、4 个 `seqvf_s*` 20488417-20。
+
+**超时 5 个,全在 phase 1 的 w_cov=1 基线**(其余 21 个没有一个超时):
+
+| job | 死在哪 | 已完成 | 续跑 job | 新 walltime |
+|---|---|---|---|---|
+| 20488397 `w1_par_iid` | rerank | 候选 2509/2509,rerank 1792/2509 | **20559656** | 2:30 |
+| 20488399 `w1_decomp` | rerank | 候选 2509/2509,rerank 1792/2509 | **20559657** | 2:30 |
+| 20488400 `w1_intrins` | rerank | 候选 2509/2509,rerank 480/2509 | **20559658** | 3:30 |
+| 20488401 `w1_feedbk` | rerank | 候选 2509/2509,rerank 992/2509 | **20559659** | 3:00 |
+| 20488398 `w1_par_div` | generation | traces 1730/2509,还没建候选 | **20559660** | 8:00 |
+
+**有 resume,所以不重跑**:`RESUME=1` → `run_fintagging_grounding_baseline.sh` 加 `--resume`,
+query_descriptions / grounding_traces / qwen_rerank_predictions 三个阶段都按 `example_idx`
+跳过已写入的行(`load_existing_predictions` / `load_existing_method_records`),再以 `mode="a"` 追加。
+续跑前逐个校验过:五个断点文件**都以完整 JSON 行 + 换行结尾**,追加不会写坏。
+四个 rerank 断点额外把 `REUSE_CANDIDATES` 从 0 改成 1,直接吃已完成的 2,509 行
+`bm25_candidates.jsonl`;`par_div` 没有候选文件,该开关按
+`reuse_candidates and candidates_path.exists()` 自动落空,等价于原样重续 generation。
+其余 export 与 `submit_ask6_batch_20260730.sh` 逐字一致(含 par_iid 的
+`PARALLEL_PROMPT_STYLE=plain` + `QUERY_TEMPERATURE=0.8`)。
+
+walltime 按实测速率给的:rerank 18-19 条/分(par_iid/decomp 还差 717 条≈0.6h,intrins 2029≈1.8h,
+feedbk 1517≈1.4h);par_div generation 5.9 条/分,还差 779 条≈2.2h,再加全量 2,509 条 rerank≈2.2h。
+
+**没有破冻结**:续跑脚本写在会话 scratchpad 里(`resubmit_w1_timeouts.sh`),只调用未改动的 wrapper,
+`data_whole_pipeline/` 里没有任何 `.py` / `.sh` 被碰过;job id 已追加进
+`ask6_batch_20260730_jobids.txt`。
+
+## 下一批:把 `− label coverage` 行改成"FHS 关掉 cov",而不是另一个脚本的重检索
+
+用户 2026-07-30 的判断:消融行必须是**同一个方法减掉一个组件**,所以这一行应该出自 FHS 本身,
+不该是 `run_index_ablation.py` 的独立重检索。同意,现在这行的四个数来自两个不同的 run,
+且没有候选级 verifier。
+
+**直接"在 FHS 里把 w_cov 设成 0"是做不到的,有三道硬闸(都不是 bug,是防漂移设计):**
+1. `ags_frozen_grounding.py` `frozen_ags_startup_assertions`:`retriever.label_coverage_weight <= 0`
+   直接 `AssertionError("frozen_ags requires ... w_cov > 0")`;
+2. 同文件 `_FROZEN_VARIANTS[frozen_ags]` 把 `label_coverage_weight` 钉死 1.0,`_assert_frozen`
+   查到不等就报 config drifted;
+3. `run_fintagging_grounding_baseline.py:3540` 的 `--label-coverage-weight` 覆盖分支,一旦与
+   frozen 变体钉住的值冲突就 `SystemExit`。
+
+**不用碰这三道闸也能拿到用户要的东西**:w_cov 只作用在检索打分,假设生成在检索之前,所以
+"FHS 关掉 cov"= 拿 **FHS 自己的假设**在 w_cov=0 下重新融合 —— 这正是
+`ags_table5_ablation/dump_index_ablation_ranking.py` 的功能,而且它已经具备需要的一切:
+`--label-coverage-weight`、`--verifier-mode llm_drop`(默认)、`--llm-unjudged-fill mean`(默认,
+注意 AblationConfig 自己的默认是 `zero`)、就地重写 `rounds`(否则会复现 w_cov=1 的融合与窗口),
+并且在 w_cov=1 上做过 60/60 tag-for-tag 自检。这也和其余 7 个臂的做法一致:它们都是在同一份
+frozen trace 上改打分,而不是重新生成。
+
+**四步(0 处代码改动):**
+1. CPU:`dump_index_ablation_ranking.py --label-coverage-weight 0 --output .../trace_wcov0.jsonl`
+   (stage 1,不带 verdicts,产出前验证器融合序 + 重写过的 rounds);
+2. CPU:`stage_arm_windows.py` → `arm_windows/window_wcov0.jsonl`(该臂**自己的**融合排序);
+3. GPU ~2h30:verdict 生成,`--window-tags window_wcov0.jsonl`,问 6,输出 `verdicts_arm6_wcov0/`;
+4. GPU ~2h30:listwise rerank → `rerank_arm6_wcov0/metrics.json`,四列同源。
+
+完成后可以撤掉 tab:ablation caption 里那句"该行为检索阶段重检索、需对着 0.383 读"的说明,
+并把 `paper/PROVENANCE.md` 的对应条目改掉。参见 [[coverage-row-not-on-deployed-path]]。
+
+**执行时机:等这批 26 个全部排完再做。** 用户明确要求不要影响正在跑的 job,所以连第 1、2 步的
+CPU 部分也不提前跑 —— 冻结期内不往 `runs_ags_verifier_ablation/` 里写任何新文件。
+
+## 表格重写时的耦合编辑:sum vs mean fusion 的措辞
+
+问 6 的新数把 `− summed fusion` 与 FHS 的差抹平了,并在两项上翻转:
+
+| | R@10 | MRR | Acc |
+|---|---|---|---|
+| FHS(sum) | 0.3970 | 0.2573 | 0.2551 |
+| − summed fusion(mean) | 0.3938 | **0.2605** | **0.2555** |
+
+论文当前印的是 `0.401 against 0.384`(+0.017);新数是 +0.0032,且 MRR/Acc 上 mean 略高。
+两处必须与 tab:ablation 的数在**同一次提交**里改:
+
+1. §方法(`acl_latex_llmonly (2).tex` 第 145 行)"Summation rather than averaging is the one choice
+   here that is not standard, and it is deliberate ... the sum carries a multiplicity bonus ...
+   Table 5 replaces it with mean RRF and **reports the cost**" —— 现在没有 cost 可报,这句读起来
+   像在宣称机制性收益。降调成"开发集选型,测试集上与 mean 无实质差别"。
+2. §结果(第 299 行)"Summed rather than mean fusion is worth little (0.401 against 0.384
+   Recall@10)" —— 换数,并改成"在噪声内,mean 在 MRR/Acc 上名义更高"。
+
+**框架不用推翻**:开发集附录(第 502 行)已经预先写了"we treat this development contrast as a
+selection result rather than a general component claim",新数只让它更成立。
+
+**连带风险**:救回这个框架的那句是 "within test uncertainty",而 uncertainty 来自 std 列 ——
+那一列是建模估的、不是三种子实测(见 [[std-column-claims-3-seeds]])。"差异在噪声内"目前没有
+实测方差支撑,审稿人可以把这两点串起来。
+
+## review 清单 P0-1 已被问 6 解掉:`− ensemble (J=1)` 不再输给 one-pass structured
+
+reviewer 的矛盾陈述(`review/FHS-revision-checklist.md` 第 10-24 行):J=1 的 FHS 保留了 dual
+rendering 和 verifier,理应 ≥ one-pass structured,但旧表里 0.366/0.178 全面低于 0.372/0.203;
+而同一张表又说去掉 verifier 会让 MRR 从 0.257 掉到 0.205 —— 两者不能同时成立。
+
+问 6 之后解掉了(J=1 取 idx0/idx1 算术平均):
+
+| | R@10 | MRR | Acc |
+|---|---|---|---|
+| One-pass, structured | 0.3723 | 0.2027 | 0.2260 |
+| − ensemble (J=1) | 0.3824 | 0.2460 | 0.2429 |
+| FHS (full) | 0.3970 | 0.2573 | 0.2551 |
+
+清单给的两条出路是"配置有差异就写明"或"配置相同则是 bug 重跑";实际是第三种 —— 旧 verdict 只问
+三维,J=1 臂被削得最狠。
+
+**写正文时必须守住的三点:**
+
+1. **这两行的 "J=1" 不是同一个配置**,差三样:解码 T=0(贪心)vs T=0.8;β=0.0 vs 0.6;
+   无 verifier vs 有。所以 +0.043 MRR 不是"集成之外还剩什么",而是单假设下 verifier+β 的价值。
+   这同时回答了 reviewer 三个"需确认"里的前两个。
+2. **集成的是假设,不是验证器。** J=2 确实是每 fact 2 次 verifier 调用(实测 5018/2509=2.0),
+   但被融合的 ranking 数量同时从 1 变 2,这个消融分不开两者。J=1→full 的 **+0.011 MRR** 只能
+   归给"集成整体",不能归给"更多验证器"。真要分开需要一个新臂:J=2 生成、两份 ranking 照常
+   融合、但只消费一个假设的 verdict —— 现在没有。
+3. 建议正文分层写:one-pass structured →(+0.043 MRR,verifier+β)→ J=1 →(+0.011 MRR,集成)
+   → FHS full。
+
+**还没被证伪的一条**:reviewer 第 22 行 "J=1 时 fused range 极窄,β=0.6 可能被严重错配"。新数里
+J=1 不再垫底,但这个机制只是不再表现为异常,没有被排除。可用已有 per-fact 分数在 **CPU** 上直接
+查 J=1 的 fused range 分布,不需要 GPU。
+
+---
+
+# 2026-07-30 23:xx — 已把这一版填进论文(FHS-Seq 除外)
+
+活文件:`paper/acl_latex_llmonly (2).tex`。备份 `*.bak-before-ask6-fill-20260730`。
+**所有更新过的格子和句子都包在 `\upd{}` 里(红色)**;拿不到的值包在 `\ph{}` 里。
+DEV 表(`tab:devsample` / `tab:coveragegain` / `tab:pilot` / `tab:beta` / `tab:configabl`)按用户指示未动。
+
+## 改法
+不是按表改,是**先列出这一版会作废的旧值,再对全文 grep 出所有出现位置逐个看**。
+这一步抓到了只改表会漏的四处:`0.543` 在附录 615/643/646、`0.401` 在 621、`0.249` 在 887/890、
+`0.237` 在 Limitations 319。脚本留在会话 scratchpad。
+
+## 落地的表
+`tab:main_results`(7 基线 + FHS)、`tab:ablation`(6 行)、`tab:queryform`、`tab:evidence_type`(9 行)、
+`tab:llm_window_sensitivity`、`tab:verifierfull`、`tab:verifierbridge`、
+`tab:verifier_reranker_interaction`、`tab:retriever_robustness` 的两个 BM25 行。
+
+## 落地的正文
+§1 的 0.074/0.017、§3.3 的四个百分比、§4.1 主结果段(重写)、§4 消融段(重写)、
+§4 modality 段(重写)、§4.5 弃权那句、Limitations 的深度权衡、app:queryform 两个配对对比、
+app:window 的区间、app:seq 的 0.401→0.397 与 95%→94%。
+
+## 三条自洽性(机械核过,脚本在 scratchpad)
+① 一个框架:九个方法七项配置字段逐字相同,最后都调 `run_fintagging_grounding_baseline.py`,
+rerank flag 一致;② 一个方法:七个臂全部 `llm_drop` + `mean` + 六维 + `verdicts_arm6_*`,
+只有 β 按既定规则在两个臂上不同;③ 一个版本:八份 verdict 全 `dims=6` / `fused` / `parse_rate=1.0`,
+opportunity 逐个等于 `2509 × K_v × 2`。
+
+## 这一轮改的代码(都不在冻结集,precheck 过,双分支实测)
+- `run_ags_verification_quality.py` / `run_ags_verifier_bridge.py`:`LLM_DIMENSIONS` 由硬编码三维
+  改成 `--llm-dimensions {deployed,legacy}`,默认 **deployed=六维**。原来问6 的 verdict 被按三维计分,
+  QUALIFIER/SCOPE/TEMPORAL 的 coverage 全是 0.0,读起来像 LLM 弃权。两个分支都跑过:
+  deterministic 行逐位不变,只有 LLM 层变。
+- `count_placeholders.py`:现在也认 `\ph{--}`,否则整表未填会报 0。两个分支都测过。
+
+## 还欠的
+1. **FHS-Seq**:`tab:main_results` 一行 + `tab:seq_outcome` 六格是 `\ph{--}`;
+   §app:seq 和 Conclusion 里的结论句已改成"待测"而不是断言。20488418/19/20 明早跑完后填。
+2. `tab:efficiency` 的 FHS 延迟:六维 verifier 的 prompt 翻倍,7.7 s 是旧值,caption 里已标注待重测。
+3. `std` 列仍是解析估计(见 [[std-column-claims-3-seeds]]),这一轮没动。
+4. `verify_single_code_path.py` 的 PIN 还指着 ask-3 的目录名,证不了这批(见本文件上面那条未打勾项)。
+5. `paper/PROVENANCE.md` 的来源路径还没改到 arm6。
+
+## 2026-07-31 补:`tab:ablation` 三个未更新行的定性
+
+- `− verifier`:β=**0.0**、`llm_verdicts_used=0` → 重排项被乘掉,是纯融合排序。
+  旁证:R@50 / R@200 与 FHS 逐位相同(0.5428 / 0.7055)。问6 不作用于它,**不用改**。
+- `Program-driven score`:`verifier_mode=deterministic`、β=0.6、不读 verdict,这就是该行的定义。**不用改**。
+- `Oracle best single`:**不是"本来就对"**,是没修的偏差,而且不止打分项:
+  它 per-hypothesis 融合,**池子都不同**(R@200 0.7429 vs 其余全部 0.7055)。
+  caption 已补一句写明它不是 matched arm、只是假设集上的选择上界。修它要改窗口文件格式,不在这一批。
+
+# 2026-07-31 — Oracle 行修好了,零代码改动、零新 verdict
+
+## 清单里"必须改窗口格式"那句是错的
+窗口文件格式**一直有 `hypothesis_indices`**。真正的限制在读取端:
+`run_llm_verifier.py:643` 是 `arm_windows[fact_id] = {...}`,同一 fact 的第二行会覆盖第一行。
+
+**但这条限制根本用不着碰**,因为:`core._evaluate_oracle` 对假设 j 走的是
+`_rankings_for(fact,[j])` → `fuse` → `rerank(...,[j])`,**和 `ensemble_idx{j}` 臂是同一件事**。
+实测(`oracle_window_check.py`):oracle 的每假设 top-10 窗口与 `window_ensemble_idx{j}.jsonl`
+**2509/2509 逐个相同,两个假设都是**;`truncate_pool_to_top_k` 从未改变过 top-10。
+所以 `verdicts_arm6_ensemble_idx0/idx1` 正好就是 oracle 需要的 verdict。
+
+## 做法
+1. CPU:两份 verdict 拼接(键 `(fact_id, hypothesis_idx, tag)`,按 hypothesis_idx 天然不相交,
+   已断言无重复)→ `oracle_arm6_llmdrop/llm_verifier_verdicts.json`,同目录 `WHY.md` 写明这是拼接不是生成。
+2. CPU 自检:用 `verifier_mode=deterministic` 重跑 oracle,**逐位复现盘上
+   `rerank_oracle_single/metrics.json`**(0.1244/0.4205/0.5971/0.2209)—— 证明 CPU 路径与原 GPU run 同源。
+3. CPU:`dump_reranked_ranking.py --oracle-best-single --verifier-mode llm_drop`
+   (该脚本本来就有这个 flag)→ `rerank_arm6_oracle/bm25_candidates.jsonl`。
+   **闸门**:dump 出的排序逐位复现步骤 2 的 llm_drop 数,过了才提交 GPU。
+4. GPU:`sbatch ARM=llmonly_oracle_single`(wrapper 里本来就有这个臂)→ job **20682177**,只补 Acc 一列。
+
+## 结果:原来那行是被程序化打分压低了头部,不是"上界偏高"
+
+| | R@1 | R@10 | R@50 | R@200 | MRR |
+|---|---|---|---|---|---|
+| 旧(程序化打分) | 0.1244 | 0.4205 | 0.5971 | 0.7429 | 0.2209 |
+| **新(llm_drop 六维)** | **0.2220** | **0.4368** | 0.5923 | 0.7338 | **0.2950** |
+
+连带改掉:`tab:ablation` 的 oracle 行(Acc 暂为 `\ph{--}`)、caption(不再说它是 det 打分,
+改成说明它唯一剩下的差异是 per-hypothesis 融合导致 R@200 0.734 vs 0.705)、
+§app:seq 的「95% → 91%」并补了 R@1 0.184 vs 0.222 这个真正的残差位置。
+
+# 2026-07-31 — `− label coverage` 行已入链(job 20684342 -> 20684343)
+
+## 盘上那份 w_cov=0 staged trace 是坏的,已弃用
+`rerank_wcov0/bm25_candidates.jsonl`(2026-07-28)的 `rounds` 里
+`retrieval_score = bm25_norm + 1.0×(label_cov + qcov)` 逐位成立 —— 还是 **w_cov=1** 的分。
+它早于 `dump_index_ablation_ranking.py` 的"就地重写 rounds",summary 里没有 `rounds_rewritten`。
+后果:从它 staged 出来的窗口与部署窗口 **2509/2509 相同**,等于根本没关掉 cov。
+`arm_windows_wcov0/` 那份 07-29 的窗口同样作废。
+
+## 重做后的两道闸门(都过了)
+- 新窗口 vs 部署窗口:**0/2509 相同**
+- `rerank_arm6_wcov0/ranking_summary.json`:`rounds_rewritten=true`, `label_coverage_weight=0.0`
+
+## 目录约定
+- `wcov0_stage1/` —— **只是 stage 1**,预验证器序、beta=0、无 verdict,**不可 rerank**,
+  只作 `stage_arm_windows.py` 和 verdict job 的 `--test-trace`。目录里有 WHY.md 写明。
+- `arm_windows_arm6_wcov0/window_full.jsonl` —— 该臂自己的 w_cov=0 窗口
+- `verdicts_arm6_wcov0/` —— job 20684342(问6,`--window-tags` 上面那个)
+- `rerank_arm6_wcov0/` —— job 20684343(afterok),四列同源的可报告行
+
+## 代码改动(precheck 过,三分支实测)
+`apply_server_wcov0_rerank.sh` 加了 `VERDICTS` 透传:
+`${VERDICTS:+--llm-verifier-verdicts "${VERDICTS}"}`,并在文件不存在时 exit 1。
+不传就退化成原来的"无 verifier 重检索"。测过:空 / 不存在(guard 触发)/ 正常文件。
+
+## 落地后要改的
+`tab:ablation` 的 `− label coverage` 四列换成 `rerank_arm6_wcov0/metrics.json`,
+并**删掉 caption 里**"\emph{$-$ label coverage} is a re-retrieval without the verifier whose
+retrieval and accuracy columns come from separate runs"这句,以及正文里那句
+"its retrieval columns belong against the matched w_cov=1 control through that same path
+(Recall@10 0.383)"。届时它就是第七个匹配臂。
+
+# 2026-07-31 — 表状态单独成文:`paper/TABLE_STATUS.md`
+
+19 张表(24 个 label 去重后)逐张列了状态、来源、以及红格对应哪个 job。
+颜色规则已改成:**黑 = 这一版的真实测量;红 = 不是**(原来是"红 = 我改过",分不清真假)。
+全文 160 处 `\upd{}` 已剥掉,只剩 `\ph{}`。
+
+没有 job 的三类,都写在 TABLE_STATUS.md 的 C 节:std 列 26 格、Dense/Hybrid 12 格、
+`tab:efficiency` 两格 Time(测不了,verifier 没有计时、one-pass 没有 wall_time 字段)。

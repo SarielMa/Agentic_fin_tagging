@@ -4,7 +4,7 @@
 #SBATCH --time=5:00:00
 #SBATCH --nodes=1
 #SBATCH --gpus=b200:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=256G
 #SBATCH --partition=gpu_b200
 #SBATCH --output=/nfs/roberts/project/pi_sjf37/lm2445/FinAI_tagging_agentic/second_domain/logs/%j_codiesp_frozen_ags_qwen3_b200.txt

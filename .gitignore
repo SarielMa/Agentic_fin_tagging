@@ -95,12 +95,15 @@ runs_ags_*/
 *.tex
 # second_domain generated artifacts and large data
 second_domain/raw/
+second_domain/*.tex
 second_domain/data/
 second_domain/results/
 second_domain/logs/
 second_domain/runs_codiesp_grounding_baseline/
 second_domain/scripts/__pycache__/
 second_domain/index/icd10cm_fy2018/*.jsonl
+fhs/data/
+/data_whole_pipeline/runs_ags_verifier_ablation/
 
 # second_domain small reproducibility metadata/configs
 !second_domain/verify_report.json
