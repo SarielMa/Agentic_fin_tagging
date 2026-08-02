@@ -4,11 +4,11 @@ set -euo pipefail
 DOMAIN_ROOT="$(readlink -f "$(dirname "$0")")"
 SHARED_ROOT="$(readlink -f "${DOMAIN_ROOT}/codiesp_pipeline")"
 
-TEST_JSONL="${TEST_JSONL:-${DOMAIN_ROOT}/data/codiesp/facts_test.jsonl}"
+TEST_JSONL="${TEST_JSONL:-${DOMAIN_ROOT}/data/codiesp/facts_test_full_exact.jsonl}"
 TAXONOMY_JSONL="${TAXONOMY_JSONL:-${DOMAIN_ROOT}/index/icd10cm_fy2018/icd10cm_fy2018_retrieval.jsonl}"
 NORMALIZATION_MAP="${NORMALIZATION_MAP:-${DOMAIN_ROOT}/schema/icd10cm/normalization_map.json}"
 RUNS_ROOT="${RUNS_ROOT:-${DOMAIN_ROOT}/runs_codiesp_grounding_baseline}"
-SCRATCH_ROOT="${SCRATCH_ROOT:-/nfs/roberts/scratch/pi_sjf37/lm2445}"
+SCRATCH_ROOT="${SCRATCH_ROOT:-${DOMAIN_ROOT}/.cache}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${SCRATCH_ROOT}/.cache}"
 export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME}/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"

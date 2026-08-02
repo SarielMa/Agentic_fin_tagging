@@ -1,0 +1,8 @@
+runs_codiesp_grounding_baseline/
+logs/
+raw/
+**/__pycache__/
+*.pyc
+*.out
+*.err
+slurm-*.out

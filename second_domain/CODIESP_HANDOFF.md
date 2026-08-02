@@ -5,6 +5,85 @@ Updated: 2026-07-30 03:20 EDT.
 Use `CODIESP_EXPERIMENT_STATE.md` top section as the authoritative detailed
 state. This file is the short version.
 
+Update 2026-08-01 21:09 EDT:
+
+- Generic final Qwen listwise rerank is no longer skipped for AGS/FHS modes when
+  `RUN_RERANK=1`.
+- Submitted rerank-only continuation jobs with existing candidates reused and
+  `--time=03:00:00`:
+  - `20929443`: `frozen_ags wcov0`.
+  - `20929445`: `frozen_ags wcov1`.
+  - `20929444`: `fhs_j1 wcov0`.
+  - `20929446`: `fhs_j1 wcov1`.
+  - `20929464`: `fhs_no_verifier wcov0`.
+  - `20929465`: `fhs_no_verifier wcov1`.
+- These jobs should write `qwen_rerank_predictions.jsonl` and `metrics.json`.
+- User requested cancelling all `j3`/`j4` tasks. Cancelled active/pending jobs:
+  `20929466` (`fhs_j3 wcov1` rerank continuation), `20693295` (`fhs_j4 wcov0`),
+  and `20693296` (`fhs_j4 wcov1`). `fhs_j3 wcov0` job `20693293` had already
+  failed startup assertions; `fhs_j3 wcov1` job `20693294` had already completed
+  candidate generation before cancellation request, but its rerank continuation
+  was cancelled.
+- Added CodiEsp-local ports of the financial intrinsic self-refinement and
+  retrieval-feedback refinement wrappers without modifying `data_whole_pipeline`.
+  Submitted `w_cov=1.0` only, with one CPU and final selector enabled
+  (`MODE=full`):
+  - `20939892`: `intrinsic_self_refinement`, output
+    `qwen3_32b_intrinsic_self_refinement_full_wcov1`, `--time=06:00:00`.
+  - `20939893`: `retrieval_feedback_refinement`, output
+    `qwen3_32b_retrieval_feedback_refinement_full_wcov1`, `--time=06:00:00`.
+- Upload policy: the HF artifact currently contains data only. If a separate
+  result artifact is later prepared, any method with both `wcov0` and `wcov1`
+  outputs should upload only the `wcov1` output; do not upload both coverage
+  variants for the same method.
+- Submitted extra `wcov1` repeat jobs for computing standard deviations. All
+  use `MODE=full`, final selector enabled, and
+  `facts_test_full_exact.jsonl`; output directories are suffixed `_r2` and
+  `_r3`. The user said `ags_j1`; this was submitted as the existing `fhs_j1`
+  method to avoid duplicating `one_pass_structured`.
+  - `20949745`: `frozen_ags r2`, output
+    `qwen3_32b_frozen_ags_full_wcov1_r2`.
+  - `20949748`: `frozen_ags r3`, output
+    `qwen3_32b_frozen_ags_full_wcov1_r3`.
+  - `20949750`: `fhs_j1 r2`, output
+    `qwen3_32b_fhs_j1_full_wcov1_r2`.
+  - `20949752`: `fhs_j1 r3`, output
+    `qwen3_32b_fhs_j1_full_wcov1_r3`.
+  - `20949753`: `one_pass_structured r2`, output
+    `qwen3_32b_one_pass_structured_full_wcov1_r2`.
+  - `20949756`: `one_pass_structured r3`, output
+    `qwen3_32b_one_pass_structured_full_wcov1_r3`.
+- Submitted remaining non-`j3`/`j4`, non-oracle `wcov1` repeat jobs for STD.
+  All use `MODE=full`, final selector enabled, and
+  `facts_test_full_exact.jsonl`; output directories are suffixed `_r2` and
+  `_r3`.
+  - `20953983`: `direct_retrieval r2`, output
+    `qwen3_32b_direct_retrieval_full_wcov1_r2`.
+  - `20953984`: `direct_retrieval r3`, output
+    `qwen3_32b_direct_retrieval_full_wcov1_r3`.
+  - `20953985`: `one_pass_grounding r2`, output
+    `qwen3_32b_one_pass_grounding_full_wcov1_r2`.
+  - `20953987`: `one_pass_grounding r3`, output
+    `qwen3_32b_one_pass_grounding_full_wcov1_r3`.
+  - `20953988`: `parallel_sampling_n2 r2`, output
+    `qwen3_32b_parallel_sampling_n2_full_wcov1_r2`, with
+    `RETRIEVAL_ROUNDS=2`.
+  - `20954149`: `parallel_sampling_n2 r3`, output
+    `qwen3_32b_parallel_sampling_n2_full_wcov1_r3`, with
+    `RETRIEVAL_ROUNDS=2`.
+  - `20954150`: `fhs_no_verifier r2`, output
+    `qwen3_32b_fhs_no_verifier_full_wcov1_r2`.
+  - `20954178`: `fhs_no_verifier r3`, output
+    `qwen3_32b_fhs_no_verifier_full_wcov1_r3`.
+  - `20954181`: `intrinsic_self_refinement r2`, output
+    `qwen3_32b_intrinsic_self_refinement_full_wcov1_r2`.
+  - `20954182`: `intrinsic_self_refinement r3`, output
+    `qwen3_32b_intrinsic_self_refinement_full_wcov1_r3`.
+  - `20954184`: `retrieval_feedback_refinement r2`, output
+    `qwen3_32b_retrieval_feedback_refinement_full_wcov1_r2`.
+  - `20954186`: `retrieval_feedback_refinement r3`, output
+    `qwen3_32b_retrieval_feedback_refinement_full_wcov1_r3`.
+
 Do not touch unrelated jobs. Only operate on this CodiEsp experiment's
 `codiesp_*` jobs. In particular, do not cancel or modify `vf6_*`, `b_*`,
 `seqvf_*`, Jupyter, or other non-CodiEsp jobs.

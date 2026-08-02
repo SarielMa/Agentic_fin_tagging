@@ -108,6 +108,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embed-batch-size", type=int, default=256)
     parser.add_argument("--query-instruction", default=None)
     parser.add_argument(
+        "--label-coverage-weight",
+        type=float,
+        default=None,
+        help="Override the deployed asymmetry (AGS 1.0 / one-pass 0.0). Set 1.0 on one-pass to "
+        "run the robustness study with the coverage term enabled identically for both methods, "
+        "which is what Table 1 reports. Pair it with --onepass-trace and --reference-metrics "
+        "pointing at the w_cov=1 run, or the gate compares against the wrong reference.",
+    )
+    parser.add_argument(
+        "--onepass-trace",
+        type=Path,
+        default=None,
+        help="Override the run whose logged one-pass queries are replayed.",
+    )
+    parser.add_argument(
+        "--reference-metrics",
+        type=Path,
+        default=None,
+        help="Override the metrics.json the BM25 gate reproduces.",
+    )
+    parser.add_argument(
         "--assert-matches-bm25",
         action="store_true",
         help="With --retriever-kind bm25, fail unless the deployed retrieval-stage numbers "
@@ -235,7 +256,14 @@ def main() -> None:
 
     cfg = FrozenAgsConfig()
     # The deployed asymmetry: AGS carries the coverage term, one-pass does not.
-    w_cov = cfg.label_coverage_weight if args.method == "AGS" else 0.0
+    # --label-coverage-weight overrides it, which is how the table is run with the term
+    # enabled identically for both methods.
+    if args.label_coverage_weight is None:
+        w_cov = cfg.label_coverage_weight if args.method == "AGS" else 0.0
+    else:
+        w_cov = args.label_coverage_weight
+
+    onepass_trace = args.onepass_trace or ONEPASS_TRACE
 
     retriever = build_retriever(
         args.retriever_kind,
@@ -254,8 +282,8 @@ def main() -> None:
         source = load_logged_hypotheses(FROZEN_TRACE)
         print(f"replaying logged hypotheses for {len(source)} facts", flush=True)
     else:
-        source = load_logged_queries(ONEPASS_TRACE)
-        print(f"replaying logged queries for {len(source)} facts", flush=True)
+        source = load_logged_queries(onepass_trace)
+        print(f"replaying logged queries from {onepass_trace} for {len(source)} facts", flush=True)
 
     records: list[dict[str, Any]] = []
     skipped = 0
@@ -280,10 +308,12 @@ def main() -> None:
         "method": args.method,
         "query_mode": QUERY_MODE[args.method],
         "label_coverage_weight": w_cov,
+        "label_coverage_weight_overridden": args.label_coverage_weight is not None,
+        "replayed_trace": str(FROZEN_TRACE if args.method == "AGS" else onepass_trace),
         "coverage_asymmetry_note": (
-            "AGS runs at w_cov=1.0 and one-pass at w_cov=0.0 because that is the deployed "
-            "configuration the main table reports. It is a confound for a robustness "
-            "comparison and is recorded here rather than silently equalised."
+            "The deployed default is AGS at w_cov=1.0 and one-pass at w_cov=0.0, which is a "
+            "confound for a robustness comparison. --label-coverage-weight equalises it; this "
+            "run used w_cov={:.1f} for {}.".format(w_cov, args.method)
         ),
         "facts_written": len(records),
         "facts_skipped_no_logged_input": skipped,
@@ -309,10 +339,12 @@ def main() -> None:
         )
         manifest["bm25_gate"] = {"skipped_due_to_limit": args.limit}
     elif args.retriever_kind == "bm25":
-        reference = json.loads(BM25_REFERENCE[args.method].read_text(encoding="utf-8"))["bm25_retrieval"]
+        reference_path = args.reference_metrics or BM25_REFERENCE[args.method]
+        reference = json.loads(reference_path.read_text(encoding="utf-8"))["bm25_retrieval"]
         diffs = {m: round(agg[m] - float(reference[m]), 9) for m in METRICS}
         ok = all(abs(d) <= args.tolerance for d in diffs.values())
         gate = {
+            "reference_path": str(reference_path),
             "reference": {m: round(float(reference[m]), 6) for m in METRICS},
             "rebuilt": {m: round(agg[m], 6) for m in METRICS},
             "difference": diffs,
