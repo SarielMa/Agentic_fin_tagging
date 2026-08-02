@@ -84,6 +84,42 @@ Update 2026-08-01 21:09 EDT:
   - `20954186`: `retrieval_feedback_refinement r3`, output
     `qwen3_32b_retrieval_feedback_refinement_full_wcov1_r3`.
 
+Status checkpoint 2026-08-02 02:50 EDT:
+
+- Do not resubmit these jobs tomorrow. They are either running or pending under
+  `QOSMaxJobsPerUserLimit`; no duplicate work is needed.
+- Running:
+  - `20939892` `intrinsic_self_refinement main`: output directory exists,
+    `grounding_traces.jsonl` has 3144 rows, `qwen_rerank_predictions.jsonl` has
+    608 rows, no `metrics.json` yet.
+  - `20939893` `retrieval_feedback_refinement main`: output directory exists,
+    `grounding_traces.jsonl` has 2665 rows, no rerank rows and no
+    `metrics.json` yet.
+  - `20949745` `frozen_ags r2`: output directory exists,
+    `grounding_traces.jsonl` has 521 rows, no `metrics.json` yet.
+  - `20949748` `frozen_ags r3`: output directory exists,
+    `grounding_traces.jsonl` has 503 rows, no `metrics.json` yet.
+  - `20949750` `fhs_j1 r2`: output directory exists,
+    `grounding_traces.jsonl` has 543 rows, no `metrics.json` yet.
+  - `20949753` `one_pass_structured r2`: output directory exists,
+    `grounding_traces.jsonl` has 3144 rows, `qwen_rerank_predictions.jsonl`
+    has 1856 rows, no `metrics.json` yet.
+- Pending with no output directory yet:
+  - `20949752` `fhs_j1 r3`.
+  - `20949756` `one_pass_structured r3`.
+  - `20953983` `direct_retrieval r2`.
+  - `20953984` `direct_retrieval r3`.
+  - `20953985` `one_pass_grounding r2`.
+  - `20953987` `one_pass_grounding r3`.
+  - `20953988` `parallel_sampling_n2 r2`.
+  - `20954149` `parallel_sampling_n2 r3`.
+  - `20954150` `fhs_no_verifier r2`.
+  - `20954178` `fhs_no_verifier r3`.
+  - `20954181` `intrinsic_self_refinement r2`.
+  - `20954182` `intrinsic_self_refinement r3`.
+  - `20954184` `retrieval_feedback_refinement r2`.
+  - `20954186` `retrieval_feedback_refinement r3`.
+
 Do not touch unrelated jobs. Only operate on this CodiEsp experiment's
 `codiesp_*` jobs. In particular, do not cancel or modify `vf6_*`, `b_*`,
 `seqvf_*`, Jupyter, or other non-CodiEsp jobs.

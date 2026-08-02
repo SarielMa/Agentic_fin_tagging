@@ -32,6 +32,9 @@ case "${QUERY_MODE}" in
   feedback|retrieval_feedback|retrieval_feedback_refinement)
     DEFAULT_METHOD_DIR="qwen3_32b_retrieval_feedback_refinement"
     ;;
+  decomposed|decomposed_retrieval)
+    DEFAULT_METHOD_DIR="qwen3_32b_decomposed_retrieval"
+    ;;
   parallel|parallel_sampling)
     DEFAULT_METHOD_DIR="qwen3_32b_parallel_sampling"
     ;;
@@ -51,7 +54,7 @@ case "${QUERY_MODE}" in
     DEFAULT_METHOD_DIR="qwen3_32b_${QUERY_MODE}"
     ;;
   *)
-    echo "Unsupported CodiEsp QUERY_MODE=${QUERY_MODE}. Expected direct_retrieval|gold_label_definition_retrieval|one_pass_grounding|intrinsic_self_refinement|retrieval_feedback_refinement|parallel_sampling|one_pass_structured|frozen_ags|fhs_j1|fhs_no_verifier|fhs_j3_wcov0|fhs_j3_wcov1|fhs_j4_wcov0|fhs_j4_wcov1." >&2
+    echo "Unsupported CodiEsp QUERY_MODE=${QUERY_MODE}. Expected direct_retrieval|gold_label_definition_retrieval|one_pass_grounding|intrinsic_self_refinement|retrieval_feedback_refinement|decomposed_retrieval|parallel_sampling|one_pass_structured|frozen_ags|fhs_j1|fhs_no_verifier|fhs_j3_wcov0|fhs_j3_wcov1|fhs_j4_wcov0|fhs_j4_wcov1." >&2
     exit 1
     ;;
 esac
